@@ -1,0 +1,96 @@
+id = "wheels.dev-workflow"
+name = "Wheels Dev Workflow"
+version = "0.2.0"
+min_herdr_version = "0.7.0"
+description = "Personal Herdr workflows for managed git worktrees and development tools."
+platforms = ["macos", "linux"]
+
+[[actions]]
+id = "layout-here"
+title = "Set up dev layout here"
+contexts = ["workspace"]
+command = ["bash", "-lc", "exec \"$HERDR_PLUGIN_ROOT/dev-workflow.sh\" layout-here"]
+
+[[actions]]
+id = "new-branch"
+title = "New personal branch"
+contexts = ["workspace"]
+command = ["bash", "-lc", "exec \"$HERDR_PLUGIN_ROOT/dev-workflow.sh\" open-pane new-branch"]
+
+[[actions]]
+id = "open"
+title = "Open worktree or origin branch"
+contexts = ["workspace"]
+command = ["bash", "-lc", "exec \"$HERDR_PLUGIN_ROOT/dev-workflow.sh\" open-pane open"]
+
+[[actions]]
+id = "open-all"
+title = "Open all managed worktrees"
+contexts = ["workspace"]
+command = ["bash", "-lc", "exec \"$HERDR_PLUGIN_ROOT/dev-workflow.sh\" open-all"]
+
+[[actions]]
+id = "prune"
+title = "Auto-prune managed worktrees"
+contexts = ["workspace"]
+command = ["bash", "-lc", "exec \"$HERDR_PLUGIN_ROOT/dev-workflow.sh\" prune-auto"]
+
+[[actions]]
+id = "prune-manual"
+title = "Manually prune a managed worktree"
+contexts = ["workspace"]
+command = ["bash", "-lc", "exec \"$HERDR_PLUGIN_ROOT/dev-workflow.sh\" open-pane prune"]
+
+[[actions]]
+id = "lazygit"
+title = "Open lazygit"
+contexts = ["workspace"]
+command = ["bash", "-lc", "exec \"$HERDR_PLUGIN_ROOT/dev-workflow.sh\" open-pane lazygit"]
+
+[[actions]]
+id = "nvim"
+title = "Open Neovim"
+contexts = ["workspace"]
+command = ["bash", "-lc", "exec \"$HERDR_PLUGIN_ROOT/dev-workflow.sh\" open-pane nvim"]
+
+[[actions]]
+id = "doctor"
+title = "Check workflow dependencies"
+contexts = ["workspace"]
+command = ["bash", "-lc", "exec \"$HERDR_PLUGIN_ROOT/dev-workflow.sh\" open-pane doctor"]
+
+[[panes]]
+id = "new-branch"
+title = "New personal branch"
+placement = "overlay"
+command = ["bash", "-lc", "exec \"$HERDR_PLUGIN_ROOT/dev-workflow.sh\" new-branch-pane"]
+
+[[panes]]
+id = "open"
+title = "Open worktree or origin branch"
+placement = "overlay"
+command = ["bash", "-lc", "exec \"$HERDR_PLUGIN_ROOT/dev-workflow.sh\" open-pane-entry"]
+
+[[panes]]
+id = "prune"
+title = "Prune managed worktrees"
+placement = "overlay"
+command = ["bash", "-lc", "exec \"$HERDR_PLUGIN_ROOT/dev-workflow.sh\" prune-pane"]
+
+[[panes]]
+id = "lazygit"
+title = "lazygit"
+placement = "overlay"
+command = ["lazygit"]
+
+[[panes]]
+id = "nvim"
+title = "Neovim"
+placement = "overlay"
+command = ["nvim"]
+
+[[panes]]
+id = "doctor"
+title = "Workflow dependency check"
+placement = "overlay"
+command = ["bash", "-lc", "exec \"$HERDR_PLUGIN_ROOT/dev-workflow.sh\" doctor"]

@@ -1,0 +1,47 @@
+[[keys.command]]
+key = "prefix+l"
+type = "plugin_action"
+command = "wheels.dev-workflow.layout-here"
+description = "set up dev layout here"
+
+[[keys.command]]
+key = "prefix+n"
+type = "plugin_action"
+command = "wheels.dev-workflow.new-branch"
+description = "new personal branch"
+
+[[keys.command]]
+key = "prefix+o"
+type = "plugin_action"
+command = "wheels.dev-workflow.open"
+description = "open worktree or origin branch"
+
+[[keys.command]]
+key = "prefix+a"
+type = "plugin_action"
+command = "wheels.dev-workflow.open-all"
+description = "open all managed worktrees"
+
+[[keys.command]]
+key = "prefix+p"
+type = "plugin_action"
+command = "wheels.dev-workflow.prune"
+description = "auto-prune eligible managed worktrees"
+
+[[keys.command]]
+key = "prefix+shift+p"
+type = "plugin_action"
+command = "wheels.dev-workflow.prune-manual"
+description = "manually prune a managed worktree"
+
+[[keys.command]]
+key = "prefix+g"
+type = "plugin_action"
+command = "wheels.dev-workflow.lazygit"
+description = "lazygit"
+
+[[keys.command]]
+key = "prefix+e"
+type = "plugin_action"
+command = "wheels.dev-workflow.nvim"
+description = "nvim"
