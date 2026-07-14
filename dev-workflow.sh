@@ -651,8 +651,10 @@ notify() {
 }
 
 prune_auto() {
-  local cwd repo_root kind name branch_name tree_path
+  local cwd repo_root kind name branch_name tree_path index
+  local source_workspace_id="${HERDR_WORKSPACE_ID:-}" source_is_pruned=0
   local total=0 pruned_branches=0 pruned_worktrees=0 skipped_dirty=0 skipped_remote=0 skipped_protected=0 skipped_other=0
+  local prune_names=() prune_branches=() prune_paths=() close_pids=() remove_pids=()
 
   cwd="$(pane_cwd_or_die)"
   cd "$cwd"
@@ -696,12 +698,54 @@ prune_auto() {
       continue
     fi
 
-    printf 'Pruning worktree %s (%s)...\n' "$name" "$branch_name"
-    prune_branch "$repo_root" "$branch_name" "$tree_path"
-    pruned_worktrees=$((pruned_worktrees + 1))
-    printf 'Pruned worktree %s and branch %s (no matching remote branch)\n' "$name" "$branch_name"
-    pruned_branches=$((pruned_branches + 1))
+    prune_names+=("$name")
+    prune_branches+=("$branch_name")
+    prune_paths+=("$tree_path")
+    if path_contains "$tree_path" "$cwd"; then
+      source_is_pruned=1
+    fi
   done < <(managed_worktree_rows "$repo_root")
+
+  for index in "${!prune_paths[@]}"; do
+    close_workspace_for_path "${prune_paths[$index]}" &
+    close_pids[$index]=$!
+  done
+  for index in "${!close_pids[@]}"; do
+    wait "${close_pids[$index]}" || true
+  done
+
+  if [[ -n "$source_workspace_id" && "$source_is_pruned" == "0" && "${#prune_paths[@]}" -gt 0 ]]; then
+    "$HERDR_BIN" workspace focus "$source_workspace_id" >/dev/null 2>&1 || true
+  fi
+
+  for index in "${!prune_paths[@]}"; do
+    printf 'Pruning worktree %s (%s)...\n' "${prune_names[$index]}" "${prune_branches[$index]}"
+    git -C "$repo_root" worktree remove "${prune_paths[$index]}" &
+    remove_pids[$index]=$!
+  done
+
+  for index in "${!remove_pids[@]}"; do
+    name="${prune_names[$index]}"
+    branch_name="${prune_branches[$index]}"
+    tree_path="${prune_paths[$index]}"
+    if ! wait "${remove_pids[$index]}"; then
+      skipped_other=$((skipped_other + 1))
+      printf 'Failed to prune worktree %s (%s)\n' "$name" "$tree_path" >&2
+      continue
+    fi
+
+    pruned_worktrees=$((pruned_worktrees + 1))
+    if git -C "$repo_root" show-ref --verify --quiet "refs/heads/$branch_name"; then
+      if ! git -C "$repo_root" branch -D "$branch_name" >/dev/null; then
+        skipped_other=$((skipped_other + 1))
+        printf 'Removed worktree %s but failed to delete branch %s\n' "$name" "$branch_name" >&2
+        continue
+      fi
+    fi
+
+    pruned_branches=$((pruned_branches + 1))
+    printf 'Pruned worktree %s and branch %s (no matching remote branch)\n' "$name" "$branch_name"
+  done
 
   local summary
   summary="Pruned $pruned_branches of $total managed worktrees; removed $pruned_worktrees worktrees; skipped $skipped_dirty dirty, $skipped_remote with remote, $skipped_protected protected, $skipped_other other."
