@@ -1,6 +1,6 @@
 id = "wheels.dev-workflow"
 name = "Wheels Dev Workflow"
-version = "0.3.0"
+version = "0.0.1"
 min_herdr_version = "0.7.4"
 description = "Personal Herdr workflows for managed git worktrees and development tools."
 platforms = ["macos", "linux"]
@@ -63,8 +63,8 @@ command = ["bash", "-lc", "exec \"$HERDR_PLUGIN_ROOT/dev-workflow.sh\" open-pane
 id = "new-branch"
 title = "New personal branch"
 placement = "popup"
-width = "60%"
-height = 10
+width = "80%"
+height = "60%"
 command = ["bash", "-lc", "exec \"$HERDR_PLUGIN_ROOT/dev-workflow.sh\" new-branch-pane"]
 
 [[panes]]

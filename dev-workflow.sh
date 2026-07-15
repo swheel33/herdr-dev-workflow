@@ -144,6 +144,16 @@ worktree_base_ref() {
   fi
 }
 
+preferred_base_branch() {
+  local repo_root="$1"
+  if git -C "$repo_root" show-ref --verify --quiet refs/remotes/origin/develop ||
+    git -C "$repo_root" show-ref --verify --quiet refs/heads/develop; then
+    printf 'develop'
+    return
+  fi
+  default_branch "$repo_root"
+}
+
 refresh_origin_refs() {
   local repo_root="$1"
   git -C "$repo_root" fetch origin --prune
@@ -298,7 +308,7 @@ open_worktree_path_with_layout() {
 
 create_personal_worktree() {
   local requested_name="$1"
-  local repo_root checkout_root branch_suffix branch_name tree_name tree_path main_branch base_ref target_directory workspace_id
+  local repo_root checkout_root branch_suffix branch_name tree_name tree_path base_branch base_ref target_directory workspace_id
   repo_root="$(repo_root_or_die)"
   checkout_root="$(current_checkout_root_or_die)"
   branch_suffix="$(slugify "$requested_name")"
@@ -325,12 +335,13 @@ create_personal_worktree() {
     exit 1
   fi
 
-  main_branch="$(default_branch "$repo_root")"
-  if [[ -z "$main_branch" ]]; then
-    printf 'Could not determine default branch for %s\n' "$repo_root" >&2
+  base_branch="$(select_base_branch "$repo_root")" || exit 0
+  base_ref="$(worktree_base_ref "$repo_root" "$base_branch")"
+  if ! git -C "$repo_root" rev-parse --verify --quiet "${base_ref}^{commit}" >/dev/null; then
+    printf 'Base branch not found: %s\n' "$base_ref" >&2
     exit 1
   fi
-  base_ref="$(worktree_base_ref "$repo_root" "$main_branch")"
+  printf 'Creating %s from %s...\n' "$branch_name" "$base_ref"
   mkdir -p "$(managed_worktree_root "$repo_root")"
   git -C "$repo_root" worktree add -b "$branch_name" "$tree_path" "$base_ref"
   bootstrap_worktree_local_files "$repo_root" "$tree_path"
@@ -428,6 +439,62 @@ select_with_fzf() {
     return 127
   fi
   fzf --prompt "$prompt" --height 90% --reverse
+}
+
+base_branch_row() {
+  local repo_root="$1"
+  local branch="$2"
+  local marker="${3:-}"
+  local ref source date subject
+  ref="$(worktree_base_ref "$repo_root" "$branch")"
+  if [[ "$ref" == origin/* ]]; then
+    source='origin'
+  else
+    source='local'
+  fi
+  if [[ -n "$marker" ]]; then
+    source="${marker}/${source}"
+  fi
+  date="$(git -C "$repo_root" log -1 --format='%cr' "$ref" 2>/dev/null || true)"
+  subject="$(git -C "$repo_root" log -1 --format='%s' "$ref" 2>/dev/null || true)"
+  printf '%s\t%s\t%s\t%s\n' "$branch" "$source" "$date" "$subject"
+}
+
+base_branch_rows() {
+  local repo_root="$1"
+  local preferred="$2"
+  local ref branch
+
+  base_branch_row "$repo_root" "$preferred" default
+
+  while IFS= read -r ref; do
+    [[ "$ref" == origin/HEAD ]] && continue
+    branch="${ref#origin/}"
+    [[ "$branch" == "$preferred" ]] && continue
+    base_branch_row "$repo_root" "$branch"
+  done < <(git -C "$repo_root" for-each-ref --sort=-committerdate --format='%(refname:short)' refs/remotes/origin)
+
+  while IFS= read -r branch; do
+    [[ "$branch" == "$preferred" ]] && continue
+    if git -C "$repo_root" show-ref --verify --quiet "refs/remotes/origin/${branch}"; then
+      continue
+    fi
+    base_branch_row "$repo_root" "$branch"
+  done < <(git -C "$repo_root" for-each-ref --sort=-committerdate --format='%(refname:short)' refs/heads)
+}
+
+select_base_branch() {
+  local repo_root="$1"
+  local preferred selected
+  preferred="$(preferred_base_branch "$repo_root")"
+  if [[ -z "$preferred" ]]; then
+    printf 'Could not determine a base branch for %s\n' "$repo_root" >&2
+    return 1
+  fi
+  selected="$(base_branch_rows "$repo_root" "$preferred" | select_with_fzf "base (${preferred})> ")" || return 1
+  selected="${selected%%$'\t'*}"
+  [[ -n "$selected" ]] || return 1
+  printf '%s' "$selected"
 }
 
 new_branch_pane() {
