@@ -39,7 +39,7 @@ herdr plugin action invoke wheels.dev-workflow.doctor
 
 - `prefix+l`: set up the two-pane dev layout in the current workspace
 - `prefix+n`: create a new `wheels/<name>` worktree from a selected base branch
-- `prefix+o`: pick in a popup and open an existing managed worktree or `origin/*` branch
+- `prefix+o`: pick in a popup and open any existing worktree or `origin/*` branch
 - `prefix+a`: open all managed worktrees
 - `prefix+p`: automatically prune eligible managed worktrees
 - `prefix+shift+p`: manually select and prune a managed worktree in a popup
@@ -62,6 +62,7 @@ See [`keybindings.example.toml`](keybindings.example.toml) for the complete bind
 - new personal branches use `wheels/<slug>` locally and `.worktrees/<slug>` on disk
 - new personal branches prefer `develop` as their base, then fall back to the repository default
 - the base selector shows fetched `origin/*` branches plus deduplicated local-only branches
+- the open selector includes managed and external Git worktrees and reuses existing checkouts
 - origin branches keep the exact origin branch name locally and use a slugged worktree path
 - selecting `origin/alice/checkout-fix` opens local branch `alice/checkout-fix` at `.worktrees/alice-checkout-fix`
 - colliding slugged worktree paths fail explicitly instead of opening a different branch

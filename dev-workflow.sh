@@ -350,25 +350,31 @@ create_personal_worktree() {
   setup_layout_for_workspace "$workspace_id" "$target_directory" "$tree_name" 1
 }
 
-normalize_worktree_name() {
-  local value="$1"
-  if [[ "$value" == wheels/* ]]; then
-    value="${value#wheels/}"
-  fi
-  slugify "$value"
-}
-
-open_managed_worktree() {
-  local requested_name="$1"
-  local repo_root name tree_path
-  repo_root="$(repo_root_or_die)"
-  name="$(normalize_worktree_name "$requested_name")"
-  tree_path="$(managed_worktree_path "$repo_root" "$name")"
+open_existing_worktree() {
+  local repo_root="$1"
+  local tree_path="$2"
+  local label="$3"
   if [[ ! -d "$tree_path" ]]; then
     printf 'Worktree not found: %s\n' "$tree_path" >&2
     exit 1
   fi
-  open_worktree_path_with_layout "$repo_root" "$tree_path" "$name" 0
+  open_worktree_path_with_layout "$repo_root" "$tree_path" "$label" 0
+}
+
+worktree_path_for_branch() {
+  local repo_root="$1"
+  local branch_name="$2"
+  local line path=""
+  while IFS= read -r line; do
+    case "$line" in
+      worktree\ *) path="${line#worktree }" ;;
+      "branch refs/heads/${branch_name}")
+        printf '%s' "$path"
+        return 0
+        ;;
+    esac
+  done < <(list_worktrees_porcelain "$repo_root")
+  return 1
 }
 
 origin_branch_tree_name() {
@@ -378,7 +384,7 @@ origin_branch_tree_name() {
 
 open_origin_branch() {
   local remote_branch="$1"
-  local repo_root tree_name tree_path upstream_ref checked_out_branch
+  local repo_root tree_name tree_path upstream_ref checked_out_branch existing_path
   repo_root="$(repo_root_or_die)"
   remote_branch="${remote_branch#origin/}"
   if [[ -z "$remote_branch" || "$remote_branch" == HEAD ]]; then
@@ -389,10 +395,15 @@ open_origin_branch() {
   tree_name="$(origin_branch_tree_name "$remote_branch")"
   tree_path="$(managed_worktree_path "$repo_root" "$tree_name")"
 
-  refresh_origin_refs "$repo_root"
   if ! git -C "$repo_root" rev-parse --verify --quiet "$upstream_ref^{commit}" >/dev/null; then
     printf 'Remote branch not found: %s\n' "$upstream_ref" >&2
     exit 1
+  fi
+
+  existing_path="$(worktree_path_for_branch "$repo_root" "$remote_branch" || true)"
+  if [[ -n "$existing_path" ]]; then
+    open_existing_worktree "$repo_root" "$existing_path" "$(basename "$existing_path")"
+    return
   fi
 
   if [[ ! -d "$tree_path" ]]; then
@@ -425,6 +436,19 @@ managed_worktree_rows() {
       if ! is_managed_worktree_path "$repo_root" "$path"; then
         continue
       fi
+      name="$(basename "$path")"
+      branch="$(git -C "$path" symbolic-ref --quiet --short HEAD 2>/dev/null || printf 'detached')"
+      printf 'worktree\t%s\t%s\t%s\n' "$name" "$branch" "$path"
+    fi
+  done < <(list_worktrees_porcelain "$repo_root")
+}
+
+openable_worktree_rows() {
+  local repo_root="$1"
+  local line path branch name
+  while IFS= read -r line; do
+    if [[ "$line" == worktree\ * ]]; then
+      path="${line#worktree }"
       name="$(basename "$path")"
       branch="$(git -C "$path" symbolic-ref --quiet --short HEAD 2>/dev/null || printf 'detached')"
       printf 'worktree\t%s\t%s\t%s\n' "$name" "$branch" "$path"
@@ -508,21 +532,37 @@ new_branch_pane() {
 
 origin_branch_rows() {
   local repo_root="$1"
-  git -C "$repo_root" for-each-ref \
-    --sort=-committerdate \
-    --format='%(refname:short)%09%(committerdate:relative)%09%(authorname)%09%(subject)' \
-    refs/remotes/origin |
-    awk -F '\t' '$1 != "origin/HEAD" { print "origin\t" $0 }'
+  local line ref branch date author subject checked
+  local checked_branches=()
+  while IFS= read -r line; do
+    if [[ "$line" == branch\ refs/heads/* ]]; then
+      checked_branches+=("${line#branch refs/heads/}")
+    fi
+  done < <(list_worktrees_porcelain "$repo_root")
+
+  while IFS=$'\t' read -r ref date author subject; do
+    [[ "$ref" == origin || "$ref" == origin/HEAD ]] && continue
+    branch="${ref#origin/}"
+    for checked in "${checked_branches[@]}"; do
+      [[ "$branch" == "$checked" ]] && continue 2
+    done
+    printf 'origin\t%s\t%s\t%s\t%s\n' "$ref" "$date" "$author" "$subject"
+  done < <(
+    git -C "$repo_root" for-each-ref \
+      --sort=-committerdate \
+      --format='%(refname:short)%09%(committerdate:relative)%09%(authorname)%09%(subject)' \
+      refs/remotes/origin
+  )
 }
 
 open_pane_entry() {
-  local repo_root selected kind branch name
+  local repo_root selected kind branch name tree_path
   repo_root="$(repo_root_or_die)"
   printf 'Fetching origin...\n'
   refresh_origin_refs "$repo_root"
   selected="$(
     {
-      managed_worktree_rows "$repo_root"
+      openable_worktree_rows "$repo_root"
       origin_branch_rows "$repo_root"
     } | select_with_fzf 'open> '
   )" || exit 0
@@ -533,8 +573,11 @@ open_pane_entry() {
   case "$kind" in
     worktree)
       name="${selected%%$'\t'*}"
-      [[ -n "$name" ]] || exit 0
-      open_managed_worktree "$name"
+      selected="${selected#*$'\t'}"
+      branch="${selected%%$'\t'*}"
+      tree_path="${selected#*$'\t'}"
+      [[ -n "$name" && -n "$branch" && -n "$tree_path" ]] || exit 0
+      open_existing_worktree "$repo_root" "$tree_path" "$name"
       ;;
     origin)
       branch="${selected%%$'\t'*}"
@@ -546,6 +589,16 @@ open_pane_entry() {
       exit 1
       ;;
   esac
+}
+
+pause_on_error() {
+  local status="$1"
+  trap - EXIT
+  if [[ "$status" != "0" && "$status" != "130" ]]; then
+    printf '\nWorkflow failed (exit %s). Press enter to close...' "$status" >&2
+    IFS= read -r _ || true
+  fi
+  exit "$status"
 }
 
 open_all() {
@@ -898,7 +951,10 @@ main() {
     open-all) open_all "$@" ;;
     prune-auto) prune_auto "$@" ;;
     new-branch-pane) new_branch_pane "$@" ;;
-    open-pane-entry) open_pane_entry "$@" ;;
+    open-pane-entry)
+      trap 'pause_on_error "$?"' EXIT
+      open_pane_entry "$@"
+      ;;
     prune-pane) prune_pane "$@" ;;
     doctor) doctor "$@" ;;
     *) usage ;;
