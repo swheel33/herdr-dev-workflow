@@ -1,7 +1,7 @@
 id = "wheels.dev-workflow"
 name = "Wheels Dev Workflow"
-version = "0.2.0"
-min_herdr_version = "0.7.0"
+version = "0.3.0"
+min_herdr_version = "0.7.4"
 description = "Personal Herdr workflows for managed git worktrees and development tools."
 platforms = ["macos", "linux"]
 
@@ -62,25 +62,33 @@ command = ["bash", "-lc", "exec \"$HERDR_PLUGIN_ROOT/dev-workflow.sh\" open-pane
 [[panes]]
 id = "new-branch"
 title = "New personal branch"
-placement = "overlay"
+placement = "popup"
+width = "60%"
+height = 10
 command = ["bash", "-lc", "exec \"$HERDR_PLUGIN_ROOT/dev-workflow.sh\" new-branch-pane"]
 
 [[panes]]
 id = "open"
 title = "Open worktree or origin branch"
-placement = "overlay"
+placement = "popup"
+width = "90%"
+height = "70%"
 command = ["bash", "-lc", "exec \"$HERDR_PLUGIN_ROOT/dev-workflow.sh\" open-pane-entry"]
 
 [[panes]]
 id = "prune"
 title = "Prune managed worktrees"
-placement = "overlay"
+placement = "popup"
+width = "80%"
+height = "60%"
 command = ["bash", "-lc", "exec \"$HERDR_PLUGIN_ROOT/dev-workflow.sh\" prune-pane"]
 
 [[panes]]
 id = "lazygit"
 title = "lazygit"
-placement = "overlay"
+placement = "popup"
+width = "90%"
+height = "90%"
 command = ["lazygit"]
 
 [[panes]]
@@ -92,5 +100,7 @@ command = ["nvim"]
 [[panes]]
 id = "doctor"
 title = "Workflow dependency check"
-placement = "overlay"
+placement = "popup"
+width = "80%"
+height = 20
 command = ["bash", "-lc", "exec \"$HERDR_PLUGIN_ROOT/dev-workflow.sh\" doctor"]

@@ -431,15 +431,10 @@ select_with_fzf() {
 }
 
 new_branch_pane() {
-  local first rest name
-  printf 'New branch name: '
-  IFS= read -rsn1 first
-  if [[ -z "$first" || "$first" == $'\e' ]]; then
+  local name
+  if ! IFS= read -er -p 'New branch name: ' name; then
     exit 0
   fi
-  printf '%s' "$first"
-  IFS= read -r rest
-  name="${first}${rest}"
   [[ -n "$name" ]] || exit 0
   create_personal_worktree "$name"
 }
@@ -824,7 +819,7 @@ open_plugin_pane() {
   local cwd
   [[ -n "$entrypoint" ]] || usage
   cwd="$(pane_cwd_or_die)"
-  "$HERDR_BIN" plugin pane open --plugin "$PLUGIN_ID" --entrypoint "$entrypoint" --placement overlay --cwd "$cwd" --focus >/dev/null
+  "$HERDR_BIN" plugin pane open --plugin "$PLUGIN_ID" --entrypoint "$entrypoint" --cwd "$cwd" --focus >/dev/null
 }
 
 main() {

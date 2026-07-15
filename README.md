@@ -36,13 +36,13 @@ herdr plugin action invoke wheels.dev-workflow.doctor
 ## Keybindings
 
 - `prefix+l`: set up the two-pane dev layout in the current workspace
-- `prefix+n`: prompt for a new `wheels/<name>` branch and worktree
-- `prefix+o`: pick and open an existing managed worktree or `origin/*` branch
+- `prefix+n`: prompt in a popup for a new `wheels/<name>` branch and worktree
+- `prefix+o`: pick in a popup and open an existing managed worktree or `origin/*` branch
 - `prefix+a`: open all managed worktrees
 - `prefix+p`: automatically prune eligible managed worktrees
-- `prefix+shift+p`: manually select and prune a managed worktree
-- `prefix+g`: open `lazygit`
-- `prefix+e`: open `nvim` in a new pane
+- `prefix+shift+p`: manually select and prune a managed worktree in a popup
+- `prefix+g`: open `lazygit` in a popup
+- `prefix+e`: open `nvim` in a temporary full overlay
 
 Keybindings live in Herdr's global `config.toml` and invoke portable plugin actions.
 The plugin itself contains no user-specific absolute paths.
