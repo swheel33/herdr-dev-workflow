@@ -788,6 +788,30 @@ notify() {
   "$HERDR_BIN" notification show "$title" --body "$body" --sound none >/dev/null 2>&1 || true
 }
 
+run_prune_job() {
+  local output status summary
+  if output="$("$@" 2>&1)"; then
+    status=0
+  else
+    status=$?
+  fi
+
+  if [[ -n "$output" ]]; then
+    printf '%s\n' "$output"
+  fi
+  summary="${output##*$'\n'}"
+  if [[ -z "$summary" ]]; then
+    summary="Prune command exited with status $status."
+  fi
+
+  if [[ "$status" == "0" ]]; then
+    notify "Prune complete" "$summary"
+  else
+    notify "Prune failed" "$summary"
+  fi
+  return "$status"
+}
+
 prune_auto() {
   local cwd repo_root kind name branch_name tree_path index
   local source_workspace_id="${HERDR_WORKSPACE_ID:-}" source_is_pruned=0
@@ -798,7 +822,6 @@ prune_auto() {
   cd "$cwd"
   repo_root="$(repo_root_or_die)"
 
-  notify "Pruning worktrees..." "Fetching origin and checking managed worktrees."
   printf 'Fetching origin...\n'
   refresh_origin_refs "$repo_root"
 
@@ -888,7 +911,19 @@ prune_auto() {
   local summary
   summary="Pruned $pruned_branches of $total managed worktrees; removed $pruned_worktrees worktrees; skipped $skipped_dirty dirty, $skipped_remote with remote, $skipped_protected protected, $skipped_other other."
   printf '%s\n' "$summary"
-  notify "Prune complete" "$summary"
+}
+
+start_background_prune() {
+  local repo_root="$1"
+  local name="$2"
+  local force="$3"
+  local state_dir log_path script_path
+  state_dir="${HERDR_PLUGIN_STATE_DIR:-${TMPDIR:-/tmp}}"
+  log_path="$state_dir/prune-manual.log"
+  script_path="$(cd -P "$(dirname "${BASH_SOURCE[0]}")" && pwd)/$(basename "${BASH_SOURCE[0]}")"
+  mkdir -p "$state_dir"
+  printf '\n[%s] Pruning %s (force=%s)\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$name" "$force" >> "$log_path"
+  nohup "$script_path" prune-selected-background "$repo_root" "$name" "$force" >> "$log_path" 2>&1 </dev/null &
 }
 
 prune_pane() {
@@ -908,9 +943,7 @@ prune_pane() {
   if [[ "$answer" == y || "$answer" == Y ]]; then
     force=1
   fi
-  prune_selected_worktree "$repo_root" "$name" "$force"
-  printf '\nPress enter to close...'
-  IFS= read -r _
+  start_background_prune "$repo_root" "$name" "$force"
 }
 
 layout_here() {
@@ -972,7 +1005,15 @@ main() {
     layout-here) layout_here "$@" ;;
     open-pane) open_plugin_pane "$@" ;;
     open-all) open_all "$@" ;;
-    prune-auto) prune_auto "$@" ;;
+    prune-auto)
+      notify "Pruning worktrees..." "Fetching origin and checking managed worktrees."
+      run_prune_job "$0" prune-auto-job "$@"
+      ;;
+    prune-auto-job) prune_auto "$@" ;;
+    prune-selected-background)
+      run_prune_job "$0" prune-selected-job "$@"
+      ;;
+    prune-selected-job) prune_selected_worktree "$@" ;;
     new-branch-pane)
       trap 'pause_on_error "$?"' EXIT
       new_branch_pane "$@"
@@ -981,7 +1022,10 @@ main() {
       trap 'pause_on_error "$?"' EXIT
       open_pane_entry "$@"
       ;;
-    prune-pane) prune_pane "$@" ;;
+    prune-pane)
+      trap 'pause_on_error "$?"' EXIT
+      prune_pane "$@"
+      ;;
     doctor) doctor "$@" ;;
     *) usage ;;
   esac

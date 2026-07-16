@@ -42,7 +42,7 @@ herdr plugin action invoke wheels.dev-workflow.doctor
 - `prefix+o`: pick in a popup and open any existing worktree or `origin/*` branch
 - `prefix+a`: open all managed worktrees
 - `prefix+p`: automatically prune eligible managed worktrees
-- `prefix+shift+p`: manually select and prune a managed worktree in a popup
+- `prefix+shift+p`: select and confirm a managed worktree, then prune it in the background
 - `prefix+g`: open `lazygit` in a popup
 - `prefix+e`: open `nvim` in a temporary full overlay
 
@@ -68,6 +68,7 @@ See [`keybindings.example.toml`](keybindings.example.toml) for the complete bind
 - colliding slugged worktree paths fail explicitly instead of opening a different branch
 - `.env` files from `apps/*/*/.env` in the primary checkout are symlinked into new worktrees
 - automatic pruning only considers worktrees under `.worktrees`; unrelated local branches are never removed
+- manual pruning closes its popup after confirmation and reports completion or failure through a Herdr notification
 
 ## Dependencies
 
