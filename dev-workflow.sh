@@ -308,7 +308,7 @@ open_worktree_path_with_layout() {
 
 create_personal_worktree() {
   local requested_name="$1"
-  local repo_root checkout_root branch_suffix branch_name tree_name tree_path base_branch base_ref target_directory workspace_id
+  local repo_root checkout_root branch_suffix branch_name tree_name tree_path base_branch base_ref target_directory workspace_id selection_status
   repo_root="$(repo_root_or_die)"
   checkout_root="$(current_checkout_root_or_die)"
   branch_suffix="$(slugify "$requested_name")"
@@ -335,7 +335,13 @@ create_personal_worktree() {
     exit 1
   fi
 
-  base_branch="$(select_base_branch "$repo_root")" || exit 0
+  if base_branch="$(select_base_branch "$repo_root")"; then
+    :
+  else
+    selection_status=$?
+    [[ "$selection_status" == "130" ]] && exit 0
+    exit "$selection_status"
+  fi
   base_ref="$(worktree_base_ref "$repo_root" "$base_branch")"
   if ! git -C "$repo_root" rev-parse --verify --quiet "${base_ref}^{commit}" >/dev/null; then
     printf 'Base branch not found: %s\n' "$base_ref" >&2
@@ -509,13 +515,30 @@ base_branch_rows() {
 
 select_base_branch() {
   local repo_root="$1"
-  local preferred selected
+  local preferred selected status
+  local pipeline_status=()
   preferred="$(preferred_base_branch "$repo_root")"
   if [[ -z "$preferred" ]]; then
     printf 'Could not determine a base branch for %s\n' "$repo_root" >&2
     return 1
   fi
-  selected="$(base_branch_rows "$repo_root" "$preferred" | select_with_fzf "base (${preferred})> ")" || return 1
+  if selected="$(
+    set +e
+    base_branch_rows "$repo_root" "$preferred" | select_with_fzf "base (${preferred})> "
+    pipeline_status=("${PIPESTATUS[@]}")
+    if ((pipeline_status[1] == 0 && (pipeline_status[0] == 0 || pipeline_status[0] == 141))); then
+      exit 0
+    fi
+    if ((pipeline_status[1] != 0)); then
+      exit "${pipeline_status[1]}"
+    fi
+    exit "${pipeline_status[0]}"
+  )"; then
+    :
+  else
+    status=$?
+    return "$status"
+  fi
   selected="${selected%%$'\t'*}"
   [[ -n "$selected" ]] || return 1
   printf '%s' "$selected"
@@ -950,7 +973,10 @@ main() {
     open-pane) open_plugin_pane "$@" ;;
     open-all) open_all "$@" ;;
     prune-auto) prune_auto "$@" ;;
-    new-branch-pane) new_branch_pane "$@" ;;
+    new-branch-pane)
+      trap 'pause_on_error "$?"' EXIT
+      new_branch_pane "$@"
+      ;;
     open-pane-entry)
       trap 'pause_on_error "$?"' EXIT
       open_pane_entry "$@"
