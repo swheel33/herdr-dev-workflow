@@ -164,10 +164,35 @@ list_worktrees_porcelain() {
   git -C "$repo_root" worktree list --porcelain
 }
 
+prunable_worktree_count() {
+  local repo_root="$1"
+  local line count=0
+  while IFS= read -r line; do
+    if [[ "$line" == prunable\ * ]]; then
+      count=$((count + 1))
+    fi
+  done < <(list_worktrees_porcelain "$repo_root")
+  printf '%s' "$count"
+}
+
 is_managed_worktree_path() {
   local repo_root="$1"
   local path="$2"
   [[ "$path" == "$(managed_worktree_root "$repo_root")"/* ]]
+}
+
+opencode_worktree_root() {
+  local root="${TMPDIR:-/tmp}/opencode"
+  [[ -d "$root" ]] || return 1
+  (cd -P "$root" && pwd)
+}
+
+is_opencode_worktree_path() {
+  local path="$1"
+  local root resolved_path
+  root="$(opencode_worktree_root)" || return 1
+  resolved_path="$(cd -P "$path" 2>/dev/null && pwd)" || return 1
+  path_contains "$root" "$resolved_path"
 }
 
 primary_worktree_path() {
@@ -449,6 +474,26 @@ managed_worktree_rows() {
   done < <(list_worktrees_porcelain "$repo_root")
 }
 
+auto_prunable_worktree_rows() {
+  local repo_root="$1"
+  local line path branch name source
+  while IFS= read -r line; do
+    if [[ "$line" == worktree\ * ]]; then
+      path="${line#worktree }"
+      if is_managed_worktree_path "$repo_root" "$path"; then
+        source='managed'
+      elif is_opencode_worktree_path "$path"; then
+        source='OpenCode'
+      else
+        continue
+      fi
+      name="$(basename "$path")"
+      branch="$(git -C "$path" symbolic-ref --quiet --short HEAD 2>/dev/null || printf 'detached')"
+      printf 'worktree\t%s\t%s\t%s\t%s\n' "$name" "$branch" "$path" "$source"
+    fi
+  done < <(list_worktrees_porcelain "$repo_root")
+}
+
 openable_worktree_rows() {
   local repo_root="$1"
   local line path branch name
@@ -712,6 +757,20 @@ branch_is_protected() {
   return 1
 }
 
+branch_worktree_path() {
+  local repo_root="$1"
+  local branch_name="$2"
+  local line tree_path=""
+  while IFS= read -r line; do
+    if [[ "$line" == worktree\ * ]]; then
+      tree_path="${line#worktree }"
+    elif [[ "$line" == "branch refs/heads/$branch_name" ]]; then
+      printf '%s' "$tree_path"
+      return 0
+    fi
+  done < <(list_worktrees_porcelain "$repo_root")
+}
+
 prune_branch() {
   local repo_root="$1"
   local branch_name="$2"
@@ -813,10 +872,12 @@ run_prune_job() {
 }
 
 prune_auto() {
-  local cwd repo_root kind name branch_name tree_path index
+  local cwd repo_root kind name branch_name tree_path source index
   local source_workspace_id="${HERDR_WORKSPACE_ID:-}" source_is_pruned=0
-  local total=0 pruned_branches=0 pruned_worktrees=0 skipped_dirty=0 skipped_remote=0 skipped_protected=0 skipped_other=0
-  local prune_names=() prune_branches=() prune_paths=() close_pids=() remove_pids=()
+  local total=0 pruned_worktrees=0 pruned_standalone_branches=0
+  local total_managed=0 total_opencode=0 pruned_managed=0 pruned_opencode=0 stale_before=0 stale_after=0 stale_pruned=0
+  local skipped_dirty=0 skipped_remote=0 skipped_protected=0 skipped_checked_out=0 skipped_other=0
+  local prune_names=() prune_branches=() prune_paths=() prune_sources=() close_pids=() remove_pids=()
 
   cwd="$(pane_cwd_or_die)"
   cd "$cwd"
@@ -825,9 +886,19 @@ prune_auto() {
   printf 'Fetching origin...\n'
   refresh_origin_refs "$repo_root"
 
-  while IFS=$'\t' read -r kind name branch_name tree_path; do
+  stale_before="$(prunable_worktree_count "$repo_root")"
+  git -C "$repo_root" worktree prune --expire now --verbose
+  stale_after="$(prunable_worktree_count "$repo_root")"
+  stale_pruned=$((stale_before - stale_after))
+
+  while IFS=$'\t' read -r kind name branch_name tree_path source; do
     [[ "$kind" == "worktree" && -n "$tree_path" ]] || continue
     total=$((total + 1))
+    if [[ "$source" == 'OpenCode' ]]; then
+      total_opencode=$((total_opencode + 1))
+    else
+      total_managed=$((total_managed + 1))
+    fi
 
     if [[ -z "$branch_name" || "$branch_name" == "detached" ]]; then
       skipped_other=$((skipped_other + 1))
@@ -862,10 +933,11 @@ prune_auto() {
     prune_names+=("$name")
     prune_branches+=("$branch_name")
     prune_paths+=("$tree_path")
+    prune_sources+=("$source")
     if path_contains "$tree_path" "$cwd"; then
       source_is_pruned=1
     fi
-  done < <(managed_worktree_rows "$repo_root")
+  done < <(auto_prunable_worktree_rows "$repo_root")
 
   for index in "${!prune_paths[@]}"; do
     close_workspace_for_path "${prune_paths[$index]}" &
@@ -889,6 +961,7 @@ prune_auto() {
     name="${prune_names[$index]}"
     branch_name="${prune_branches[$index]}"
     tree_path="${prune_paths[$index]}"
+    source="${prune_sources[$index]}"
     if ! wait "${remove_pids[$index]}"; then
       skipped_other=$((skipped_other + 1))
       printf 'Failed to prune worktree %s (%s)\n' "$name" "$tree_path" >&2
@@ -896,6 +969,11 @@ prune_auto() {
     fi
 
     pruned_worktrees=$((pruned_worktrees + 1))
+    if [[ "$source" == 'OpenCode' ]]; then
+      pruned_opencode=$((pruned_opencode + 1))
+    else
+      pruned_managed=$((pruned_managed + 1))
+    fi
     if git -C "$repo_root" show-ref --verify --quiet "refs/heads/$branch_name"; then
       if ! git -C "$repo_root" branch -D "$branch_name" >/dev/null; then
         skipped_other=$((skipped_other + 1))
@@ -904,12 +982,43 @@ prune_auto() {
       fi
     fi
 
-    pruned_branches=$((pruned_branches + 1))
     printf 'Pruned worktree %s and branch %s (no matching remote branch)\n' "$name" "$branch_name"
   done
 
+  while IFS= read -r branch_name; do
+    [[ -n "$branch_name" ]] || continue
+    if remote_branch_exists "$repo_root" "$branch_name"; then
+      continue
+    fi
+
+    tree_path="$(branch_worktree_path "$repo_root" "$branch_name")"
+    if [[ -n "$tree_path" ]]; then
+      if is_managed_worktree_path "$repo_root" "$tree_path" || is_opencode_worktree_path "$tree_path"; then
+        continue
+      fi
+    fi
+    if branch_is_protected "$repo_root" "$branch_name"; then
+      skipped_protected=$((skipped_protected + 1))
+      printf 'Skipping branch %s: protected branch\n' "$branch_name"
+      continue
+    fi
+    if [[ -n "$tree_path" ]]; then
+      skipped_checked_out=$((skipped_checked_out + 1))
+      printf 'Skipping branch %s: checked out at %s\n' "$branch_name" "$tree_path"
+      continue
+    fi
+    if ! git -C "$repo_root" branch -D "$branch_name" >/dev/null; then
+      skipped_other=$((skipped_other + 1))
+      printf 'Failed to prune standalone branch %s\n' "$branch_name" >&2
+      continue
+    fi
+
+    pruned_standalone_branches=$((pruned_standalone_branches + 1))
+    printf 'Pruned standalone branch %s (no matching remote branch)\n' "$branch_name"
+  done < <(git -C "$repo_root" for-each-ref --format='%(refname:short)' refs/heads)
+
   local summary
-  summary="Pruned $pruned_branches of $total managed worktrees; removed $pruned_worktrees worktrees; skipped $skipped_dirty dirty, $skipped_remote with remote, $skipped_protected protected, $skipped_other other."
+  summary="Pruned $pruned_worktrees of $total worktrees ($pruned_managed/$total_managed managed, $pruned_opencode/$total_opencode OpenCode), $pruned_standalone_branches standalone branches, and $stale_pruned stale worktree record(s); skipped $skipped_dirty dirty, $skipped_remote with remote, $skipped_protected protected, $skipped_checked_out checked out elsewhere, $skipped_other other."
   printf '%s\n' "$summary"
 }
 
@@ -923,7 +1032,10 @@ start_background_prune() {
   script_path="$(cd -P "$(dirname "${BASH_SOURCE[0]}")" && pwd)/$(basename "${BASH_SOURCE[0]}")"
   mkdir -p "$state_dir"
   printf '\n[%s] Pruning %s (force=%s)\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$name" "$force" >> "$log_path"
-  nohup "$script_path" prune-selected-background "$repo_root" "$name" "$force" >> "$log_path" 2>&1 </dev/null &
+  # Ignore HUP before forking so popup teardown cannot race the worker startup.
+  trap '' HUP
+  "$script_path" prune-selected-background "$repo_root" "$name" "$force" >> "$log_path" 2>&1 </dev/null &
+  trap - HUP
 }
 
 prune_pane() {

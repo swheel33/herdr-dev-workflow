@@ -41,7 +41,7 @@ herdr plugin action invoke wheels.dev-workflow.doctor
 - `prefix+n`: create a new `wheels/<name>` worktree from a selected base branch
 - `prefix+o`: pick in a popup and open any existing worktree or `origin/*` branch
 - `prefix+a`: open all managed worktrees
-- `prefix+p`: automatically prune eligible managed worktrees
+- `prefix+p`: automatically prune eligible managed and OpenCode worktrees plus standalone local branches
 - `prefix+shift+p`: select and confirm a managed worktree, then prune it in the background
 - `prefix+g`: open `lazygit` in a popup
 - `prefix+e`: open `nvim` in a temporary full overlay
@@ -67,7 +67,8 @@ See [`keybindings.example.toml`](keybindings.example.toml) for the complete bind
 - selecting `origin/alice/checkout-fix` opens local branch `alice/checkout-fix` at `.worktrees/alice-checkout-fix`
 - colliding slugged worktree paths fail explicitly instead of opening a different branch
 - `.env` files from `apps/*/*/.env` in the primary checkout are symlinked into new worktrees
-- automatic pruning only considers worktrees under `.worktrees`; unrelated local branches are never removed
+- automatic pruning removes clean managed and `$TMPDIR/opencode` worktrees plus unchecked-out local branches when no same-named `origin/*` branch exists
+- automatic pruning also clears stale Git worktree records whose checkout paths no longer exist
 - manual pruning closes its popup after confirmation and reports completion or failure through a Herdr notification
 
 ## Dependencies
