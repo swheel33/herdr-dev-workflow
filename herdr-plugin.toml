@@ -1,7 +1,7 @@
 id = "wheels.dev-workflow"
 name = "Wheels Dev Workflow"
 version = "0.0.1"
-min_herdr_version = "0.7.4"
+min_herdr_version = "0.7.5"
 description = "Personal Herdr workflows for managed git worktrees and development tools."
 platforms = ["macos", "linux"]
 

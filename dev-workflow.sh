@@ -11,11 +11,24 @@ usage() {
 }
 
 doctor() {
-  local command missing=0
+  local command integration_line missing=0
   local required=(git python3 opencode pnpm zsh nvim lazygit fzf)
 
   printf 'Wheels Dev Workflow dependency check\n\n'
-  printf 'Herdr: %s\n' "$HERDR_BIN"
+  printf 'Herdr: %s (%s)\n' "$HERDR_BIN" "$("$HERDR_BIN" --version 2>/dev/null || printf 'version unknown')"
+  integration_line="$("$HERDR_BIN" integration status 2>/dev/null | while IFS= read -r line; do
+    if [[ "$line" == opencode:* ]]; then
+      printf '%s' "$line"
+      break
+    fi
+  done)"
+  if [[ "$integration_line" == opencode:\ current* ]]; then
+    printf '  ok       %s\n' "$integration_line"
+  else
+    printf '  warning  %s\n' "${integration_line:-opencode integration status unavailable}"
+    printf '           install with `herdr integration install opencode`\n'
+    missing=1
+  fi
   for command in "${required[@]}"; do
     if command -v "$command" >/dev/null 2>&1; then
       printf '  ok       %-10s %s\n' "$command" "$(command -v "$command")"
@@ -50,6 +63,21 @@ slugify() {
   value="${value#-}"
   value="${value%-}"
   printf '%s' "$value"
+}
+
+agent_name_for_pane() {
+  local label="$1"
+  local pane_id="$2"
+  local label_part pane_part
+  label_part="$(slugify "$label")"
+  label_part="${label_part//./-}"
+  label_part="${label_part:0:18}"
+  [[ -n "$label_part" ]] || label_part='workspace'
+  pane_part="$(slugify "$pane_id")"
+  pane_part="${pane_part//./-}"
+  pane_part="${pane_part:0:10}"
+  [[ -n "$pane_part" ]] || pane_part='pane'
+  printf 'oc-%s-%s' "$label_part" "$pane_part"
 }
 
 json_field() {
@@ -283,7 +311,7 @@ setup_layout_for_workspace() {
   local directory="$2"
   local label="$3"
   local run_install="${4:-0}"
-  local root_pane pane_count shell_json shell_pane directory_quoted
+  local root_pane pane_count shell_json shell_pane directory_quoted agent_name
 
   pane_count="$(workspace_pane_count "$workspace_id")"
   if [[ "$pane_count" -gt 1 ]]; then
@@ -296,8 +324,9 @@ setup_layout_for_workspace() {
   shell_json="$("$HERDR_BIN" pane split "$root_pane" --direction down --ratio 0.70 --cwd "$directory" --no-focus)"
   shell_pane="$(printf '%s' "$shell_json" | json_field pane_id)"
   printf -v directory_quoted '%q' "$directory"
+  agent_name="$(agent_name_for_pane "$label" "$root_pane")"
 
-  "$HERDR_BIN" pane run "$root_pane" "cd -- $directory_quoted && opencode" >/dev/null
+  "$HERDR_BIN" agent start "$agent_name" --kind opencode --pane "$root_pane" -- "$directory" >/dev/null
   if [[ "$run_install" == "1" ]]; then
     "$HERDR_BIN" pane run "$shell_pane" "zsh -lic 'cd -- \"\$1\" && pnpm install' zsh $directory_quoted" >/dev/null
   else
