@@ -19,7 +19,7 @@ brew install fzf
 sudo apt install fzf
 ```
 
-After the repository is published, install the plugin from GitHub:
+Install the plugin from GitHub:
 
 ```bash
 herdr plugin install swheel33/herdr-dev-workflow --yes
@@ -45,7 +45,7 @@ Install the OpenCode lifecycle integration and the official Herdr skill:
 
 ```bash
 herdr integration install opencode
-npx skills add ogulcancelik/herdr --skill herdr -g
+npx skills add ogulcancelik/herdr --skill herdr -g -y
 ```
 
 Restart OpenCode after installing or updating its integration, skills, or
@@ -145,7 +145,7 @@ Herdr installs the plugin repository but does not install system dependencies.
 herdr update
 herdr integration install opencode
 herdr plugin install swheel33/herdr-dev-workflow --yes
-npx skills add ogulcancelik/herdr --skill herdr -g
+npx skills add ogulcancelik/herdr --skill herdr -g -y
 herdr config check
 herdr plugin action invoke wheels.dev-workflow.doctor
 ```
