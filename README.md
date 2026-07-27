@@ -141,3 +141,10 @@ commands. Add the keybindings from `keybindings.example.toml` to
 `~/.config/herdr/config.toml`, then run `herdr server reload-config` or restart
 Herdr. Register `instructions/herdr-feature-workspaces.md` in OpenCode's global
 configuration and restart OpenCode so it loads the integration and instruction.
+
+Herdr forwards OSC 52 clipboard writes from terminal applications to the local
+clipboard. For Neovim, merge the relevant lines from
+[`examples/nvim/options.lua`](examples/nvim/options.lua) into the existing
+`lua/config/options.lua`; do not overwrite an existing options file. In
+particular, set `vim.g.clipboard = "osc52"` before
+`vim.opt.clipboard = "unnamedplus"` so yanks use the forwarded clipboard.

@@ -2,6 +2,8 @@
 
 When `HERDR_ENV=1` and a request requires code changes:
 
+- Treat repository detection as a prerequisite. Run `git rev-parse --show-toplevel` from the caller's current directory before planning a workspace. If it fails, do not create a Herdr workspace or treat the home or root directory as a project; ask the user for the intended repository path.
+- Before `herdr worktree create`, verify the proposed repository root contains a valid `.git` worktree: `test -e "$repo_root/.git"`, `git -C "$repo_root" rev-parse --is-inside-work-tree` must return `true`, and `git -C "$repo_root" rev-parse --show-toplevel` must resolve to `$repo_root`. If validation fails, ask the user for the correct repository path instead of creating a workspace.
 - Do not create worktrees for questions, planning, exploration, reviews, or Git-only publication.
 - If already delegated into the worktree for this exact task, work there directly and do not delegate again.
 - Otherwise, do not edit the originating checkout. Create a sibling worktree under the primary repository's `.worktrees` directory.
