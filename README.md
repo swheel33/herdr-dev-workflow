@@ -77,25 +77,11 @@ addressed reliably with Herdr 0.7.5 commands such as `herdr agent get`,
 
 ## OpenCode Feature Spaces
 
-The official Herdr skill gives an OpenCode agent access to Herdr's workspace,
-worktree, pane, and agent commands when `HERDR_ENV=1`. Keep the skill installed
-globally rather than copying it into every application repository.
-
-A personal OpenCode instruction can authorize this feature-space policy:
-
-- read-only exploration and OpenCode task subagents stay in the current space
-- reuse the current worktree only when it belongs to the requested feature
-- create a new Herdr worktree workspace when the current checkout is primary, unrelated, or uncertain
-- use `wheels/<slug>` and `<repo>/.worktrees/<slug>` for new feature work
-- use current `HEAD` for default-branch work or intentional stacked work
-- use `develop`, then the repository default, for unrelated work
-- start and prompt a named OpenCode agent in the new workspace
-- leave the originating workspace open and never prune the new space automatically
-
-The policy should be conditional on `HERDR_ENV=1`; outside Herdr, OpenCode
-continues its normal workflow. OpenCode's experimental internal workspace
-feature is not required because Herdr remains the visible workspace and agent
-orchestrator.
+The repository includes a concise global OpenCode policy at
+[`instructions/herdr-feature-workspaces.md`](instructions/herdr-feature-workspaces.md).
+Reference that file from OpenCode's global `instructions` configuration. The
+broader Herdr skill is not required for this workflow. Repository `AGENTS.md`
+files continue to provide project-specific guidance.
 
 Herdr 0.7.5 separates topology from agent startup. An agent creates a worktree
 workspace, reads the returned root pane ID, starts OpenCode there, and submits
@@ -108,9 +94,10 @@ herdr worktree create \
   --base "$base_ref" \
   --path "$repo_root/.worktrees/$slug" \
   --label "$slug" \
-  --no-focus \
+  --focus \
   --json
 
+herdr pane split "$root_pane_id" --direction down --ratio 0.70 --cwd "$worktree_path" --no-focus
 herdr agent start "$agent_name" --kind opencode --pane "$root_pane_id" -- "$worktree_path"
 herdr agent prompt "$agent_name" "$implementation_task"
 ```
@@ -145,7 +132,6 @@ Herdr installs the plugin repository but does not install system dependencies.
 herdr update
 herdr integration install opencode
 herdr plugin install swheel33/herdr-dev-workflow --yes
-npx skills add ogulcancelik/herdr --skill herdr -g -y
 herdr config check
 herdr plugin action invoke wheels.dev-workflow.doctor
 ```
@@ -153,4 +139,5 @@ herdr plugin action invoke wheels.dev-workflow.doctor
 When a named Herdr session is active, set `HERDR_SESSION=<name>` for the Herdr
 commands. Add the keybindings from `keybindings.example.toml` to
 `~/.config/herdr/config.toml`, then run `herdr server reload-config` or restart
-Herdr. Restart OpenCode separately so it loads the integration and skill.
+Herdr. Register `instructions/herdr-feature-workspaces.md` in OpenCode's global
+configuration and restart OpenCode so it loads the integration and instruction.
