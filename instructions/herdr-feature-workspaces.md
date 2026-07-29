@@ -10,8 +10,9 @@ When `HERDR_ENV=1` and a request requires code changes:
 - Run `git -C "$repo_root" fetch origin --prune` before selecting a base or creating a branch.
 - Use `wheels/<slug>` for the branch and `.worktrees/<slug>` for the path.
 - For work related to the current feature branch, use that branch as the base. Otherwise prefer `origin/develop`, then the remote default branch.
-- Use `herdr worktree create --focus --json`, split the returned root pane downward at `0.70` without changing focus, start a named OpenCode agent in the focused root pane, and send it the complete request.
-- Coordinate the delegated agent asynchronously. Submit prompts without `--wait`; never use blocking agent waits such as `herdr agent prompt --wait`, `herdr agent wait`, or `herdr pane wait-output`. Check status with short, non-blocking calls when needed. Do not duplicate its work, close the originating workspace, or automatically prune the new workspace.
-- If creation fails, report the error instead of editing the originating checkout.
+- Use `herdr worktree create --focus --json`. Split the returned `root_pane.pane_id` downward at `0.70` with `herdr pane split <root-pane-id> --direction down --ratio 0.70 --no-focus`. The original root pane must remain focused, occupy the upper 70%, and host the only agent. Leave the new lower pane as an unused interactive shell.
+- Start exactly one named OpenCode agent in the original root pane and send it the complete request. Submit the prompt without `--wait`, then return control immediately. Do not repeatedly poll, wait for completion, inspect the delegated work, or perform the task locally in the same turn.
+- Coordinate the delegated agent asynchronously. Never use blocking agent waits such as `herdr agent prompt --wait`, `herdr agent wait`, or `herdr pane wait-output`. Resume coordination after an asynchronous completion notification or a new user request. Do not duplicate its work, close the originating workspace, or automatically prune the new workspace.
+- If workspace creation or the delegated agent fails, is blocked, becomes overloaded, or exits, report the error. Do not edit the originating checkout, start a replacement agent, move the agent, or use the lower pane for an agent.
 
 Repository `AGENTS.md` files remain authoritative for implementation, validation, commits, and pushes.
