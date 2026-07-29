@@ -11,7 +11,7 @@ When `HERDR_ENV=1` and a request requires code changes:
 - Use `wheels/<slug>` for the branch and `.worktrees/<slug>` for the path.
 - For work related to the current feature branch, use that branch as the base. Otherwise prefer `origin/develop`, then the remote default branch.
 - Use `herdr worktree create --focus --json`, split the returned root pane downward at `0.70` without changing focus, start a named OpenCode agent in the focused root pane, and send it the complete request.
-- Wait for and coordinate the delegated agent. Do not duplicate its work, close the originating workspace, or automatically prune the new workspace.
+- Coordinate the delegated agent asynchronously. Submit prompts without `--wait`; never use blocking agent waits such as `herdr agent prompt --wait`, `herdr agent wait`, or `herdr pane wait-output`. Check status with short, non-blocking calls when needed. Do not duplicate its work, close the originating workspace, or automatically prune the new workspace.
 - If creation fails, report the error instead of editing the originating checkout.
 
 Repository `AGENTS.md` files remain authoritative for implementation, validation, commits, and pushes.
