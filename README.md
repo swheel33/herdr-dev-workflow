@@ -94,7 +94,7 @@ herdr worktree create \
   --base "$base_ref" \
   --path "$repo_root/.worktrees/$slug" \
   --label "$slug" \
-  --focus \
+  --no-focus \
   --json
 
 herdr pane split "$root_pane_id" --direction down --ratio 0.70 --cwd "$worktree_path" --no-focus
