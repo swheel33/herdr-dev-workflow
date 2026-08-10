@@ -20,6 +20,7 @@ from lifecycle import (
     GitFailure,
     known_roots,
     log_event,
+    notify,
     state_dir,
     synchronize_primary_main,
 )
@@ -253,6 +254,11 @@ def dispatcher_environment(root, session_id=None):
         environment["HERDR_DISPATCHER_SESSION_ID"] = session_id
     else:
         environment.pop("HERDR_DISPATCHER_SESSION_ID", None)
+    thread_id = os.environ.get("HERDR_DISPATCH_THREAD_ID")
+    if thread_id:
+        environment["HERDR_DISPATCH_THREAD_ID"] = thread_id
+    else:
+        environment.pop("HERDR_DISPATCH_THREAD_ID", None)
     return environment
 
 
@@ -281,28 +287,62 @@ def primary_workspace(root):
     return workspace_id, bootstrap_pane_id
 
 
-def open_chat_tab(root, session_id=None, label=CHAT_TAB_LABEL):
+def open_chat_in_workspace(
+    root,
+    workspace_id,
+    *,
+    session_id=None,
+    label=CHAT_TAB_LABEL,
+    focus=True,
+    target_pane=None,
+    fork=False,
+    thread_id=None,
+):
     root = canonical(root)
-    workspace_id, bootstrap_pane_id = primary_workspace(root)
     command = [
         "plugin", "pane", "open",
         "--plugin", os.environ.get("HERDR_PLUGIN_ID", "wheels.dev-workflow"),
         "--entrypoint", "dispatcher-chat",
-        "--placement", "split" if bootstrap_pane_id else "tab",
+        "--placement", "split" if target_pane else "tab",
         "--workspace", workspace_id,
         "--cwd", root,
         "--env", f"HERDR_DISPATCHER_PROJECT_ROOT={root}",
         "--env", f"HERDR_CHAT_TAB_LABEL={label}",
     ]
-    if bootstrap_pane_id:
-        command.extend(("--target-pane", bootstrap_pane_id))
+    if target_pane:
+        command.extend(("--target-pane", target_pane))
     if session_id:
         command.extend(("--env", f"HERDR_DISPATCHER_SESSION_ID={session_id}"))
-    command.append("--focus")
+    if fork:
+        command.extend(("--env", "HERDR_DISPATCHER_FORK_SESSION=1"))
+    if thread_id:
+        command.extend(("--env", f"HERDR_DISPATCH_THREAD_ID={thread_id}"))
+    command.append("--focus" if focus else "--no-focus")
     herdr(*command)
+
+
+def open_chat_tab(root, session_id=None, label=CHAT_TAB_LABEL, *, fork=False, thread_id=None):
+    root = canonical(root)
+    workspace_id, bootstrap_pane_id = primary_workspace(root)
+    open_chat_in_workspace(
+        root,
+        workspace_id,
+        session_id=session_id,
+        label=label,
+        target_pane=bootstrap_pane_id,
+        fork=fork,
+        thread_id=thread_id,
+    )
     if bootstrap_pane_id:
         herdr("pane", "close", bootstrap_pane_id)
-    log_event("dispatcher.chat_tab_opened", project_root=root, workspace_id=workspace_id, session_id=session_id)
+    log_event(
+        "dispatcher.chat_tab_opened",
+        project_root=root,
+        workspace_id=workspace_id,
+        session_id=session_id,
+        fork=fork,
+        thread_id=thread_id,
+    )
     return workspace_id
 
 
@@ -327,6 +367,8 @@ def run_chat(exec_fn=os.execvpe):
     arguments = ["opencode", root, "--agent", CHAT_AGENT]
     if session_id:
         arguments.extend(("--session", session_id))
+    if os.environ.get("HERDR_DISPATCHER_FORK_SESSION") == "1":
+        arguments.append("--fork")
     log_event("dispatcher.session_launching", project_root=root, fresh=not bool(session_id), session_id=session_id)
     exec_fn("opencode", arguments, dispatcher_environment(root, session_id))
 
@@ -349,7 +391,7 @@ def chat_picker():
 
 
 def opencode_sessions(root):
-    result = run_command(["opencode", "session", "list", "--format", "json"], cwd=root)
+    result = run_command(["opencode", "session", "list", "--format", "json", "--max-count", "200"], cwd=root)
     try:
         sessions = json.loads(result.stdout)
     except json.JSONDecodeError as error:
@@ -362,9 +404,97 @@ def checkout_root(path):
     return canonical(result.stdout.strip()) if result.returncode == 0 and result.stdout.strip() else None
 
 
+def dispatch_threads_path():
+    return state_dir() / "dispatch-threads.json"
+
+
+def load_dispatch_threads():
+    path = dispatch_threads_path()
+    if not path.exists():
+        return []
+    try:
+        threads = json.loads(path.read_text()).get("threads", [])
+    except (OSError, json.JSONDecodeError):
+        return []
+    return threads if isinstance(threads, list) else []
+
+
+def update_dispatch_thread(thread_id, project_root, session_id, **fields):
+    path = dispatch_threads_path()
+    lock_path = state_dir() / "locks" / "dispatch-threads.lock"
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    with lock_path.open("a+") as handle:
+        fcntl.flock(handle, fcntl.LOCK_EX)
+        threads = load_dispatch_threads()
+        thread = next((item for item in threads if item.get("thread_id") == thread_id), None)
+        if thread is None:
+            thread = {
+                "thread_id": thread_id,
+                "project_root": canonical(project_root),
+                "sessions": [],
+                "dispatches": [],
+            }
+            threads.append(thread)
+        sessions = thread.setdefault("sessions", [])
+        if session_id and session_id not in sessions:
+            sessions.append(session_id)
+        thread.update(fields)
+        thread["project_root"] = canonical(project_root)
+        thread["latest_session_id"] = session_id
+        thread["updated"] = int(time.time() * 1000)
+        atomic_json(path, {"threads": threads})
+    return thread
+
+
+def record_dispatch_thread(root, thread_id, source_session_id, implementation_session_id, slug, branch, checkout):
+    path = dispatch_threads_path()
+    lock_path = state_dir() / "locks" / "dispatch-threads.lock"
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    with lock_path.open("a+") as handle:
+        fcntl.flock(handle, fcntl.LOCK_EX)
+        threads = load_dispatch_threads()
+        thread = next((item for item in threads if item.get("thread_id") == thread_id), None)
+        if thread is None:
+            thread = {
+                "thread_id": thread_id,
+                "project_root": canonical(root),
+                "sessions": [],
+                "dispatches": [],
+            }
+            threads.append(thread)
+        sessions = thread.setdefault("sessions", [])
+        for session_id in (source_session_id, implementation_session_id):
+            if session_id not in sessions:
+                sessions.append(session_id)
+        thread.update({
+            "project_root": canonical(root),
+            "latest_session_id": implementation_session_id,
+            "title": slug,
+            "updated": int(time.time() * 1000),
+        })
+        thread.setdefault("dispatches", []).append({
+            "slug": slug,
+            "branch": branch,
+            "checkout_path": canonical(checkout),
+            "source_session_id": source_session_id,
+            "implementation_session_id": implementation_session_id,
+            "created": int(time.time() * 1000),
+        })
+        atomic_json(path, {"threads": threads})
+    log_event(
+        "dispatcher.thread_recorded",
+        thread_id=thread_id,
+        source_session_id=source_session_id,
+        implementation_session_id=implementation_session_id,
+        project_root=canonical(root),
+    )
+
+
 def general_chat_sessions():
     sessions = {}
+    all_sessions = {}
     roots = discover_project_roots()
+    canonical_roots = {canonical(root) for root in roots}
     with ThreadPoolExecutor(max_workers=len(roots) or 1) as executor:
         futures = {executor.submit(opencode_sessions, root): root for root in roots}
         for future in as_completed(futures):
@@ -377,9 +507,27 @@ def general_chat_sessions():
             for session in root_sessions:
                 session_id = session.get("id")
                 directory = session.get("directory")
-                if not session_id or not directory or checkout_root(directory) != canonical(root):
+                if not session_id:
                     continue
-                sessions.setdefault(session_id, {**session, "project_root": root})
+                all_sessions.setdefault(session_id, session)
+                if directory and checkout_root(directory) == canonical(root):
+                    sessions.setdefault(session_id, {**session, "project_root": root})
+    for thread in load_dispatch_threads():
+        root = canonical(thread.get("project_root", ""))
+        if root not in canonical_roots:
+            continue
+        thread_sessions = set(thread.get("sessions", []))
+        for session_id in thread_sessions:
+            sessions.pop(session_id, None)
+        latest_id = thread.get("latest_session_id")
+        latest = all_sessions.get(latest_id)
+        if latest:
+            sessions[latest_id] = {
+                **latest,
+                "project_root": root,
+                "thread_id": thread.get("thread_id"),
+                "fork_on_open": True,
+            }
     return sorted(sessions.values(), key=lambda item: item.get("updated", 0), reverse=True)
 
 
@@ -398,7 +546,7 @@ def pick_chat():
             f"{Path(session['project_root']).name}\t{session.get('title') or 'Untitled'}\t{timestamp}\t{session_id}\n"
         )
     result = run_command(
-        ["fzf", "--prompt", "chat> ", "--height", "100%", "--reverse", "--with-nth", "1,2,3"],
+        ["fzf", "--prompt", "chat> ", "--reverse", "--with-nth", "1,2,3"],
         check=False,
         input_text="".join(rows),
     )
@@ -410,13 +558,33 @@ def pick_chat():
     if len(selected) != 2 or selected[1] not in valid:
         raise DispatchFailure("Chat picker returned an invalid OpenCode session")
     session = valid[selected[1]]
-    return session["project_root"], session["id"], session.get("title") or CHAT_TAB_LABEL
+    return (
+        session["project_root"],
+        session["id"],
+        session.get("title") or CHAT_TAB_LABEL,
+        session.get("fork_on_open", False),
+        session.get("thread_id"),
+    )
 
 
 def chat_history():
+    print("Loading chat history...", flush=True)
     selected = pick_chat()
     if selected:
-        open_chat_tab(*selected)
+        root, session_id, label, fork, thread_id = selected
+        open_chat_tab(root, session_id, label, fork=fork, thread_id=thread_id)
+    return 0
+
+
+def register_chat_session(thread_id, session_id, root):
+    root = validate_selected_repository(root)
+    update_dispatch_thread(thread_id, root, session_id)
+    log_event(
+        "dispatcher.chat_session_registered",
+        thread_id=thread_id,
+        session_id=session_id,
+        project_root=root,
+    )
     return 0
 
 
@@ -461,20 +629,41 @@ def agent_name(slug, pane_id):
     return f"oc-{prefix}-{pane}"[:32]
 
 
-def start_agent_when_shell_ready(name, pane_id, checkout, timeout=AGENT_START_TIMEOUT_SECONDS):
+def current_chat_session(pane_id):
+    resumed = os.environ.get("HERDR_DISPATCHER_SESSION_ID")
+    result = herdr("pane", "get", pane_id)
+    pane = json_field(result.stdout, "result", "pane")
+    session = pane.get("agent_session") if isinstance(pane, dict) else None
+    session_id = session.get("value") if isinstance(session, dict) else None
+    if session_id:
+        return session_id
+    if resumed:
+        return resumed
+    raise DispatchFailure("Project Chat session identity is not available; dispatch was not started")
+
+
+def start_agent_when_shell_ready(
+    name,
+    pane_id,
+    checkout,
+    timeout=AGENT_START_TIMEOUT_SECONDS,
+    parent_session_id=None,
+):
     deadline = time.monotonic() + timeout
     while True:
         remaining = deadline - time.monotonic()
         if remaining <= 0:
             raise DispatchFailure(f"Timed out waiting for agent target pane {pane_id} to become an available shell")
-        result = herdr(
+        command = [
             "agent", "start", name,
             "--kind", "opencode",
             "--pane", pane_id,
             "--timeout", str(max(1, int(remaining * 1000))),
             "--", checkout,
-            check=False,
-        )
+        ]
+        if parent_session_id:
+            command.extend(("--session", parent_session_id, "--fork"))
+        result = herdr(*command, check=False)
         if result.returncode == 0:
             agent = json_field(result.stdout, "result", "agent")
             if (
@@ -535,6 +724,36 @@ def dispatch_lock(root):
         yield
 
 
+def dispatch_cleanup_warning(root, slug, stage, error):
+    message = f"Implementation dispatch succeeded, but {stage}: {error}. Do not retry the dispatch."
+    log_event(
+        "dispatcher.dispatch_cleanup_warning",
+        project_root=root,
+        slug=slug,
+        stage=stage,
+        error=str(error),
+    )
+    try:
+        notify("Dispatch cleanup incomplete", message)
+    except Exception as notify_error:
+        log_event("dispatcher.dispatch_cleanup_notification_failed", error=str(notify_error))
+    try:
+        print(message, file=sys.stderr)
+    except OSError:
+        pass
+
+
+def replace_source_chat(root, chat_tab_id, chat_workspace_id):
+    listed = herdr("tab", "list", "--workspace", chat_workspace_id)
+    tabs = json_field(listed.stdout, "result", "tabs")
+    if not isinstance(tabs, list) or not any(
+        isinstance(tab, dict) and tab.get("tab_id") == chat_tab_id for tab in tabs
+    ):
+        raise DispatchFailure("source Project Chat is no longer present")
+    open_chat_in_workspace(root, chat_workspace_id, focus=False)
+    herdr("tab", "close", chat_tab_id)
+
+
 def dispatch_task(slug, request):
     if os.environ.get("HERDR_DISPATCHER") != "1":
         raise DispatchFailure("dispatch is only available inside a project chat tab")
@@ -543,11 +762,35 @@ def dispatch_task(slug, request):
     request = request.strip()
     if not request:
         raise DispatchFailure("Dispatch request must not be empty")
+    context = plugin_context()
+    chat_tab_id = os.environ.get("HERDR_TAB_ID") or context.get("tab_id")
+    chat_workspace_id = os.environ.get("HERDR_WORKSPACE_ID") or context.get("workspace_id")
+    chat_pane_id = os.environ.get("HERDR_PANE_ID") or context.get("pane_id")
+    if not chat_tab_id or not chat_workspace_id or not chat_pane_id:
+        raise DispatchFailure("Project Chat tab, workspace, or pane metadata is missing")
+    source_session_id = current_chat_session(chat_pane_id)
+    thread_id = os.environ.get("HERDR_DISPATCH_THREAD_ID") or source_session_id
     with dispatch_lock(root):
-        return dispatch_task_locked(root, slug, request)
+        return dispatch_task_locked(
+            root,
+            slug,
+            request,
+            chat_tab_id,
+            chat_workspace_id,
+            source_session_id,
+            thread_id,
+        )
 
 
-def dispatch_task_locked(root, slug, request):
+def dispatch_task_locked(
+    root,
+    slug,
+    request,
+    chat_tab_id,
+    chat_workspace_id,
+    source_session_id,
+    thread_id,
+):
     branch = f"wheels/{slug}"
     checkout = str(Path(root) / ".worktrees" / slug)
     log_event(
@@ -592,16 +835,36 @@ def dispatch_task_locked(root, slug, request):
         root_pane = json_field(created.stdout, "result", "root_pane", "pane_id")
         herdr("pane", "split", root_pane, "--direction", "down", "--ratio", "0.70", "--cwd", checkout, "--no-focus")
         name = agent_name(slug, root_pane)
-        started_agent = start_agent_when_shell_ready(name, root_pane, checkout)
+        started_agent = start_agent_when_shell_ready(
+            name,
+            root_pane,
+            checkout,
+            parent_session_id=source_session_id,
+        )
         delivered_agent = prompt_agent_and_confirm_delivery(name, request, started_agent["state_change_seq"])
     except (DispatchFailure, OSError) as error:
         log_event("dispatcher.dispatch_failed", project_root=root, slug=slug, error=str(error))
         raise
+    implementation_session_id = delivered_agent["agent_session"]["value"]
+    try:
+        record_dispatch_thread(
+            root,
+            thread_id,
+            source_session_id,
+            implementation_session_id,
+            slug,
+            branch,
+            checkout,
+        )
+        replace_source_chat(root, chat_tab_id, chat_workspace_id)
+    except Exception as error:
+        dispatch_cleanup_warning(root, slug, "could not reset the source Project Chat", error)
     log_event(
         "dispatcher.dispatch_succeeded",
         workspace_id=workspace_id,
         agent=name,
-        agent_session=delivered_agent["agent_session"]["value"],
+        agent_session=implementation_session_id,
+        thread_id=thread_id,
     )
     return 0
 
@@ -613,6 +876,10 @@ def parse_args():
     commands.add_parser("chat-picker")
     commands.add_parser("chat-history")
     commands.add_parser("run-chat")
+    register = commands.add_parser("register-chat-session")
+    register.add_argument("--thread-id", required=True)
+    register.add_argument("--session-id", required=True)
+    register.add_argument("--root", required=True)
     dispatch = commands.add_parser("dispatch")
     dispatch.add_argument("--slug", required=True)
     dispatch.add_argument("--request", required=True)
@@ -630,6 +897,8 @@ def main():
             return chat_history()
         if args.command == "run-chat":
             return run_chat()
+        if args.command == "register-chat-session":
+            return register_chat_session(args.thread_id, args.session_id, args.root)
         if args.command == "dispatch":
             return dispatch_task(args.slug, args.request)
     except DispatchFailure as error:

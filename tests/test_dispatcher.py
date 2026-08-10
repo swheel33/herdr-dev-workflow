@@ -147,6 +147,52 @@ class DispatcherTest(unittest.TestCase):
         self.assertEqual([item["id"] for item in history], ["general"])
         self.assertEqual(history[0]["project_root"], str(self.repo))
 
+    def test_history_collapses_dispatch_chain_to_latest_combined_session(self):
+        checkout = self.add_worktree("combined-history")
+        dispatcher.record_dispatch_thread(
+            self.repo,
+            "ses-source",
+            "ses-source",
+            "ses-implementation",
+            "combined-history",
+            "wheels/combined-history",
+            checkout,
+        )
+        sessions = [
+            {"id": "ses-source", "title": "Original discussion", "updated": 2, "directory": str(self.repo)},
+            {"id": "ses-implementation", "title": "Implemented fix", "updated": 4, "directory": str(checkout)},
+            {"id": "general", "title": "Unrelated chat", "updated": 3, "directory": str(self.repo)},
+        ]
+
+        with mock.patch.object(dispatcher, "discover_project_roots", return_value=[str(self.repo)]), \
+             mock.patch.object(dispatcher, "opencode_sessions", return_value=sessions):
+            history = dispatcher.general_chat_sessions()
+
+        self.assertEqual([item["id"] for item in history], ["ses-implementation", "general"])
+        combined = history[0]
+        self.assertTrue(combined["fork_on_open"])
+        self.assertEqual(combined["thread_id"], "ses-source")
+        self.assertEqual(combined["project_root"], lifecycle.canonical(self.repo))
+
+    def test_history_picker_receives_rows_and_uses_full_popup(self):
+        session = {
+            "id": "ses-history",
+            "title": "Visible history row",
+            "updated": 1_786_396_551_406,
+            "project_root": str(self.repo),
+        }
+        selected = f"project\tVisible history row\t2026-08-10 17:29\tses-history\n"
+        response = subprocess.CompletedProcess(["fzf"], 0, selected, "")
+
+        with mock.patch.object(dispatcher, "general_chat_sessions", return_value=[session]), \
+             mock.patch.object(dispatcher, "run_command", return_value=response) as run_mock:
+            result = dispatcher.pick_chat()
+
+        command_args = run_mock.call_args.args[0]
+        self.assertNotIn("--height", command_args)
+        self.assertIn("Visible history row", run_mock.call_args.kwargs["input_text"])
+        self.assertEqual(result, (str(self.repo), "ses-history", "Visible history row", False, None))
+
     def test_resumed_chat_launches_native_session(self):
         captured = {}
 
@@ -166,6 +212,37 @@ class DispatcherTest(unittest.TestCase):
         ])
         self.assertEqual(captured["environment"]["HERDR_DISPATCHER"], "1")
         herdr_mock.assert_called_once_with("tab", "rename", "w-root:t-chat", "New Chat", check=False)
+
+    def test_history_continuation_forks_into_project_chat(self):
+        captured = {}
+
+        def fake_exec(program, arguments, environment):
+            captured.update(program=program, arguments=arguments, environment=environment)
+
+        with mock.patch.dict(os.environ, {
+            "HERDR_DISPATCHER_PROJECT_ROOT": str(self.repo),
+            "HERDR_DISPATCHER_SESSION_ID": "ses-implementation",
+            "HERDR_DISPATCHER_FORK_SESSION": "1",
+            "HERDR_DISPATCH_THREAD_ID": "ses-source",
+        }), mock.patch.object(dispatcher, "herdr"):
+            dispatcher.run_chat(exec_fn=fake_exec)
+
+        self.assertEqual(captured["arguments"], [
+            "opencode", lifecycle.canonical(self.repo), "--agent", dispatcher.CHAT_AGENT,
+            "--session", "ses-implementation", "--fork",
+        ])
+        self.assertEqual(captured["environment"]["HERDR_DISPATCH_THREAD_ID"], "ses-source")
+
+    def test_live_history_fork_identity_wins_over_launch_parent(self):
+        response = subprocess.CompletedProcess(
+            ["herdr"],
+            0,
+            json.dumps({"result": {"pane": {"agent_session": {"value": "ses-review"}}}}),
+            "",
+        )
+        with mock.patch.dict(os.environ, {"HERDR_DISPATCHER_SESSION_ID": "ses-implementation"}), \
+             mock.patch.object(dispatcher, "herdr", return_value=response):
+            self.assertEqual(dispatcher.current_chat_session("w-root:p-chat"), "ses-review")
 
     def created_response(self):
         return subprocess.CompletedProcess(
@@ -198,7 +275,15 @@ class DispatcherTest(unittest.TestCase):
             args, 0, json.dumps({"result": {"agent": agent}}), ""
         )
 
-    def test_successful_dispatch_keeps_project_chat_active(self):
+    def pane_response(self, args):
+        return subprocess.CompletedProcess(
+            args,
+            0,
+            json.dumps({"result": {"pane": {"agent_session": {"value": "ses-source"}}}}),
+            "",
+        )
+
+    def test_successful_dispatch_forks_context_and_resets_project_chat_without_focus(self):
         calls = []
         start_attempts = 0
 
@@ -207,6 +292,8 @@ class DispatcherTest(unittest.TestCase):
             calls.append(args)
             if args[:2] == ("worktree", "create"):
                 return self.created_response()
+            if args[:2] == ("pane", "get"):
+                return self.pane_response(args)
             if args[:2] == ("pane", "split"):
                 return subprocess.CompletedProcess(
                     args, 0, json.dumps({"result": {"pane": {"pane_id": "w-task:p2"}}}), ""
@@ -220,6 +307,10 @@ class DispatcherTest(unittest.TestCase):
                 return self.agent_response(args)
             if args[:2] == ("agent", "prompt"):
                 return self.agent_response(args, status="working", state_change_seq=11, session=True)
+            if args[:2] == ("tab", "list"):
+                return subprocess.CompletedProcess(
+                    args, 0, json.dumps({"result": {"tabs": [{"tab_id": "w-root:t-chat"}]}}), ""
+                )
             return subprocess.CompletedProcess(args, 0, json.dumps({"result": {"type": "ok"}}), "")
 
         with mock.patch.dict(os.environ, {
@@ -227,6 +318,8 @@ class DispatcherTest(unittest.TestCase):
             "HERDR_DISPATCHER_PROJECT_ROOT": str(self.repo),
             "HERDR_TAB_ID": "w-root:t-chat",
             "HERDR_WORKSPACE_ID": "w-root",
+            "HERDR_PANE_ID": "w-root:p-chat",
+            "HERDR_DISPATCHER_SESSION_ID": "ses-source",
         }), mock.patch.object(dispatcher, "herdr", side_effect=fake_herdr), \
              mock.patch.object(dispatcher.time, "sleep") as sleep:
             self.assertEqual(dispatcher.dispatch_task("new feature", "Implement the complete request"), 0)
@@ -238,6 +331,8 @@ class DispatcherTest(unittest.TestCase):
         start_indexes = [index for index, call in enumerate(calls) if call[:2] == ("agent", "start")]
         start_index = start_indexes[0]
         prompt_index = next(index for index, call in enumerate(calls) if call[:2] == ("agent", "prompt"))
+        replacement_index = next(index for index, call in enumerate(calls) if call[:3] == ("plugin", "pane", "open"))
+        close_index = next(index for index, call in enumerate(calls) if call[:2] == ("tab", "close"))
         self.assertLess(split_index, start_index)
         self.assertLess(start_index, prompt_index)
         self.assertEqual(len(start_indexes), 2)
@@ -245,37 +340,62 @@ class DispatcherTest(unittest.TestCase):
             self.assertEqual(calls[index][calls[index].index("--pane") + 1], "w-task:p1")
             self.assertNotIn("w-task:p2", calls[index])
             self.assertIn("--timeout", calls[index])
+        final_start = calls[start_indexes[-1]]
+        self.assertEqual(final_start[-3:], ("--session", "ses-source", "--fork"))
         self.assertEqual(calls[prompt_index][-5:], (
             "--wait", "--until", "working", "--timeout", str(dispatcher.PROMPT_DELIVERY_TIMEOUT_MS),
         ))
         sleep.assert_called_once()
-        self.assertFalse(any(call[0] in {"tab", "workspace"} for call in calls))
+        self.assertLess(prompt_index, replacement_index)
+        self.assertLess(replacement_index, close_index)
+        replacement = calls[replacement_index]
+        self.assertIn("dispatcher-chat", replacement)
+        self.assertIn("--no-focus", replacement)
+        self.assertNotIn("HERDR_DISPATCHER_SESSION_ID=ses-source", replacement)
+        self.assertEqual(calls[close_index], ("tab", "close", "w-root:t-chat"))
+        self.assertFalse(any(call[:2] in {("workspace", "focus"), ("tab", "focus")} for call in calls))
+        threads = dispatcher.load_dispatch_threads()
+        self.assertEqual(len(threads), 1)
+        self.assertEqual(threads[0]["sessions"], ["ses-source", "ses-dispatched"])
+        self.assertEqual(threads[0]["latest_session_id"], "ses-dispatched")
 
-    def test_dispatch_does_not_require_tab_or_workspace_metadata(self):
+    def test_dispatch_requires_source_chat_metadata_before_creating_worktree(self):
+        with mock.patch.dict(os.environ, {
+            "HERDR_DISPATCHER": "1",
+            "HERDR_DISPATCHER_PROJECT_ROOT": str(self.repo),
+        }, clear=True), mock.patch.object(dispatcher, "herdr") as herdr_mock:
+            with self.assertRaisesRegex(dispatcher.DispatchFailure, "metadata is missing"):
+                dispatcher.dispatch_task("metadata-free", "Implement this request")
+
+        herdr_mock.assert_not_called()
+
+    def test_replacement_failure_leaves_used_project_chat_open(self):
         calls = []
 
         def fake_herdr(*args, **_kwargs):
             calls.append(args)
-            if args[:2] == ("worktree", "create"):
-                return self.created_response()
-            if args[:2] == ("pane", "split"):
+            if args[:2] == ("tab", "list"):
                 return subprocess.CompletedProcess(
-                    args, 0, json.dumps({"result": {"pane": {"pane_id": "w-task:p2"}}}), ""
+                    args, 0, json.dumps({"result": {"tabs": [{"tab_id": "w-root:t-chat"}]}}), ""
                 )
-            if args[:2] == ("agent", "start"):
-                return self.agent_response(args)
-            if args[:2] == ("agent", "prompt"):
-                return self.agent_response(args, status="working", state_change_seq=11, session=True)
-            return subprocess.CompletedProcess(args, 0, json.dumps({"result": {}}), "")
+            if args[:3] == ("plugin", "pane", "open"):
+                raise dispatcher.DispatchFailure("replacement failed")
+            return subprocess.CompletedProcess(args, 0, "", "")
 
-        with mock.patch.dict(os.environ, {
-            "HERDR_DISPATCHER": "1",
-            "HERDR_DISPATCHER_PROJECT_ROOT": str(self.repo),
-        }, clear=True), mock.patch.object(dispatcher, "herdr", side_effect=fake_herdr):
-            self.assertEqual(dispatcher.dispatch_task("metadata-free", "Implement this request"), 0)
+        with mock.patch.object(dispatcher, "herdr", side_effect=fake_herdr):
+            with self.assertRaisesRegex(dispatcher.DispatchFailure, "replacement failed"):
+                dispatcher.replace_source_chat(str(self.repo), "w-root:t-chat", "w-root")
 
-        self.assertTrue(any(call[:2] == ("agent", "prompt") for call in calls))
-        self.assertFalse(any(call[0] in {"tab", "workspace"} for call in calls))
+        self.assertFalse(any(call[:2] == ("tab", "close") for call in calls))
+
+    def test_registered_history_continuation_becomes_latest_thread_session(self):
+        dispatcher.update_dispatch_thread("thread", self.repo, "ses-implementation")
+
+        dispatcher.register_chat_session("thread", "ses-review", str(self.repo))
+
+        thread = dispatcher.load_dispatch_threads()[0]
+        self.assertEqual(thread["sessions"], ["ses-implementation", "ses-review"])
+        self.assertEqual(thread["latest_session_id"], "ses-review")
 
     def test_agent_start_does_not_retry_non_readiness_failures(self):
         failure = subprocess.CompletedProcess(
@@ -302,6 +422,8 @@ class DispatcherTest(unittest.TestCase):
 
         def fake_herdr(*args, **_kwargs):
             calls.append(args)
+            if args[:2] == ("pane", "get"):
+                return self.pane_response(args)
             if args[:2] == ("worktree", "create"):
                 return self.created_response()
             if args[:2] == ("pane", "split"):
@@ -313,6 +435,8 @@ class DispatcherTest(unittest.TestCase):
             "HERDR_DISPATCHER_PROJECT_ROOT": str(self.repo),
             "HERDR_TAB_ID": "w-root:t-chat",
             "HERDR_WORKSPACE_ID": "w-root",
+            "HERDR_PANE_ID": "w-root:p-chat",
+            "HERDR_DISPATCHER_SESSION_ID": "ses-source",
         }), mock.patch.object(dispatcher, "herdr", side_effect=fake_herdr):
             with self.assertRaisesRegex(dispatcher.DispatchFailure, "exact split failure"):
                 dispatcher.dispatch_task("broken", "Implement this request")
@@ -328,16 +452,22 @@ class DispatcherTest(unittest.TestCase):
             "HERDR_DISPATCHER_PROJECT_ROOT": str(self.repo),
             "HERDR_TAB_ID": "w-root:t-chat",
             "HERDR_WORKSPACE_ID": "w-root",
+            "HERDR_PANE_ID": "w-root:p-chat",
+            "HERDR_DISPATCHER_SESSION_ID": "ses-source",
         }), mock.patch.object(
             dispatcher,
             "synchronize_primary_main",
             return_value={"status": "dirty"},
-        ), mock.patch.object(dispatcher, "herdr") as herdr_mock:
+        ), mock.patch.object(
+            dispatcher,
+            "herdr",
+            side_effect=lambda *args, **_kwargs: self.pane_response(args),
+        ) as herdr_mock:
             with self.assertRaisesRegex(dispatcher.DispatchFailure, "synchronization blocked: dirty"):
                 dispatcher.dispatch_task("blocked", "Implement this request")
 
         self.assertEqual(dirty.read_text(), "keep me\n")
-        herdr_mock.assert_not_called()
+        self.assertFalse(any(call.args[:2] == ("worktree", "create") for call in herdr_mock.call_args_list))
 
     def test_local_only_repository_uses_local_main_as_dispatch_base(self):
         command("git", "remote", "remove", "origin", cwd=self.repo)
@@ -350,6 +480,8 @@ class DispatcherTest(unittest.TestCase):
 
         def fake_herdr(*args, **_kwargs):
             calls.append(args)
+            if args[:2] == ("pane", "get"):
+                return self.pane_response(args)
             if args[:2] == ("worktree", "create"):
                 return self.created_response()
             if args[:2] == ("pane", "split"):
@@ -367,6 +499,8 @@ class DispatcherTest(unittest.TestCase):
             "HERDR_DISPATCHER_PROJECT_ROOT": str(self.repo),
             "HERDR_TAB_ID": "w-root:t-chat",
             "HERDR_WORKSPACE_ID": "w-root",
+            "HERDR_PANE_ID": "w-root:p-chat",
+            "HERDR_DISPATCHER_SESSION_ID": "ses-source",
         }), mock.patch.object(dispatcher, "herdr", side_effect=fake_herdr):
             with self.assertRaisesRegex(dispatcher.DispatchFailure, "exact prompt failure"):
                 dispatcher.dispatch_task("prompt-failure", "Implement this request")
@@ -380,6 +514,8 @@ class DispatcherTest(unittest.TestCase):
 
         def fake_herdr(*args, **_kwargs):
             calls.append(args)
+            if args[:2] == ("pane", "get"):
+                return self.pane_response(args)
             if args[:2] == ("worktree", "create"):
                 return self.created_response()
             if args[:2] == ("pane", "split"):
@@ -395,6 +531,8 @@ class DispatcherTest(unittest.TestCase):
             "HERDR_DISPATCHER_PROJECT_ROOT": str(self.repo),
             "HERDR_TAB_ID": "w-root:t-chat",
             "HERDR_WORKSPACE_ID": "w-root",
+            "HERDR_PANE_ID": "w-root:p-chat",
+            "HERDR_DISPATCHER_SESSION_ID": "ses-source",
         }), mock.patch.object(dispatcher, "herdr", side_effect=fake_herdr):
             with self.assertRaisesRegex(dispatcher.DispatchFailure, "agent_prompt_stalled"):
                 dispatcher.dispatch_task("delivery-timeout", "Implement this request")
