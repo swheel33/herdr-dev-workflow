@@ -432,7 +432,17 @@ def dispatch_base(root):
     head = git(root, "symbolic-ref", "--quiet", "refs/remotes/origin/HEAD", check=False)
     if head.returncode == 0:
         return head.stdout.strip()
-    raise DispatchFailure("Could not determine a base: origin/develop and origin/HEAD are unavailable")
+    for branch in ("develop", "main", "master"):
+        if git(root, "show-ref", "--verify", "--quiet", f"refs/heads/{branch}", check=False).returncode == 0:
+            return branch
+    current = git(root, "branch", "--show-current", check=False).stdout.strip()
+    if current:
+        return current
+    raise DispatchFailure("Could not determine a local or remote base branch")
+
+
+def has_origin(root):
+    return git(root, "remote", "get-url", "origin", check=False).returncode == 0
 
 
 def agent_name(slug, pane_id):
@@ -514,10 +524,12 @@ def dispatch_task_locked(root, slug, request, chat_tab_id, chat_workspace_id):
         request=request,
     )
     try:
-        git(root, "fetch", "origin", "--prune")
+        origin = has_origin(root)
+        if origin:
+            git(root, "fetch", "origin", "--prune")
         if git(root, "show-ref", "--verify", "--quiet", f"refs/heads/{branch}", check=False).returncode == 0:
             raise DispatchFailure(f"Local branch already exists: {branch}")
-        if git(root, "show-ref", "--verify", "--quiet", f"refs/remotes/origin/{branch}", check=False).returncode == 0:
+        if origin and git(root, "show-ref", "--verify", "--quiet", f"refs/remotes/origin/{branch}", check=False).returncode == 0:
             raise DispatchFailure(f"Remote branch already exists: origin/{branch}")
         if Path(checkout).exists():
             raise DispatchFailure(f"Worktree path already exists: {checkout}")

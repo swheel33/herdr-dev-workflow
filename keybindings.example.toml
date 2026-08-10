@@ -1,8 +1,8 @@
 [[keys.command]]
 key = "prefix+n"
 type = "plugin_action"
-command = "wheels.dev-workflow.new-branch"
-description = "new personal branch"
+command = "wheels.dev-workflow.new-blank-project"
+description = "new blank project"
 
 [[keys.command]]
 key = "prefix+o"

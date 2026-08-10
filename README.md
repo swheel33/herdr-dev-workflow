@@ -7,7 +7,7 @@ Git worktrees, cleanup, and development tools.
 
 - stable Herdr 0.8.0 or newer
 - `git`
-- authenticated GitHub CLI (`gh auth login`)
+- GitHub CLI authenticated with `gh auth login` (only for GitHub-backed project creation and GitHub workflows)
 - `python3`
 - `opencode`
 - `fzf`
@@ -44,6 +44,30 @@ herdr plugin link /path/to/herdr-dev-workflow
 Installed and linked plugins are available to all Herdr sessions for the
 current user.
 
+## New Blank Project
+
+Run the global **New blank project** action from any Herdr session. Its popup
+asks for a project name and parent directory. The parent defaults to
+`HERDR_PROJECTS_ROOT` when set, otherwise `~/Projects`.
+
+The workflow deliberately creates no template, framework, package-manager
+configuration, README, `.gitignore`, source file, or dependency. It only:
+
+1. Validates the project name and resolves `~` and environment variables in the parent path.
+2. Refuses path traversal, symbolic-link destinations, files, and existing non-empty directories. An existing empty directory is allowed.
+3. Initializes Git with `main` and creates an empty commit named `Initial commit`.
+4. Registers the repository with the plugin, opens its primary Herdr workspace, and focuses a new Project Chat tab.
+
+The popup can optionally create a private or public GitHub repository. This
+requires authenticated `gh`; the workflow creates `origin` and pushes `main`.
+Local-only projects do not require `gh`. If GitHub authentication, repository
+creation, or pushing fails, the initialized local repository is retained,
+registered, and opened, and the exact GitHub error is reported.
+
+The parent directory itself must already exist. Empty input accepts the shown
+parent and GitHub defaults. `Ctrl-C` or end-of-input before creation cancels
+without changing the filesystem.
+
 ## Dispatcher
 
 The dispatcher opens normal OpenCode chat tabs in each project's primary
@@ -57,7 +81,8 @@ MCPs, plugins, credentials, and TUI settings.
 - **Chats** searches native OpenCode sessions across every known project and
   resumes the selection in its primary workspace.
 - Project discovery combines known cleanup repositories with Git repositories
-  under `~/Projects`, excludes `.worktrees`, and deduplicates primary roots.
+  under `HERDR_PROJECTS_ROOT` or `~/Projects`, excludes `.worktrees`, and
+  deduplicates primary roots.
 
 Discussion, questions, reviews, exploration, and planning remain in root
 workspace tabs. The sidebar therefore contains primary projects and their
@@ -188,7 +213,7 @@ Suggested bindings from [`keybindings.example.toml`](keybindings.example.toml):
 - `prefix+space`: chat for current project
 - `prefix+shift+space`: chat for another project
 - `prefix+c`: search chats across all projects
-- `prefix+n`: create a personal worktree
+- `prefix+n`: create a blank project
 - `prefix+o`: open a worktree or `origin/*` branch
 - `prefix+a`: open all managed worktrees
 - `prefix+p`: retry pending cleanup jobs

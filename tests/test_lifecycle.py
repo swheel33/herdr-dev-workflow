@@ -583,6 +583,7 @@ class ManifestTest(unittest.TestCase):
     def test_python_panes_resolve_scripts_from_plugin_root(self):
         manifest = tomllib.loads((Path(__file__).parents[1] / "herdr-plugin.toml").read_text())
         python_panes = {
+            "new-blank-project",
             "dispatcher-chat",
             "dispatcher-picker",
             "dispatcher-history",
@@ -597,6 +598,10 @@ class ManifestTest(unittest.TestCase):
             self.assertIn("$HERDR_PLUGIN_ROOT/", command[2])
         dispatcher_chat = next(pane for pane in manifest["panes"] if pane["id"] == "dispatcher-chat")
         self.assertEqual(dispatcher_chat["placement"], "tab")
+        blank_action = next(action for action in manifest["actions"] if action["id"] == "new-blank-project")
+        self.assertEqual(blank_action["contexts"], ["global"])
+        blank_pane = next(pane for pane in manifest["panes"] if pane["id"] == "new-blank-project")
+        self.assertEqual(blank_pane["placement"], "popup")
         self.assertNotIn("layout-here", {action["id"] for action in manifest["actions"]})
 
 

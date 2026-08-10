@@ -263,6 +263,12 @@ class DispatcherTest(unittest.TestCase):
         self.assertFalse(any(call[:2] == ("workspace", "focus") for call in calls))
         self.assertFalse(any(call[:2] == ("tab", "close") for call in calls))
 
+    def test_local_only_repository_uses_local_main_as_dispatch_base(self):
+        command("git", "remote", "remove", "origin", cwd=self.repo)
+        command("git", "branch", "-D", "develop", cwd=self.repo)
+        self.assertFalse(dispatcher.has_origin(self.repo))
+        self.assertEqual(dispatcher.dispatch_base(self.repo), "main")
+
 
 if __name__ == "__main__":
     unittest.main()
