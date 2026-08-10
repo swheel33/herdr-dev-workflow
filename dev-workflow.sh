@@ -4,6 +4,7 @@ set -euo pipefail
 
 HERDR_BIN="${HERDR_BIN_PATH:-herdr}"
 PLUGIN_ID="${HERDR_PLUGIN_ID:-wheels.dev-workflow}"
+PLUGIN_ROOT="${HERDR_PLUGIN_ROOT:-$(cd -P "$(dirname "${BASH_SOURCE[0]}")" && pwd)}"
 
 usage() {
   printf 'Usage: dev-workflow.sh <layout-here|setup-workspace|open-pane|open-all|retry-cleanup|new-branch-pane|open-pane-entry|doctor>\n' >&2
@@ -693,6 +694,7 @@ open_all() {
   local cwd repo_root selected kind name tree_path workspace_id
   local total=0 opened=0 already_open=0
   local target_workspace=""
+  local -a setup_args=()
 
   cwd="$(pane_cwd_or_die)"
   cd "$cwd"
@@ -719,15 +721,18 @@ open_all() {
       continue
     fi
 
-    setup_layout_for_workspace "$workspace_id" "$tree_path" "$name" 0
+    setup_args+=(--workspace "$workspace_id" "$tree_path" "$name")
     opened=$((opened + 1))
-    printf 'Opened: %s\n' "$name"
   done < <(managed_worktree_rows "$repo_root")
 
   if [[ "$total" -eq 0 ]]; then
     printf 'No managed worktrees found under %s\n' "$(managed_worktree_root "$repo_root")" >&2
     notify "No managed worktrees" "No managed worktrees found."
     exit 1
+  fi
+
+  if [[ "${#setup_args[@]}" -gt 0 ]]; then
+    python3 "$PLUGIN_ROOT/lifecycle.py" setup-workspaces "${setup_args[@]}"
   fi
 
   if [[ -n "$target_workspace" ]]; then

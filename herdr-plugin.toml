@@ -33,7 +33,7 @@ command = ["bash", "-lc", "exec \"$HERDR_PLUGIN_ROOT/dev-workflow.sh\" open-all"
 id = "adopt-workspaces"
 title = "Adopt current workspaces"
 contexts = ["global", "workspace"]
-command = ["python3", "lifecycle.py", "adopt"]
+command = ["bash", "-lc", "exec python3 \"$HERDR_PLUGIN_ROOT/lifecycle.py\" adopt"]
 
 [[actions]]
 id = "chat-current"
@@ -54,24 +54,24 @@ contexts = ["workspace"]
 command = ["bash", "-lc", "exec \"$HERDR_PLUGIN_ROOT/dev-workflow.sh\" open-pane dispatcher-history"]
 
 [[startup]]
-command = ["python3", "lifecycle.py", "startup"]
+command = ["bash", "-lc", "exec python3 \"$HERDR_PLUGIN_ROOT/lifecycle.py\" startup"]
 
 [[startup]]
-command = ["python3", "lifecycle.py", "watch-merged"]
+command = ["bash", "-lc", "exec python3 \"$HERDR_PLUGIN_ROOT/lifecycle.py\" watch-merged"]
 
 [[events]]
 on = "workspace.closed"
-command = ["python3", "lifecycle.py", "event"]
+command = ["bash", "-lc", "exec python3 \"$HERDR_PLUGIN_ROOT/lifecycle.py\" event"]
 
 [[events]]
 on = "worktree.removed"
-command = ["python3", "lifecycle.py", "event"]
+command = ["bash", "-lc", "exec python3 \"$HERDR_PLUGIN_ROOT/lifecycle.py\" event"]
 
 [[actions]]
 id = "retry-cleanup"
 title = "Retry pending worktree cleanup"
 contexts = ["global", "workspace"]
-command = ["python3", "lifecycle.py", "retry"]
+command = ["bash", "-lc", "exec python3 \"$HERDR_PLUGIN_ROOT/lifecycle.py\" retry"]
 
 [[actions]]
 id = "show-cleanup-failures"
@@ -125,7 +125,7 @@ title = "Chat for current project"
 placement = "popup"
 width = "95%"
 height = "90%"
-command = ["python3", "dispatcher.py", "chat-current"]
+command = ["bash", "-lc", "exec python3 \"$HERDR_PLUGIN_ROOT/dispatcher.py\" chat-current"]
 
 [[panes]]
 id = "dispatcher-picker"
@@ -133,7 +133,7 @@ title = "Chat for another project"
 placement = "popup"
 width = "95%"
 height = "90%"
-command = ["python3", "dispatcher.py", "chat-picker"]
+command = ["bash", "-lc", "exec python3 \"$HERDR_PLUGIN_ROOT/dispatcher.py\" chat-picker"]
 
 [[panes]]
 id = "dispatcher-history"
@@ -141,7 +141,7 @@ title = "Previous project chats"
 placement = "popup"
 width = "95%"
 height = "90%"
-command = ["python3", "dispatcher.py", "chat-history"]
+command = ["bash", "-lc", "exec python3 \"$HERDR_PLUGIN_ROOT/dispatcher.py\" chat-history"]
 
 [[panes]]
 id = "cleanup-failures"
@@ -149,7 +149,7 @@ title = "Pending worktree cleanup failures"
 placement = "popup"
 width = "90%"
 height = "70%"
-command = ["python3", "lifecycle.py", "show-pane"]
+command = ["bash", "-lc", "exec python3 \"$HERDR_PLUGIN_ROOT/lifecycle.py\" show-pane"]
 
 [[panes]]
 id = "cleanup-log"
@@ -157,7 +157,7 @@ title = "Worktree cleanup log"
 placement = "popup"
 width = "95%"
 height = "85%"
-command = ["python3", "lifecycle.py", "show-log-pane"]
+command = ["bash", "-lc", "exec python3 \"$HERDR_PLUGIN_ROOT/lifecycle.py\" show-log-pane"]
 
 [[panes]]
 id = "lazygit"

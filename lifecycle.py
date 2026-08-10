@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 
 import argparse
+from concurrent.futures import as_completed, ThreadPoolExecutor
 import contextlib
 from datetime import datetime, timezone
 import fcntl
@@ -952,11 +953,42 @@ def live_workspaces():
     return response_result(output).get("workspaces", [])
 
 
+def worktree_label(tree, path):
+    return Path(path).name or tree.get("branch") or tree.get("label") or "worktree"
+
+
+def setup_workspaces(workspaces):
+    if not workspaces:
+        return
+    script = Path(__file__).with_name("dev-workflow.sh")
+    errors = []
+    log_event("workspace_setup.batch_started", workspaces=len(workspaces))
+    with ThreadPoolExecutor(max_workers=len(workspaces)) as executor:
+        futures = {
+            executor.submit(
+                run,
+                [str(script), "setup-workspace", workspace_id, path, label],
+            ): path
+            for workspace_id, path, label in workspaces
+        }
+        for future in as_completed(futures):
+            path = futures[future]
+            try:
+                future.result()
+            except (RuntimeError, GitFailure, OSError) as error:
+                log_event("workspace_setup.failed", checkout_path=path, error=str(error))
+                errors.append(f"{path}: {error}")
+    log_event("workspace_setup.batch_finished", workspaces=len(workspaces), failures=len(errors))
+    if errors:
+        raise RuntimeError("; ".join(errors))
+
+
 def reconcile():
     log_event("reconciliation.started")
     workspaces = live_workspaces()
     adoption = adopt_current_workspaces(workspaces, live_panes(), announce=False)
     errors = []
+    setup = []
     for repo in adoption["roots"]:
         if not Path(repo).is_dir():
             continue
@@ -978,31 +1010,27 @@ def reconcile():
                     ):
                         continue
                     try:
+                        label = worktree_label(tree, path)
                         log_event("reconciliation.opening_worktree", repo_root=repo, checkout_path=path)
                         opened = response_result(
                             herdr(
                                 "worktree", "open", "--cwd", repo, "--path", path,
-                                "--label", tree.get("label") or Path(path).name, "--no-focus", "--json",
+                                "--label", label, "--no-focus", "--json",
                             ).stdout
                         )
                         workspace = opened.get("workspace", {})
                         if workspace.get("workspace_id"):
-                            script = Path(__file__).with_name("dev-workflow.sh")
-                            run(
-                                [
-                                    str(script),
-                                    "setup-workspace",
-                                    workspace["workspace_id"],
-                                    path,
-                                    tree.get("label") or Path(path).name,
-                                ]
-                            )
+                            setup.append((workspace["workspace_id"], path, label))
                     except (RuntimeError, GitFailure, OSError, json.JSONDecodeError) as error:
                         log_event("reconciliation.worktree_failed", repo_root=repo, checkout_path=path, error=str(error))
                         errors.append(f"{path}: {error}")
         except (RuntimeError, GitFailure, OSError, json.JSONDecodeError) as error:
             log_event("reconciliation.repository_failed", repo_root=repo, error=str(error))
             errors.append(f"{repo}: {error}")
+    try:
+        setup_workspaces(setup)
+    except (RuntimeError, GitFailure, OSError) as error:
+        errors.append(str(error))
     if errors:
         log_event("reconciliation.failed", errors=errors)
         raise RuntimeError("; ".join(errors))
@@ -1037,6 +1065,8 @@ def parse_args():
     subparsers.add_parser("show")
     subparsers.add_parser("show-pane")
     subparsers.add_parser("show-log-pane")
+    setup_parser = subparsers.add_parser("setup-workspaces")
+    setup_parser.add_argument("--workspace", action="append", nargs=3, required=True)
     enqueue_parser = subparsers.add_parser("enqueue")
     enqueue_parser.add_argument("repo")
     enqueue_parser.add_argument("checkout")
@@ -1065,6 +1095,9 @@ def main():
         return show_failures_pane()
     if args.command == "show-log-pane":
         return show_log_pane()
+    if args.command == "setup-workspaces":
+        setup_workspaces(args.workspace)
+        return 0
     if args.command == "enqueue":
         return 0 if enqueue(args.repo, args.checkout, args.branch, label=args.label) else 1
     return 2

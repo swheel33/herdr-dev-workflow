@@ -7,6 +7,7 @@ import shutil
 import subprocess
 import tempfile
 import threading
+import tomllib
 import unittest
 from unittest import mock
 
@@ -449,6 +450,65 @@ class LifecycleIntegrationTest(unittest.TestCase):
             self.assertEqual(lifecycle.startup(), 0)
         self.assertEqual(calls, ["retry", "reconcile"])
 
+    def test_worktree_label_prefers_checkout_folder(self):
+        tree = {"branch": "wheels/useful-name", "label": self.repo.name}
+        self.assertEqual(lifecycle.worktree_label(tree, self.repo / ".worktrees" / "useful-name"), "useful-name")
+
+    def test_reconciliation_uses_checkout_folder_for_label(self):
+        checkout = self.add_worktree("feature/useful-name", push=False)
+        worktree_output = json.dumps({"result": {"worktrees": [{
+            "path": str(checkout),
+            "branch": "feature/useful-name",
+            "is_linked_worktree": True,
+            "open_workspace_id": None,
+            "label": self.repo.name,
+        }]}})
+        opened_output = json.dumps({"result": {"workspace": {"workspace_id": "w-useful"}}})
+
+        def fake_herdr(*args, **kwargs):
+            output = worktree_output if args[:2] == ("worktree", "list") else opened_output
+            return subprocess.CompletedProcess(args, 0, output, "")
+
+        with mock.patch.object(lifecycle, "live_workspaces", return_value=[]), \
+             mock.patch.object(lifecycle, "live_panes", return_value=[]), \
+             mock.patch.object(lifecycle, "adopt_current_workspaces", return_value={"roots": [str(self.repo)]}), \
+             mock.patch.object(lifecycle, "herdr", side_effect=fake_herdr) as herdr_mock, \
+             mock.patch.object(lifecycle, "setup_workspaces") as setup_mock:
+            lifecycle.reconcile()
+
+        open_call = next(call.args for call in herdr_mock.call_args_list if call.args[:2] == ("worktree", "open"))
+        self.assertEqual(open_call[open_call.index("--label") + 1], checkout.name)
+        setup_mock.assert_called_once_with([("w-useful", lifecycle.canonical(checkout), checkout.name)])
+
+    def test_setup_workspaces_starts_every_layout_in_parallel(self):
+        entered = threading.Barrier(3)
+        release = threading.Event()
+        errors = []
+
+        def fake_run(command, **kwargs):
+            entered.wait(timeout=2)
+            release.wait(timeout=2)
+            return subprocess.CompletedProcess(command, 0, "", "")
+
+        def invoke():
+            try:
+                lifecycle.setup_workspaces([
+                    ("w-one", "/tmp/one", "one"),
+                    ("w-two", "/tmp/two", "two"),
+                ])
+            except Exception as error:
+                errors.append(error)
+
+        with mock.patch.object(lifecycle, "run", side_effect=fake_run):
+            worker = threading.Thread(target=invoke)
+            worker.start()
+            entered.wait(timeout=2)
+            release.set()
+            worker.join(timeout=2)
+
+        self.assertFalse(worker.is_alive())
+        self.assertEqual(errors, [])
+
     def test_reconciliation_does_not_reopen_pending_checkout(self):
         checkout = self.add_worktree("feature/pending", push=False)
         job = lifecycle.create_job(self.repo, checkout, "feature/pending", "test")
@@ -488,6 +548,24 @@ class LifecycleIntegrationTest(unittest.TestCase):
             lifecycle.close_reopened_workspace(job)
         close_calls = [call.args for call in herdr_mock.call_args_list if call.args[:2] == ("workspace", "close")]
         self.assertEqual(close_calls, [("workspace", "close", "w-reopened")])
+
+
+class ManifestTest(unittest.TestCase):
+    def test_python_panes_resolve_scripts_from_plugin_root(self):
+        manifest = tomllib.loads((Path(__file__).parents[1] / "herdr-plugin.toml").read_text())
+        python_panes = {
+            "dispatcher-current",
+            "dispatcher-picker",
+            "dispatcher-history",
+            "cleanup-failures",
+            "cleanup-log",
+        }
+        commands = {pane["id"]: pane["command"] for pane in manifest["panes"] if pane["id"] in python_panes}
+
+        self.assertEqual(set(commands), python_panes)
+        for command in commands.values():
+            self.assertEqual(command[:2], ["bash", "-lc"])
+            self.assertIn("$HERDR_PLUGIN_ROOT/", command[2])
 
 
 if __name__ == "__main__":
