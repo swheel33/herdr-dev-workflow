@@ -20,6 +20,8 @@ from lifecycle import (
     known_roots,
     log_event,
     notify,
+    primary_record,
+    record_for_path,
     state_dir,
     synchronize_primary_main,
 )
@@ -407,6 +409,50 @@ def opencode_sessions(root):
     return sessions if isinstance(sessions, list) else []
 
 
+def checkout_root(path):
+    result = git(path, "rev-parse", "--path-format=absolute", "--show-toplevel", check=False)
+    return canonical(result.stdout.strip()) if result.returncode == 0 and result.stdout.strip() else None
+
+
+def primary_state(root):
+    branch = git(root, "branch", "--show-current").stdout.strip()
+    head = git(root, "rev-parse", "HEAD").stdout.strip()
+    if not branch or not head:
+        raise DispatchFailure("Primary checkout must be on a branch before dispatch")
+    return branch, head
+
+
+def validate_primary_state(root, expected):
+    actual = primary_state(root)
+    if actual != expected:
+        raise DispatchFailure(
+            "Primary checkout changed during dispatch: "
+            f"expected branch {expected[0]} at {expected[1]}, got branch {actual[0]} at {actual[1]}"
+        )
+
+
+def validate_dispatch_checkout(root, checkout, branch):
+    root = canonical(root)
+    checkout = canonical(checkout)
+    if checkout == root:
+        raise DispatchFailure("Refusing to dispatch an implementation agent in the primary checkout")
+    if not Path(checkout).is_dir():
+        raise DispatchFailure(f"Implementation worktree does not exist: {checkout}")
+    primary = primary_record(root)
+    if not primary or canonical(primary.get("path", "")) != root:
+        raise DispatchFailure(f"Primary worktree mismatch: expected {root}")
+    record = record_for_path(root, checkout)
+    if not record:
+        raise DispatchFailure(f"Implementation path is not a registered Git worktree: {checkout}")
+    if record.get("branch") != branch:
+        raise DispatchFailure(
+            f"Implementation worktree branch mismatch: expected {branch}, got {record.get('branch') or 'detached HEAD'}"
+        )
+    if checkout_root(checkout) != checkout or primary_repository(checkout) != root:
+        raise DispatchFailure(f"Implementation worktree repository mismatch: {checkout}")
+    return checkout
+
+
 def dispatch_threads_path():
     return state_dir() / "dispatch-threads.json"
 
@@ -638,6 +684,60 @@ def current_chat_session(pane_id):
     raise DispatchFailure("Project Chat session identity is not available; dispatch was not started")
 
 
+def agent_session_id(value):
+    session = value.get("agent_session") if isinstance(value, dict) else None
+    if (
+        isinstance(session, dict)
+        and session.get("source") == "herdr:opencode"
+        and session.get("agent") == "opencode"
+        and session.get("kind") == "id"
+        and isinstance(session.get("value"), str)
+        and session["value"]
+    ):
+        return session["value"]
+    return None
+
+
+def validate_agent_pane_checkout(pane_id, checkout):
+    result = herdr("pane", "get", pane_id)
+    pane = json_field(result.stdout, "result", "pane")
+    directory = pane.get("foreground_cwd") or pane.get("cwd") if isinstance(pane, dict) else None
+    if not directory or canonical(directory) != canonical(checkout):
+        raise DispatchFailure(
+            f"Implementation pane cwd mismatch: expected {canonical(checkout)}, got {directory or 'unknown'}"
+        )
+    return pane
+
+
+def validate_opencode_session_checkout(session_id, checkout):
+    session = next((item for item in opencode_sessions(checkout) if item.get("id") == session_id), None)
+    if session is None:
+        return False
+    directory = session.get("directory")
+    if not directory or canonical(directory) != canonical(checkout) or checkout_root(directory) != canonical(checkout):
+        raise DispatchFailure(
+            f"OpenCode session directory mismatch: expected {canonical(checkout)}, got {directory or 'unknown'}"
+        )
+    return True
+
+
+def wait_for_safe_agent_session(pane_id, checkout, started_agent, timeout=AGENT_START_TIMEOUT_SECONDS):
+    deadline = time.monotonic() + timeout
+    candidate = started_agent
+    while True:
+        pane = validate_agent_pane_checkout(pane_id, checkout)
+        session_id = agent_session_id(candidate) or agent_session_id(pane)
+        if session_id and validate_opencode_session_checkout(session_id, checkout):
+            return session_id
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise DispatchFailure(
+                f"Timed out verifying that the OpenCode session is rooted at implementation worktree {canonical(checkout)}"
+            )
+        candidate = pane
+        time.sleep(min(0.05, remaining))
+
+
 def start_agent_when_shell_ready(
     name,
     pane_id,
@@ -684,7 +784,13 @@ def start_agent_when_shell_ready(
         time.sleep(min(0.05, remaining))
 
 
-def prompt_agent_and_confirm_delivery(name, request, initial_state_change_seq, timeout_ms=PROMPT_DELIVERY_TIMEOUT_MS):
+def prompt_agent_and_confirm_delivery(
+    name,
+    request,
+    initial_state_change_seq,
+    expected_session_id,
+    timeout_ms=PROMPT_DELIVERY_TIMEOUT_MS,
+):
     result = herdr(
         "agent", "prompt", name, request,
         "--wait",
@@ -692,7 +798,7 @@ def prompt_agent_and_confirm_delivery(name, request, initial_state_change_seq, t
         "--timeout", str(timeout_ms),
     )
     agent = json_field(result.stdout, "result", "agent")
-    session = agent.get("agent_session") if isinstance(agent, dict) else None
+    session_id = agent_session_id(agent)
     if (
         not isinstance(agent, dict)
         or agent.get("name") != name
@@ -700,12 +806,7 @@ def prompt_agent_and_confirm_delivery(name, request, initial_state_change_seq, t
         or agent.get("agent_status") != "working"
         or type(agent.get("state_change_seq")) is not int
         or agent["state_change_seq"] <= initial_state_change_seq
-        or not isinstance(session, dict)
-        or session.get("source") != "herdr:opencode"
-        or session.get("agent") != "opencode"
-        or session.get("kind") != "id"
-        or not isinstance(session.get("value"), str)
-        or not session["value"]
+        or session_id != expected_session_id
     ):
         raise DispatchFailure(f"Prompt delivery to agent {name} was not confirmed by an OpenCode session transition")
     return agent
@@ -837,6 +938,7 @@ def dispatch_task_locked(
         if Path(checkout).exists():
             raise DispatchFailure(f"Worktree path already exists: {checkout}")
         base = dispatch_base(root)
+        preserved_primary_state = primary_state(root)
         created = herdr(
             "worktree", "create",
             "--cwd", root,
@@ -849,6 +951,9 @@ def dispatch_task_locked(
         )
         workspace_id = json_field(created.stdout, "result", "workspace", "workspace_id")
         root_pane = json_field(created.stdout, "result", "root_pane", "pane_id")
+        validate_dispatch_checkout(root, checkout, branch)
+        validate_primary_state(root, preserved_primary_state)
+        validate_agent_pane_checkout(root_pane, checkout)
         herdr("pane", "split", root_pane, "--direction", "down", "--ratio", "0.70", "--cwd", checkout, "--no-focus")
         name = agent_name(slug, root_pane)
         started_agent = start_agent_when_shell_ready(
@@ -857,11 +962,21 @@ def dispatch_task_locked(
             checkout,
             parent_session_id=source_session_id,
         )
-        delivered_agent = prompt_agent_and_confirm_delivery(name, request, started_agent["state_change_seq"])
+        implementation_session_id = wait_for_safe_agent_session(root_pane, checkout, started_agent)
+        validate_primary_state(root, preserved_primary_state)
+        prompt_agent_and_confirm_delivery(
+            name,
+            request,
+            started_agent["state_change_seq"],
+            implementation_session_id,
+        )
+        validate_agent_pane_checkout(root_pane, checkout)
+        if not validate_opencode_session_checkout(implementation_session_id, checkout):
+            raise DispatchFailure(f"OpenCode session disappeared after prompt delivery: {implementation_session_id}")
+        validate_primary_state(root, preserved_primary_state)
     except (DispatchFailure, OSError) as error:
         log_event("dispatcher.dispatch_failed", project_root=root, slug=slug, error=str(error))
         raise
-    implementation_session_id = delivered_agent["agent_session"]["value"]
     try:
         record_dispatch_thread(
             root,

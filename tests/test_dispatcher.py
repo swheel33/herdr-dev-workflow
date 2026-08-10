@@ -304,6 +304,7 @@ class DispatcherTest(unittest.TestCase):
 
     def test_successful_dispatch_forks_context_and_resets_project_chat_without_focus(self):
         calls = []
+        safety_events = []
         start_attempts = 0
 
         def fake_herdr(*args, **_kwargs):
@@ -325,6 +326,7 @@ class DispatcherTest(unittest.TestCase):
                     )
                 return self.agent_response(args)
             if args[:2] == ("agent", "prompt"):
+                safety_events.append("prompt")
                 return self.agent_response(args, status="working", state_change_seq=11, session=True)
             if args[:2] == ("tab", "list"):
                 return subprocess.CompletedProcess(
@@ -346,6 +348,14 @@ class DispatcherTest(unittest.TestCase):
             "HERDR_PANE_ID": "w-root:p-chat",
             "HERDR_DISPATCHER_SESSION_ID": "ses-source",
         }), mock.patch.object(dispatcher, "herdr", side_effect=fake_herdr), \
+             mock.patch.object(dispatcher, "validate_dispatch_checkout"), \
+             mock.patch.object(dispatcher, "validate_agent_pane_checkout"), \
+             mock.patch.object(
+                 dispatcher,
+                 "wait_for_safe_agent_session",
+                 side_effect=lambda *_args: safety_events.append("validated") or "ses-dispatched",
+             ), \
+             mock.patch.object(dispatcher, "validate_opencode_session_checkout", return_value=True), \
              mock.patch.object(dispatcher.time, "sleep") as sleep:
             self.assertEqual(dispatcher.dispatch_task("new feature", "Implement the complete request"), 0)
 
@@ -389,6 +399,7 @@ class DispatcherTest(unittest.TestCase):
         self.assertEqual(len(threads), 1)
         self.assertEqual(threads[0]["sessions"], ["ses-source", "ses-dispatched"])
         self.assertEqual(threads[0]["latest_session_id"], "ses-dispatched")
+        self.assertEqual(safety_events, ["validated", "prompt"])
 
     def test_dispatch_requires_source_chat_metadata_before_creating_worktree(self):
         with mock.patch.dict(os.environ, {
@@ -547,6 +558,81 @@ class DispatcherTest(unittest.TestCase):
             with self.assertRaisesRegex(dispatcher.DispatchFailure, "authoritative idle readiness"):
                 dispatcher.start_agent_when_shell_ready("agent", "w-task:p1", "/checkout")
 
+    def test_dispatch_checkout_must_be_registered_linked_worktree(self):
+        before = dispatcher.primary_state(self.repo)
+        checkout = self.add_worktree("isolated")
+
+        self.assertEqual(
+            dispatcher.validate_dispatch_checkout(self.repo, checkout, "wheels/isolated"),
+            lifecycle.canonical(checkout),
+        )
+        self.assertEqual(dispatcher.primary_state(self.repo), before)
+        with self.assertRaisesRegex(dispatcher.DispatchFailure, "primary checkout"):
+            dispatcher.validate_dispatch_checkout(self.repo, self.repo, "main")
+
+    def test_agent_pane_must_remain_in_worktree(self):
+        checkout = self.add_worktree("pane-cwd")
+        response = subprocess.CompletedProcess(
+            ["herdr"],
+            0,
+            json.dumps({"result": {"pane": {
+                "cwd": str(self.repo),
+                "foreground_cwd": str(self.repo),
+            }}}),
+            "",
+        )
+
+        with mock.patch.object(dispatcher, "herdr", return_value=response):
+            with self.assertRaisesRegex(dispatcher.DispatchFailure, "pane cwd mismatch"):
+                dispatcher.validate_agent_pane_checkout("w-task:p1", checkout)
+
+    def test_opencode_session_must_be_rooted_in_worktree(self):
+        checkout = self.add_worktree("session-cwd")
+        sessions = [{
+            "id": "ses-dispatched",
+            "directory": str(self.repo),
+        }]
+
+        with mock.patch.object(dispatcher, "opencode_sessions", return_value=sessions):
+            with self.assertRaisesRegex(dispatcher.DispatchFailure, "session directory mismatch"):
+                dispatcher.validate_opencode_session_checkout("ses-dispatched", checkout)
+
+    def test_session_directory_failure_prevents_prompt_delivery(self):
+        calls = []
+
+        def fake_herdr(*args, **_kwargs):
+            calls.append(args)
+            if args[:2] == ("pane", "get"):
+                return self.pane_response(args)
+            if args[:2] == ("worktree", "create"):
+                return self.created_response()
+            if args[:2] == ("pane", "split"):
+                return subprocess.CompletedProcess(args, 0, "", "")
+            if args[:2] == ("agent", "start"):
+                return self.agent_response(args, session=True)
+            return subprocess.CompletedProcess(args, 0, "", "")
+
+        with mock.patch.dict(os.environ, {
+            "HERDR_DISPATCHER": "1",
+            "HERDR_DISPATCHER_PROJECT_ROOT": str(self.repo),
+            "HERDR_TAB_ID": "w-root:t-chat",
+            "HERDR_WORKSPACE_ID": "w-root",
+            "HERDR_PANE_ID": "w-root:p-chat",
+            "HERDR_DISPATCHER_SESSION_ID": "ses-source",
+        }), mock.patch.object(dispatcher, "herdr", side_effect=fake_herdr), \
+             mock.patch.object(dispatcher, "validate_dispatch_checkout"), \
+             mock.patch.object(dispatcher, "validate_agent_pane_checkout"), \
+             mock.patch.object(
+                 dispatcher,
+                 "wait_for_safe_agent_session",
+                 side_effect=dispatcher.DispatchFailure("OpenCode session directory mismatch"),
+             ):
+            with self.assertRaisesRegex(dispatcher.DispatchFailure, "session directory mismatch"):
+                dispatcher.dispatch_task("wrong-session-cwd", "Implement this request")
+
+        self.assertFalse(any(call[:2] == ("agent", "prompt") for call in calls))
+        self.assertFalse(any(call[:2] == ("tab", "close") for call in calls))
+
     def test_dispatch_failure_keeps_chat_tab_open(self):
         calls = []
 
@@ -567,10 +653,14 @@ class DispatcherTest(unittest.TestCase):
             "HERDR_WORKSPACE_ID": "w-root",
             "HERDR_PANE_ID": "w-root:p-chat",
             "HERDR_DISPATCHER_SESSION_ID": "ses-source",
-        }), mock.patch.object(dispatcher, "herdr", side_effect=fake_herdr):
+        }), mock.patch.object(dispatcher, "herdr", side_effect=fake_herdr), \
+             mock.patch.object(dispatcher, "validate_dispatch_checkout"), \
+             mock.patch.object(dispatcher, "validate_agent_pane_checkout"):
+            before = dispatcher.primary_state(self.repo)
             with self.assertRaisesRegex(dispatcher.DispatchFailure, "exact split failure"):
                 dispatcher.dispatch_task("broken", "Implement this request")
 
+        self.assertEqual(dispatcher.primary_state(self.repo), before)
         self.assertFalse(any(call[:2] == ("workspace", "focus") for call in calls))
         self.assertFalse(any(call[:2] == ("tab", "close") for call in calls))
 
@@ -631,7 +721,10 @@ class DispatcherTest(unittest.TestCase):
             "HERDR_WORKSPACE_ID": "w-root",
             "HERDR_PANE_ID": "w-root:p-chat",
             "HERDR_DISPATCHER_SESSION_ID": "ses-source",
-        }), mock.patch.object(dispatcher, "herdr", side_effect=fake_herdr):
+        }), mock.patch.object(dispatcher, "herdr", side_effect=fake_herdr), \
+             mock.patch.object(dispatcher, "validate_dispatch_checkout"), \
+             mock.patch.object(dispatcher, "validate_agent_pane_checkout"), \
+             mock.patch.object(dispatcher, "wait_for_safe_agent_session", return_value="ses-dispatched"):
             with self.assertRaisesRegex(dispatcher.DispatchFailure, "exact prompt failure"):
                 dispatcher.dispatch_task("prompt-failure", "Implement this request")
 
@@ -663,7 +756,10 @@ class DispatcherTest(unittest.TestCase):
             "HERDR_WORKSPACE_ID": "w-root",
             "HERDR_PANE_ID": "w-root:p-chat",
             "HERDR_DISPATCHER_SESSION_ID": "ses-source",
-        }), mock.patch.object(dispatcher, "herdr", side_effect=fake_herdr):
+        }), mock.patch.object(dispatcher, "herdr", side_effect=fake_herdr), \
+             mock.patch.object(dispatcher, "validate_dispatch_checkout"), \
+             mock.patch.object(dispatcher, "validate_agent_pane_checkout"), \
+             mock.patch.object(dispatcher, "wait_for_safe_agent_session", return_value="ses-dispatched"):
             with self.assertRaisesRegex(dispatcher.DispatchFailure, "agent_prompt_stalled"):
                 dispatcher.dispatch_task("delivery-timeout", "Implement this request")
 
@@ -682,7 +778,7 @@ class DispatcherTest(unittest.TestCase):
         )
         with mock.patch.object(dispatcher, "herdr", return_value=response) as herdr_mock:
             with self.assertRaisesRegex(dispatcher.DispatchFailure, "not confirmed"):
-                dispatcher.prompt_agent_and_confirm_delivery("agent", "request", 10)
+                dispatcher.prompt_agent_and_confirm_delivery("agent", "request", 10, "ses-dispatched")
 
         herdr_mock.assert_called_once_with(
             "agent", "prompt", "agent", "request",
@@ -696,7 +792,7 @@ class DispatcherTest(unittest.TestCase):
         )
         with mock.patch.object(dispatcher, "herdr", return_value=response) as herdr_mock:
             with self.assertRaisesRegex(dispatcher.DispatchFailure, "not confirmed"):
-                dispatcher.prompt_agent_and_confirm_delivery("agent", "request", 10)
+                dispatcher.prompt_agent_and_confirm_delivery("agent", "request", 10, "ses-dispatched")
 
         herdr_mock.assert_called_once()
 

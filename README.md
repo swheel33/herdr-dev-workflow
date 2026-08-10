@@ -75,13 +75,17 @@ a complete handoff. The dispatcher:
 3. Creates `wheels/<slug>` at `<repo>/.worktrees/<slug>` without changing focus.
 4. Splits the implementation workspace into a 70% OpenCode pane and a 30%
    interactive shell, also without changing focus.
-5. Starts OpenCode's Build agent as a fork of the source Project Chat session,
+5. Verifies the checkout is the expected registered linked worktree and that the
+   primary checkout's branch and HEAD have not changed.
+6. Starts OpenCode's Build agent as a fork of the source Project Chat session,
    preserving the full planning and discussion context without retaining the
    discussion-only Project Chat role.
-6. Waits for structured idle readiness, submits the request once, and succeeds
-   only after Herdr observes a new working OpenCode session transition.
-7. Records the source and implementation sessions as one logical history thread.
-8. Ensures one fresh, unfocused Project Chat exists in the primary workspace and
+7. Waits for structured idle readiness, then verifies both the pane cwd and the
+   forked OpenCode session directory resolve to the linked worktree before
+   submitting the request once.
+8. Confirms Herdr observed the expected session transition, revalidates checkout
+   isolation, and records both sessions as one logical history thread.
+9. Ensures one fresh, unfocused Project Chat exists in the primary workspace and
    closes the used chat without creating a duplicate.
 
 The implementation workspace never steals focus. The dispatcher does not call
@@ -91,9 +95,11 @@ background. If the used Project Chat is still active, closing it naturally
 reveals the fresh project home screen.
 
 Failures before confirmed prompt delivery leave the source Project Chat open
-with the exact error. After delivery, the implementation is already running;
-history persistence and chat replacement failures are reported as non-fatal
-cleanup warnings and must not be retried.
+with the exact error. A pane or OpenCode session directory mismatch is fatal and
+prevents prompt submission, including when an OpenCode version preserves the
+source session's primary-root directory while forking. After delivery, the
+implementation is already running; history persistence and chat replacement
+failures are reported as non-fatal cleanup warnings and must not be retried.
 
 Primary synchronization never resets or force-updates local work. Dirty or
 diverged primary checkouts block dispatch. Repositories without `origin` use an
