@@ -6,16 +6,26 @@ HERDR_BIN="${HERDR_BIN_PATH:-herdr}"
 PLUGIN_ID="${HERDR_PLUGIN_ID:-wheels.dev-workflow}"
 
 usage() {
-  printf 'Usage: dev-workflow.sh <layout-here|open-pane|open-all|prune-auto|new-branch-pane|open-pane-entry|prune-pane|doctor>\n' >&2
+  printf 'Usage: dev-workflow.sh <layout-here|setup-workspace|open-pane|open-all|retry-cleanup|new-branch-pane|open-pane-entry|doctor>\n' >&2
   exit 1
 }
 
 doctor() {
-  local command integration_line missing=0
+  local command integration_line herdr_version plugin_root missing=0
   local required=(git python3 opencode pnpm zsh nvim lazygit fzf)
 
   printf 'Wheels Dev Workflow dependency check\n\n'
-  printf 'Herdr: %s (%s)\n' "$HERDR_BIN" "$("$HERDR_BIN" --version 2>/dev/null || printf 'version unknown')"
+  herdr_version="$("$HERDR_BIN" --version 2>/dev/null || printf 'version unknown')"
+  printf 'Herdr: %s (%s)\n' "$HERDR_BIN" "$herdr_version"
+  if ! python3 -c '
+import re
+import sys
+match = re.search(r"([0-9]+)\.([0-9]+)\.([0-9]+)", sys.argv[1])
+raise SystemExit(0 if match and tuple(map(int, match.groups())) >= (0, 8, 0) else 1)
+' "$herdr_version"; then
+    printf '  missing  stable Herdr 0.8.0 or newer is required\n'
+    missing=1
+  fi
   integration_line="$("$HERDR_BIN" integration status 2>/dev/null | while IFS= read -r line; do
     if [[ "$line" == opencode:* ]]; then
       printf '%s' "$line"
@@ -40,6 +50,13 @@ doctor() {
       missing=1
     fi
   done
+  plugin_root="${HERDR_PLUGIN_ROOT:-$(cd -P "$(dirname "${BASH_SOURCE[0]}")" && pwd)}"
+  if [[ -r "$plugin_root/instructions/dispatcher.md" ]]; then
+    printf '  ok       dispatcher instruction %s\n' "$plugin_root/instructions/dispatcher.md"
+  else
+    printf '  missing  dispatcher instruction %s\n' "$plugin_root/instructions/dispatcher.md"
+    missing=1
+  fi
 
   printf '\n'
   if [[ "$missing" == "0" ]]; then
@@ -192,35 +209,10 @@ list_worktrees_porcelain() {
   git -C "$repo_root" worktree list --porcelain
 }
 
-prunable_worktree_count() {
-  local repo_root="$1"
-  local line count=0
-  while IFS= read -r line; do
-    if [[ "$line" == prunable\ * ]]; then
-      count=$((count + 1))
-    fi
-  done < <(list_worktrees_porcelain "$repo_root")
-  printf '%s' "$count"
-}
-
 is_managed_worktree_path() {
   local repo_root="$1"
   local path="$2"
   [[ "$path" == "$(managed_worktree_root "$repo_root")"/* ]]
-}
-
-opencode_worktree_root() {
-  local root="${TMPDIR:-/tmp}/opencode"
-  [[ -d "$root" ]] || return 1
-  (cd -P "$root" && pwd)
-}
-
-is_opencode_worktree_path() {
-  local path="$1"
-  local root resolved_path
-  root="$(opencode_worktree_root)" || return 1
-  resolved_path="$(cd -P "$path" 2>/dev/null && pwd)" || return 1
-  path_contains "$root" "$resolved_path"
 }
 
 primary_worktree_path() {
@@ -311,11 +303,14 @@ setup_layout_for_workspace() {
   local directory="$2"
   local label="$3"
   local run_install="${4:-0}"
+  local focus_workspace="${5:-1}"
   local root_pane pane_count shell_json shell_pane directory_quoted agent_name
 
   pane_count="$(workspace_pane_count "$workspace_id")"
   if [[ "$pane_count" -gt 1 ]]; then
-    "$HERDR_BIN" workspace focus "$workspace_id" >/dev/null
+    if [[ "$focus_workspace" == "1" ]]; then
+      "$HERDR_BIN" workspace focus "$workspace_id" >/dev/null
+    fi
     return
   fi
 
@@ -332,7 +327,10 @@ setup_layout_for_workspace() {
   else
     "$HERDR_BIN" pane run "$shell_pane" "cd -- $directory_quoted && clear" >/dev/null
   fi
-  "$HERDR_BIN" workspace focus "$workspace_id" >/dev/null
+  python3 "$(dirname "${BASH_SOURCE[0]}")/lifecycle.py" metadata
+  if [[ "$focus_workspace" == "1" ]]; then
+    "$HERDR_BIN" workspace focus "$workspace_id" >/dev/null
+  fi
 }
 
 target_directory_for_new_worktree() {
@@ -499,26 +497,6 @@ managed_worktree_rows() {
       name="$(basename "$path")"
       branch="$(git -C "$path" symbolic-ref --quiet --short HEAD 2>/dev/null || printf 'detached')"
       printf 'worktree\t%s\t%s\t%s\n' "$name" "$branch" "$path"
-    fi
-  done < <(list_worktrees_porcelain "$repo_root")
-}
-
-auto_prunable_worktree_rows() {
-  local repo_root="$1"
-  local line path branch name source
-  while IFS= read -r line; do
-    if [[ "$line" == worktree\ * ]]; then
-      path="${line#worktree }"
-      if is_managed_worktree_path "$repo_root" "$path"; then
-        source='managed'
-      elif is_opencode_worktree_path "$path"; then
-        source='OpenCode'
-      else
-        continue
-      fi
-      name="$(basename "$path")"
-      branch="$(git -C "$path" symbolic-ref --quiet --short HEAD 2>/dev/null || printf 'detached')"
-      printf 'worktree\t%s\t%s\t%s\t%s\n' "$name" "$branch" "$path" "$source"
     fi
   done < <(list_worktrees_porcelain "$repo_root")
 }
@@ -749,342 +727,10 @@ open_all() {
   notify "Open all complete" "$summary"
 }
 
-worktree_dirty() {
-  local path="$1"
-  [[ -n "$(git -C "$path" status --porcelain 2>/dev/null)" ]]
-}
-
-remote_branch_exists() {
-  local repo_root="$1"
-  local branch_name="$2"
-  git -C "$repo_root" show-ref --verify --quiet "refs/remotes/origin/$branch_name"
-}
-
-default_branch_names() {
-  local repo_root="$1"
-  local branch
-  branch="$(default_branch "$repo_root")"
-  [[ -n "$branch" ]] && printf '%s\n' "$branch"
-  printf 'main\nmaster\n'
-}
-
-branch_is_protected() {
-  local repo_root="$1"
-  local branch_name="$2"
-  local protected primary_path primary_branch
-  primary_path="$(primary_worktree_path "$repo_root")"
-  primary_branch="$(git -C "$primary_path" symbolic-ref --quiet --short HEAD 2>/dev/null || true)"
-  if [[ "$branch_name" == "$primary_branch" ]]; then
-    return 0
-  fi
-  while IFS= read -r protected; do
-    [[ -n "$protected" ]] || continue
-    if [[ "$branch_name" == "$protected" ]]; then
-      return 0
-    fi
-  done < <(default_branch_names "$repo_root" | sort -u)
-  return 1
-}
-
-branch_worktree_path() {
-  local repo_root="$1"
-  local branch_name="$2"
-  local line tree_path=""
-  while IFS= read -r line; do
-    if [[ "$line" == worktree\ * ]]; then
-      tree_path="${line#worktree }"
-    elif [[ "$line" == "branch refs/heads/$branch_name" ]]; then
-      printf '%s' "$tree_path"
-      return 0
-    fi
-  done < <(list_worktrees_porcelain "$repo_root")
-}
-
-prune_branch() {
-  local repo_root="$1"
-  local branch_name="$2"
-  local tree_path="${3:-}"
-
-  if [[ -n "$tree_path" ]]; then
-    close_workspace_for_path "$tree_path"
-    git -C "$repo_root" worktree remove "$tree_path"
-  fi
-  if git -C "$repo_root" show-ref --verify --quiet "refs/heads/$branch_name"; then
-    git -C "$repo_root" branch -D "$branch_name" >/dev/null
-  fi
-}
-
-close_workspace_for_path() {
-  local target_path="$1"
-  "$HERDR_BIN" worktree list --cwd "$target_path" --json 2>/dev/null | python3 -c '
-import json
-import sys
-
-target = sys.argv[1]
-try:
-    data = json.load(sys.stdin)
-except Exception:
-    raise SystemExit(0)
-for worktree in data.get("result", {}).get("worktrees", []):
-    path = worktree.get("path", "")
-    workspace_id = worktree.get("open_workspace_id")
-    if workspace_id and (path == target or path.startswith(target.rstrip("/") + "/")):
-        print(workspace_id)
-' "$target_path" | while IFS= read -r workspace_id; do
-    "$HERDR_BIN" workspace close "$workspace_id" >/dev/null 2>&1 || true
-  done
-}
-
-prune_selected_worktree() {
-  local repo_root="$1"
-  local name="$2"
-  local force="${3:-0}"
-  local tree_path branch_name reason
-  tree_path="$(managed_worktree_path "$repo_root" "$name")"
-  branch_name="$(git -C "$tree_path" symbolic-ref --quiet --short HEAD 2>/dev/null || true)"
-  if [[ ! -d "$tree_path" || -z "$branch_name" ]]; then
-    printf 'Worktree not found or detached: %s\n' "$name" >&2
-    return 1
-  fi
-  if worktree_dirty "$tree_path" && [[ "$force" != "1" ]]; then
-    printf 'Skipping dirty worktree: %s (use force mode to remove)\n' "$name" >&2
-    return 1
-  fi
-  if [[ "$force" != "1" ]]; then
-    if remote_branch_exists "$repo_root" "$branch_name"; then
-      printf 'Skipping %s: remote branch still exists\n' "$name" >&2
-      return 1
-    fi
-    reason='no matching remote branch'
-  else
-    reason='forced'
-  fi
-
-  close_workspace_for_path "$tree_path"
-  if [[ "$force" == "1" ]]; then
-    git -C "$repo_root" worktree remove --force "$tree_path"
-    git -C "$repo_root" branch -D "$branch_name" >/dev/null
-  else
-    prune_branch "$repo_root" "$branch_name" "$tree_path"
-  fi
-  printf 'Pruned %s (%s)\n' "$name" "$reason"
-}
-
 notify() {
   local title="$1"
   local body="${2:-}"
   "$HERDR_BIN" notification show "$title" --body "$body" --sound none >/dev/null 2>&1 || true
-}
-
-run_prune_job() {
-  local output status summary
-  if output="$("$@" 2>&1)"; then
-    status=0
-  else
-    status=$?
-  fi
-
-  if [[ -n "$output" ]]; then
-    printf '%s\n' "$output"
-  fi
-  summary="${output##*$'\n'}"
-  if [[ -z "$summary" ]]; then
-    summary="Prune command exited with status $status."
-  fi
-
-  if [[ "$status" == "0" ]]; then
-    notify "Prune complete" "$summary"
-  else
-    notify "Prune failed" "$summary"
-  fi
-  return "$status"
-}
-
-prune_auto() {
-  local cwd repo_root kind name branch_name tree_path source index
-  local source_workspace_id="${HERDR_WORKSPACE_ID:-}" source_is_pruned=0
-  local total=0 pruned_worktrees=0 pruned_standalone_branches=0
-  local total_managed=0 total_opencode=0 pruned_managed=0 pruned_opencode=0 stale_before=0 stale_after=0 stale_pruned=0
-  local skipped_dirty=0 skipped_remote=0 skipped_protected=0 skipped_checked_out=0 skipped_other=0
-  local prune_names=() prune_branches=() prune_paths=() prune_sources=() close_pids=() remove_pids=()
-
-  cwd="$(pane_cwd_or_die)"
-  cd "$cwd"
-  repo_root="$(repo_root_or_die)"
-
-  printf 'Fetching origin...\n'
-  refresh_origin_refs "$repo_root"
-
-  stale_before="$(prunable_worktree_count "$repo_root")"
-  git -C "$repo_root" worktree prune --expire now --verbose
-  stale_after="$(prunable_worktree_count "$repo_root")"
-  stale_pruned=$((stale_before - stale_after))
-
-  while IFS=$'\t' read -r kind name branch_name tree_path source; do
-    [[ "$kind" == "worktree" && -n "$tree_path" ]] || continue
-    total=$((total + 1))
-    if [[ "$source" == 'OpenCode' ]]; then
-      total_opencode=$((total_opencode + 1))
-    else
-      total_managed=$((total_managed + 1))
-    fi
-
-    if [[ -z "$branch_name" || "$branch_name" == "detached" ]]; then
-      skipped_other=$((skipped_other + 1))
-      printf 'Skipping %s: detached worktree\n' "$name"
-      continue
-    fi
-
-    if branch_is_protected "$repo_root" "$branch_name"; then
-      skipped_protected=$((skipped_protected + 1))
-      printf 'Skipping %s: protected branch\n' "$branch_name"
-      continue
-    fi
-
-    if remote_branch_exists "$repo_root" "$branch_name"; then
-      skipped_remote=$((skipped_remote + 1))
-      printf 'Skipping %s: remote branch exists\n' "$branch_name"
-      continue
-    fi
-
-    if [[ ! -d "$tree_path" ]]; then
-      skipped_other=$((skipped_other + 1))
-      printf 'Skipping %s: worktree path missing (%s)\n' "$branch_name" "$tree_path"
-      continue
-    fi
-
-    if worktree_dirty "$tree_path"; then
-      skipped_dirty=$((skipped_dirty + 1))
-      printf 'Skipping %s: dirty worktree (%s)\n' "$branch_name" "$tree_path"
-      continue
-    fi
-
-    prune_names+=("$name")
-    prune_branches+=("$branch_name")
-    prune_paths+=("$tree_path")
-    prune_sources+=("$source")
-    if path_contains "$tree_path" "$cwd"; then
-      source_is_pruned=1
-    fi
-  done < <(auto_prunable_worktree_rows "$repo_root")
-
-  for index in "${!prune_paths[@]}"; do
-    close_workspace_for_path "${prune_paths[$index]}" &
-    close_pids[$index]=$!
-  done
-  for index in "${!close_pids[@]}"; do
-    wait "${close_pids[$index]}" || true
-  done
-
-  if [[ -n "$source_workspace_id" && "$source_is_pruned" == "0" && "${#prune_paths[@]}" -gt 0 ]]; then
-    "$HERDR_BIN" workspace focus "$source_workspace_id" >/dev/null 2>&1 || true
-  fi
-
-  for index in "${!prune_paths[@]}"; do
-    printf 'Pruning worktree %s (%s)...\n' "${prune_names[$index]}" "${prune_branches[$index]}"
-    git -C "$repo_root" worktree remove "${prune_paths[$index]}" &
-    remove_pids[$index]=$!
-  done
-
-  for index in "${!remove_pids[@]}"; do
-    name="${prune_names[$index]}"
-    branch_name="${prune_branches[$index]}"
-    tree_path="${prune_paths[$index]}"
-    source="${prune_sources[$index]}"
-    if ! wait "${remove_pids[$index]}"; then
-      skipped_other=$((skipped_other + 1))
-      printf 'Failed to prune worktree %s (%s)\n' "$name" "$tree_path" >&2
-      continue
-    fi
-
-    pruned_worktrees=$((pruned_worktrees + 1))
-    if [[ "$source" == 'OpenCode' ]]; then
-      pruned_opencode=$((pruned_opencode + 1))
-    else
-      pruned_managed=$((pruned_managed + 1))
-    fi
-    if git -C "$repo_root" show-ref --verify --quiet "refs/heads/$branch_name"; then
-      if ! git -C "$repo_root" branch -D "$branch_name" >/dev/null; then
-        skipped_other=$((skipped_other + 1))
-        printf 'Removed worktree %s but failed to delete branch %s\n' "$name" "$branch_name" >&2
-        continue
-      fi
-    fi
-
-    printf 'Pruned worktree %s and branch %s (no matching remote branch)\n' "$name" "$branch_name"
-  done
-
-  while IFS= read -r branch_name; do
-    [[ -n "$branch_name" ]] || continue
-    if remote_branch_exists "$repo_root" "$branch_name"; then
-      continue
-    fi
-
-    tree_path="$(branch_worktree_path "$repo_root" "$branch_name")"
-    if [[ -n "$tree_path" ]]; then
-      if is_managed_worktree_path "$repo_root" "$tree_path" || is_opencode_worktree_path "$tree_path"; then
-        continue
-      fi
-    fi
-    if branch_is_protected "$repo_root" "$branch_name"; then
-      skipped_protected=$((skipped_protected + 1))
-      printf 'Skipping branch %s: protected branch\n' "$branch_name"
-      continue
-    fi
-    if [[ -n "$tree_path" ]]; then
-      skipped_checked_out=$((skipped_checked_out + 1))
-      printf 'Skipping branch %s: checked out at %s\n' "$branch_name" "$tree_path"
-      continue
-    fi
-    if ! git -C "$repo_root" branch -D "$branch_name" >/dev/null; then
-      skipped_other=$((skipped_other + 1))
-      printf 'Failed to prune standalone branch %s\n' "$branch_name" >&2
-      continue
-    fi
-
-    pruned_standalone_branches=$((pruned_standalone_branches + 1))
-    printf 'Pruned standalone branch %s (no matching remote branch)\n' "$branch_name"
-  done < <(git -C "$repo_root" for-each-ref --format='%(refname:short)' refs/heads)
-
-  local summary
-  summary="Pruned $pruned_worktrees of $total worktrees ($pruned_managed/$total_managed managed, $pruned_opencode/$total_opencode OpenCode), $pruned_standalone_branches standalone branches, and $stale_pruned stale worktree record(s); skipped $skipped_dirty dirty, $skipped_remote with remote, $skipped_protected protected, $skipped_checked_out checked out elsewhere, $skipped_other other."
-  printf '%s\n' "$summary"
-}
-
-start_background_prune() {
-  local repo_root="$1"
-  local name="$2"
-  local force="$3"
-  local state_dir log_path script_path
-  state_dir="${HERDR_PLUGIN_STATE_DIR:-${TMPDIR:-/tmp}}"
-  log_path="$state_dir/prune-manual.log"
-  script_path="$(cd -P "$(dirname "${BASH_SOURCE[0]}")" && pwd)/$(basename "${BASH_SOURCE[0]}")"
-  mkdir -p "$state_dir"
-  printf '\n[%s] Pruning %s (force=%s)\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$name" "$force" >> "$log_path"
-  # Ignore HUP before forking so popup teardown cannot race the worker startup.
-  trap '' HUP
-  "$script_path" prune-selected-background "$repo_root" "$name" "$force" >> "$log_path" 2>&1 </dev/null &
-  trap - HUP
-}
-
-prune_pane() {
-  local repo_root selected name answer force=0
-  repo_root="$(repo_root_or_die)"
-  printf 'Fetching origin...\n'
-  refresh_origin_refs "$repo_root"
-  selected="$(managed_worktree_rows "$repo_root" | select_with_fzf 'prune> ')" || exit 0
-  selected="${selected#*$'\t'}"
-  name="${selected%%$'\t'*}"
-  [[ -n "$name" ]] || exit 0
-  printf 'Prune %s? [y/N] ' "$name"
-  IFS= read -r answer
-  [[ "$answer" == y || "$answer" == Y ]] || exit 0
-  printf 'Force if dirty/remote branch still exists? [y/N] '
-  IFS= read -r answer
-  if [[ "$answer" == y || "$answer" == Y ]]; then
-    force=1
-  fi
-  start_background_prune "$repo_root" "$name" "$force"
 }
 
 layout_here() {
@@ -1101,6 +747,12 @@ layout_here() {
   if [[ -n "$pane_id" ]]; then
     "$HERDR_BIN" workspace focus "$workspace_id" >/dev/null 2>&1 || true
   fi
+}
+
+setup_workspace() {
+  local workspace_id="${1:-}" directory="${2:-}" label="${3:-}"
+  [[ -n "$workspace_id" && -n "$directory" && -n "$label" ]] || usage
+  setup_layout_for_workspace "$workspace_id" "$directory" "$label" 0 0
 }
 
 pane_cwd_or_die() {
@@ -1144,17 +796,12 @@ main() {
   shift || true
   case "$command" in
     layout-here) layout_here "$@" ;;
+    setup-workspace) setup_workspace "$@" ;;
     open-pane) open_plugin_pane "$@" ;;
     open-all) open_all "$@" ;;
-    prune-auto)
-      notify "Pruning worktrees..." "Fetching origin and checking managed worktrees."
-      run_prune_job "$0" prune-auto-job "$@"
+    retry-cleanup)
+      python3 "$(dirname "${BASH_SOURCE[0]}")/lifecycle.py" retry
       ;;
-    prune-auto-job) prune_auto "$@" ;;
-    prune-selected-background)
-      run_prune_job "$0" prune-selected-job "$@"
-      ;;
-    prune-selected-job) prune_selected_worktree "$@" ;;
     new-branch-pane)
       trap 'pause_on_error "$?"' EXIT
       new_branch_pane "$@"
@@ -1162,10 +809,6 @@ main() {
     open-pane-entry)
       trap 'pause_on_error "$?"' EXIT
       open_pane_entry "$@"
-      ;;
-    prune-pane)
-      trap 'pause_on_error "$?"' EXIT
-      prune_pane "$@"
       ;;
     doctor) doctor "$@" ;;
     *) usage ;;
