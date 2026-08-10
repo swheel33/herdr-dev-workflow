@@ -32,6 +32,7 @@ class DispatchFailure(RuntimeError):
 CHAT_AGENT = "Project Chat"
 CHAT_AGENT_COLOR = "#D27E99"
 CHAT_TAB_LABEL = "New Chat"
+IMPLEMENTATION_AGENT = "build"
 CHAT_DISPATCH_COMMANDS = (
     'python3 "$HERDR_PLUGIN_ROOT/dispatcher.py" dispatch *',
     "python3 *dispatcher.py dispatch *",
@@ -317,7 +318,11 @@ def open_chat_in_workspace(
     if thread_id:
         command.extend(("--env", f"HERDR_DISPATCH_THREAD_ID={thread_id}"))
     command.append("--focus" if focus else "--no-focus")
-    herdr(*command)
+    opened = herdr(*command)
+    try:
+        return json.loads(opened.stdout)["result"]["plugin_pane"]["pane"]["tab_id"]
+    except (json.JSONDecodeError, KeyError, TypeError):
+        return None
 
 
 def open_chat_tab(root, session_id=None, label=CHAT_TAB_LABEL, *, fork=False, thread_id=None):
@@ -651,6 +656,7 @@ def start_agent_when_shell_ready(
             "--pane", pane_id,
             "--timeout", str(max(1, int(remaining * 1000))),
             "--", checkout,
+            "--agent", IMPLEMENTATION_AGENT,
         ]
         if parent_session_id:
             command.extend(("--session", parent_session_id, "--fork"))
@@ -737,11 +743,30 @@ def dispatch_cleanup_warning(root, slug, stage, error):
 def replace_source_chat(root, chat_tab_id, chat_workspace_id):
     listed = herdr("tab", "list", "--workspace", chat_workspace_id)
     tabs = json_field(listed.stdout, "result", "tabs")
-    if not isinstance(tabs, list) or not any(
-        isinstance(tab, dict) and tab.get("tab_id") == chat_tab_id for tab in tabs
+    if not isinstance(tabs, list) or any(
+        not isinstance(tab, dict) or not isinstance(tab.get("tab_id"), str) for tab in tabs
     ):
+        raise DispatchFailure("source workspace tab metadata is invalid")
+    if not any(tab["tab_id"] == chat_tab_id for tab in tabs):
         raise DispatchFailure("source Project Chat is no longer present")
-    open_chat_in_workspace(root, chat_workspace_id, focus=False)
+
+    empty_chat_ids = [
+        tab["tab_id"]
+        for tab in tabs
+        if tab["tab_id"] != chat_tab_id and tab.get("label") == CHAT_TAB_LABEL
+    ]
+    if not empty_chat_ids:
+        replacement_tab_id = open_chat_in_workspace(root, chat_workspace_id, focus=False)
+        if not replacement_tab_id:
+            raise DispatchFailure("replacement Project Chat tab identity is not available")
+        try:
+            herdr("tab", "rename", replacement_tab_id, CHAT_TAB_LABEL)
+        except Exception:
+            herdr("tab", "close", replacement_tab_id, check=False)
+            raise
+    else:
+        for duplicate_tab_id in empty_chat_ids[1:]:
+            herdr("tab", "close", duplicate_tab_id)
     herdr("tab", "close", chat_tab_id)
 
 

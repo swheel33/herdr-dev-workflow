@@ -328,8 +328,14 @@ class DispatcherTest(unittest.TestCase):
                 return self.agent_response(args, status="working", state_change_seq=11, session=True)
             if args[:2] == ("tab", "list"):
                 return subprocess.CompletedProcess(
-                    args, 0, json.dumps({"result": {"tabs": [{"tab_id": "w-root:t-chat"}]}}), ""
+                    args, 0, json.dumps({"result": {"tabs": [{
+                        "tab_id": "w-root:t-chat", "label": "Used chat",
+                    }]}}), ""
                 )
+            if args[:3] == ("plugin", "pane", "open"):
+                return subprocess.CompletedProcess(args, 0, json.dumps({"result": {
+                    "plugin_pane": {"pane": {"tab_id": "w-root:t-new"}},
+                }}), "")
             return subprocess.CompletedProcess(args, 0, json.dumps({"result": {"type": "ok"}}), "")
 
         with mock.patch.dict(os.environ, {
@@ -351,6 +357,7 @@ class DispatcherTest(unittest.TestCase):
         start_index = start_indexes[0]
         prompt_index = next(index for index, call in enumerate(calls) if call[:2] == ("agent", "prompt"))
         replacement_index = next(index for index, call in enumerate(calls) if call[:3] == ("plugin", "pane", "open"))
+        rename_index = next(index for index, call in enumerate(calls) if call[:2] == ("tab", "rename"))
         close_index = next(index for index, call in enumerate(calls) if call[:2] == ("tab", "close"))
         self.assertLess(split_index, start_index)
         self.assertLess(start_index, prompt_index)
@@ -360,17 +367,22 @@ class DispatcherTest(unittest.TestCase):
             self.assertNotIn("w-task:p2", calls[index])
             self.assertIn("--timeout", calls[index])
         final_start = calls[start_indexes[-1]]
-        self.assertEqual(final_start[-3:], ("--session", "ses-source", "--fork"))
+        self.assertEqual(final_start[-5:], (
+            "--agent", dispatcher.IMPLEMENTATION_AGENT,
+            "--session", "ses-source", "--fork",
+        ))
         self.assertEqual(calls[prompt_index][-5:], (
             "--wait", "--until", "working", "--timeout", str(dispatcher.PROMPT_DELIVERY_TIMEOUT_MS),
         ))
         sleep.assert_called_once()
         self.assertLess(prompt_index, replacement_index)
-        self.assertLess(replacement_index, close_index)
+        self.assertLess(replacement_index, rename_index)
+        self.assertLess(rename_index, close_index)
         replacement = calls[replacement_index]
         self.assertIn("dispatcher-chat", replacement)
         self.assertIn("--no-focus", replacement)
         self.assertNotIn("HERDR_DISPATCHER_SESSION_ID=ses-source", replacement)
+        self.assertEqual(calls[rename_index], ("tab", "rename", "w-root:t-new", "New Chat"))
         self.assertEqual(calls[close_index], ("tab", "close", "w-root:t-chat"))
         self.assertFalse(any(call[:2] in {("workspace", "focus"), ("tab", "focus")} for call in calls))
         threads = dispatcher.load_dispatch_threads()
@@ -406,6 +418,105 @@ class DispatcherTest(unittest.TestCase):
                 dispatcher.replace_source_chat(str(self.repo), "w-root:t-chat", "w-root")
 
         self.assertFalse(any(call[:2] == ("tab", "close") for call in calls))
+
+    def test_existing_empty_project_chat_is_reused_during_handoff(self):
+        calls = []
+
+        def fake_herdr(*args, **_kwargs):
+            calls.append(args)
+            if args[:2] == ("tab", "list"):
+                return subprocess.CompletedProcess(args, 0, json.dumps({"result": {"tabs": [
+                    {"tab_id": "w-root:t-used", "label": "Implement the fix"},
+                    {"tab_id": "w-root:t-empty", "label": "New Chat"},
+                ]}}), "")
+            return subprocess.CompletedProcess(args, 0, json.dumps({"result": {"type": "ok"}}), "")
+
+        with mock.patch.object(dispatcher, "herdr", side_effect=fake_herdr):
+            dispatcher.replace_source_chat(str(self.repo), "w-root:t-used", "w-root")
+
+        self.assertFalse(any(call[:3] == ("plugin", "pane", "open") for call in calls))
+        self.assertEqual(
+            [call for call in calls if call[:2] == ("tab", "close")],
+            [("tab", "close", "w-root:t-used")],
+        )
+
+    def test_repeated_handoffs_see_synchronously_labeled_replacement(self):
+        calls = []
+        tabs = [
+            {"tab_id": "w-root:t-first", "label": "First request"},
+            {"tab_id": "w-root:t-second", "label": "Second request"},
+        ]
+
+        def fake_herdr(*args, **kwargs):
+            calls.append(args)
+            if args[:2] == ("tab", "list"):
+                return subprocess.CompletedProcess(args, 0, json.dumps({"result": {"tabs": tabs}}), "")
+            if args[:3] == ("plugin", "pane", "open"):
+                tabs.append({"tab_id": "w-root:t-empty", "label": "Project chat"})
+                return subprocess.CompletedProcess(args, 0, json.dumps({"result": {
+                    "plugin_pane": {"pane": {"tab_id": "w-root:t-empty"}},
+                }}), "")
+            if args[:2] == ("tab", "rename"):
+                next(tab for tab in tabs if tab["tab_id"] == args[2])["label"] = args[3]
+            if args[:2] == ("tab", "close") and kwargs.get("check", True):
+                tabs[:] = [tab for tab in tabs if tab["tab_id"] != args[2]]
+            return subprocess.CompletedProcess(args, 0, json.dumps({"result": {"type": "ok"}}), "")
+
+        with mock.patch.object(dispatcher, "herdr", side_effect=fake_herdr):
+            dispatcher.replace_source_chat(str(self.repo), "w-root:t-first", "w-root")
+            dispatcher.replace_source_chat(str(self.repo), "w-root:t-second", "w-root")
+
+        self.assertEqual(len([call for call in calls if call[:3] == ("plugin", "pane", "open")]), 1)
+        self.assertEqual(tabs, [{"tab_id": "w-root:t-empty", "label": "New Chat"}])
+
+    def test_replacement_label_failure_removes_new_tab_and_keeps_source(self):
+        calls = []
+
+        def fake_herdr(*args, **_kwargs):
+            calls.append(args)
+            if args[:2] == ("tab", "list"):
+                return subprocess.CompletedProcess(args, 0, json.dumps({"result": {"tabs": [
+                    {"tab_id": "w-root:t-used", "label": "Used chat"},
+                ]}}), "")
+            if args[:3] == ("plugin", "pane", "open"):
+                return subprocess.CompletedProcess(args, 0, json.dumps({"result": {
+                    "plugin_pane": {"pane": {"tab_id": "w-root:t-new"}},
+                }}), "")
+            if args[:2] == ("tab", "rename"):
+                raise dispatcher.DispatchFailure("rename failed")
+            return subprocess.CompletedProcess(args, 0, json.dumps({"result": {"type": "ok"}}), "")
+
+        with mock.patch.object(dispatcher, "herdr", side_effect=fake_herdr):
+            with self.assertRaisesRegex(dispatcher.DispatchFailure, "rename failed"):
+                dispatcher.replace_source_chat(str(self.repo), "w-root:t-used", "w-root")
+
+        self.assertIn(("tab", "close", "w-root:t-new"), calls)
+        self.assertNotIn(("tab", "close", "w-root:t-used"), calls)
+
+    def test_handoff_collapses_preexisting_duplicate_empty_chats(self):
+        tabs = [
+            {"tab_id": "w-root:t-used", "label": "Used chat"},
+            {"tab_id": "w-root:t-empty-1", "label": "New Chat"},
+            {"tab_id": "w-root:t-empty-2", "label": "New Chat"},
+        ]
+        calls = []
+
+        def fake_herdr(*args, **_kwargs):
+            calls.append(args)
+            if args[:2] == ("tab", "list"):
+                return subprocess.CompletedProcess(args, 0, json.dumps({"result": {"tabs": tabs}}), "")
+            return subprocess.CompletedProcess(args, 0, json.dumps({"result": {"type": "ok"}}), "")
+
+        with mock.patch.object(dispatcher, "herdr", side_effect=fake_herdr):
+            dispatcher.replace_source_chat(str(self.repo), "w-root:t-used", "w-root")
+
+        self.assertEqual(
+            [call for call in calls if call[:2] == ("tab", "close")],
+            [
+                ("tab", "close", "w-root:t-empty-2"),
+                ("tab", "close", "w-root:t-used"),
+            ],
+        )
 
     def test_registered_history_continuation_becomes_latest_thread_session(self):
         dispatcher.update_dispatch_thread("thread", self.repo, "ses-implementation")

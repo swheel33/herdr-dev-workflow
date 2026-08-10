@@ -75,13 +75,14 @@ a complete handoff. The dispatcher:
 3. Creates `wheels/<slug>` at `<repo>/.worktrees/<slug>` without changing focus.
 4. Splits the implementation workspace into a 70% OpenCode pane and a 30%
    interactive shell, also without changing focus.
-5. Starts OpenCode as a fork of the source Project Chat session, preserving the
-   full planning and discussion context.
+5. Starts OpenCode's Build agent as a fork of the source Project Chat session,
+   preserving the full planning and discussion context without retaining the
+   discussion-only Project Chat role.
 6. Waits for structured idle readiness, submits the request once, and succeeds
    only after Herdr observes a new working OpenCode session transition.
 7. Records the source and implementation sessions as one logical history thread.
-8. Opens a fresh, unfocused Project Chat in the primary workspace and closes the
-   used chat.
+8. Ensures one fresh, unfocused Project Chat exists in the primary workspace and
+   closes the used chat without creating a duplicate.
 
 The implementation workspace never steals focus. The dispatcher does not call
 `workspace focus` or `tab focus`. If the user moved elsewhere while dispatch was
