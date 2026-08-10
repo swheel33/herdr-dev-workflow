@@ -75,7 +75,11 @@ class DispatcherTest(unittest.TestCase):
         self.assertEqual(dispatcher.discover_project_roots(self.projects), [lifecycle.canonical(self.repo)])
 
     def test_dispatcher_environment_preserves_normal_config(self):
-        inline = {"mcp": {"example": {"type": "remote"}}, "instructions": ["existing.md"]}
+        inline = {
+            "mcp": {"example": {"type": "remote"}},
+            "instructions": ["existing.md"],
+            "permission": {"bash": {"*": "allow"}},
+        }
         tui = self.temp / "tui.json"
         tui.write_text(json.dumps({"theme": "kanagawa", "keybinds": {"session_compact": "ctrl+x,c"}}))
         with mock.patch.dict(os.environ, {
@@ -91,10 +95,17 @@ class DispatcherTest(unittest.TestCase):
         merged = json.loads(environment["OPENCODE_CONFIG_CONTENT"])
         self.assertEqual(merged["mcp"], inline["mcp"])
         self.assertEqual(merged["instructions"], ["existing.md"])
+        self.assertEqual(merged["permission"], inline["permission"])
         self.assertIn(dispatcher.CHAT_AGENT, merged["agent"])
         self.assertIn(f"file://{dispatcher.chat_title_plugin_path()}", merged["plugin"])
         self.assertTrue(merged["agent"]["build"]["disable"])
         self.assertTrue(merged["agent"]["plan"]["disable"])
+        chat = merged["agent"][dispatcher.CHAT_AGENT]
+        self.assertEqual(chat["color"], dispatcher.CHAT_AGENT_COLOR)
+        self.assertEqual(chat["permission"]["edit"], "deny")
+        self.assertNotIn("*", chat["permission"]["bash"])
+        for dispatch_command in dispatcher.CHAT_DISPATCH_COMMANDS:
+            self.assertEqual(chat["permission"]["bash"][dispatch_command], "allow")
         chat_tui = json.loads(Path(environment["OPENCODE_TUI_CONFIG"]).read_text())
         self.assertEqual(chat_tui["theme"], "kanagawa")
         self.assertEqual(chat_tui["keybinds"]["session_compact"], "ctrl+x,c")
@@ -169,11 +180,23 @@ class DispatcherTest(unittest.TestCase):
 
     def test_successful_dispatch_focuses_worktree_then_closes_chat_tab(self):
         calls = []
+        start_attempts = 0
 
         def fake_herdr(*args, **_kwargs):
+            nonlocal start_attempts
             calls.append(args)
             if args[:2] == ("worktree", "create"):
                 return self.created_response()
+            if args[:2] == ("pane", "split"):
+                return subprocess.CompletedProcess(
+                    args, 0, json.dumps({"result": {"pane": {"pane_id": "w-task:p2"}}}), ""
+                )
+            if args[:2] == ("agent", "start"):
+                start_attempts += 1
+                if start_attempts == 1:
+                    return subprocess.CompletedProcess(
+                        args, 1, "", "agent_pane_busy: agent target pane w-task:p1 is not an available shell"
+                    )
             return subprocess.CompletedProcess(args, 0, json.dumps({"result": {"type": "ok"}}), "")
 
         with mock.patch.dict(os.environ, {
@@ -181,14 +204,16 @@ class DispatcherTest(unittest.TestCase):
             "HERDR_DISPATCHER_PROJECT_ROOT": str(self.repo),
             "HERDR_TAB_ID": "w-root:t-chat",
             "HERDR_WORKSPACE_ID": "w-root",
-        }), mock.patch.object(dispatcher, "herdr", side_effect=fake_herdr):
+        }), mock.patch.object(dispatcher, "herdr", side_effect=fake_herdr), \
+             mock.patch.object(dispatcher.time, "sleep") as sleep:
             self.assertEqual(dispatcher.dispatch_task("new feature", "Implement the complete request"), 0)
 
         create = next(call for call in calls if call[:2] == ("worktree", "create"))
         self.assertIn("wheels/new-feature", create)
         self.assertIn(lifecycle.canonical(self.repo / ".worktrees" / "new-feature"), create)
         split_index = next(index for index, call in enumerate(calls) if call[:2] == ("pane", "split"))
-        start_index = next(index for index, call in enumerate(calls) if call[:2] == ("agent", "start"))
+        start_indexes = [index for index, call in enumerate(calls) if call[:2] == ("agent", "start")]
+        start_index = start_indexes[0]
         prompt_index = next(index for index, call in enumerate(calls) if call[:2] == ("agent", "prompt"))
         focus_index = next(index for index, call in enumerate(calls) if call[:2] == ("workspace", "focus"))
         close_index = next(index for index, call in enumerate(calls) if call[:2] == ("tab", "close"))
@@ -196,7 +221,24 @@ class DispatcherTest(unittest.TestCase):
         self.assertLess(start_index, prompt_index)
         self.assertLess(prompt_index, focus_index)
         self.assertLess(focus_index, close_index)
+        self.assertEqual(len(start_indexes), 2)
+        for index in start_indexes:
+            self.assertEqual(calls[index][calls[index].index("--pane") + 1], "w-task:p1")
+            self.assertNotIn("w-task:p2", calls[index])
+        sleep.assert_called_once()
         self.assertEqual(calls[close_index], ("tab", "close", "w-root:t-chat"))
+
+    def test_agent_start_does_not_retry_non_readiness_failures(self):
+        failure = subprocess.CompletedProcess(
+            ["herdr"], 1, "", "agent_name_conflict: agent already exists"
+        )
+        with mock.patch.object(dispatcher, "herdr", return_value=failure) as herdr_mock, \
+             mock.patch.object(dispatcher.time, "sleep") as sleep:
+            with self.assertRaisesRegex(dispatcher.DispatchFailure, "agent_name_conflict"):
+                dispatcher.start_agent_when_shell_ready("agent", "w-task:p1", "/checkout")
+
+        herdr_mock.assert_called_once()
+        sleep.assert_not_called()
 
     def test_dispatch_failure_keeps_chat_tab_open(self):
         calls = []

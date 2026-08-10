@@ -12,6 +12,7 @@ from pathlib import Path
 import re
 import subprocess
 import sys
+import time
 
 from lifecycle import atomic_json, canonical, known_roots, log_event, state_dir
 
@@ -21,7 +22,12 @@ class DispatchFailure(RuntimeError):
 
 
 CHAT_AGENT = "Project Chat"
+CHAT_AGENT_COLOR = "#D27E99"
 CHAT_TAB_LABEL = "New Chat"
+CHAT_DISPATCH_COMMANDS = (
+    'python3 "$HERDR_PLUGIN_ROOT/dispatcher.py" dispatch *',
+    "python3 *dispatcher.py dispatch *",
+)
 CHAT_TUI_DISABLED_KEYBINDS = (
     "session_new",
     "session_list",
@@ -204,19 +210,25 @@ def dispatcher_environment(root, session_id=None):
         raise DispatchFailure("OPENCODE_CONFIG_CONTENT plugin must be an array")
     build = agents.get("build") if isinstance(agents.get("build"), dict) else {}
     plan = agents.get("plan") if isinstance(agents.get("plan"), dict) else {}
+    chat = agents.get(CHAT_AGENT) if isinstance(agents.get(CHAT_AGENT), dict) else {}
+    chat_permission = chat.get("permission") if isinstance(chat.get("permission"), dict) else {}
+    chat_bash = chat_permission.get("bash") if isinstance(chat_permission.get("bash"), dict) else {}
     inline["agent"] = {
         **agents,
         "build": {**build, "disable": True},
         "plan": {**plan, "disable": True},
         CHAT_AGENT: {
+            **chat,
             "description": "Project Chat",
             "mode": "primary",
+            "color": chat.get("color", CHAT_AGENT_COLOR),
             "prompt": Path(dispatcher_instruction_path()).read_text(),
             "permission": {
+                **chat_permission,
                 "edit": "deny",
                 "bash": {
-                    "*": "ask",
-                    "python3 *dispatcher.py dispatch *": "allow",
+                    **chat_bash,
+                    **{command: "allow" for command in CHAT_DISPATCH_COMMANDS},
                 },
             },
         },
@@ -429,6 +441,27 @@ def agent_name(slug, pane_id):
     return f"oc-{prefix}-{pane}"[:32]
 
 
+def start_agent_when_shell_ready(name, pane_id, checkout, timeout=30):
+    deadline = time.monotonic() + timeout
+    while True:
+        result = herdr(
+            "agent", "start", name,
+            "--kind", "opencode",
+            "--pane", pane_id,
+            "--", checkout,
+            check=False,
+        )
+        if result.returncode == 0:
+            return
+        detail = result.stderr.strip() or result.stdout.strip() or "no error output"
+        if "agent_pane_busy" not in detail:
+            raise DispatchFailure(f"Could not start agent {name}: {detail}")
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise DispatchFailure(f"Timed out waiting for agent target pane {pane_id} to become an available shell: {detail}")
+        time.sleep(min(0.05, remaining))
+
+
 @contextlib.contextmanager
 def dispatch_lock(root):
     identifier = hashlib.sha256(canonical(root).encode()).hexdigest()[:24]
@@ -503,7 +536,7 @@ def dispatch_task_locked(root, slug, request, chat_tab_id, chat_workspace_id):
         root_pane = json_field(created.stdout, "result", "root_pane", "pane_id")
         herdr("pane", "split", root_pane, "--direction", "down", "--ratio", "0.70", "--cwd", checkout, "--no-focus")
         name = agent_name(slug, root_pane)
-        herdr("agent", "start", name, "--kind", "opencode", "--pane", root_pane, "--", checkout)
+        start_agent_when_shell_ready(name, root_pane, checkout)
         herdr("agent", "prompt", name, request)
         finish_dispatch(workspace_id, chat_tab_id, chat_workspace_id)
     except (DispatchFailure, OSError) as error:
