@@ -480,6 +480,35 @@ class LifecycleIntegrationTest(unittest.TestCase):
         self.assertEqual(open_call[open_call.index("--label") + 1], checkout.name)
         setup_mock.assert_called_once_with([("w-useful", lifecycle.canonical(checkout), checkout.name)])
 
+    def test_reconciliation_renames_existing_linked_workspace(self):
+        checkout = self.add_worktree("feature/existing-name", push=False)
+        workspaces = [{"workspace_id": "w-existing", "label": self.repo.name}]
+        worktree_output = json.dumps({"result": {"worktrees": [{
+            "path": str(checkout),
+            "branch": "feature/existing-name",
+            "is_linked_worktree": True,
+            "open_workspace_id": "w-existing",
+            "label": self.repo.name,
+        }]}})
+
+        def fake_herdr(*args, **kwargs):
+            output = worktree_output if args[:2] == ("worktree", "list") else json.dumps({"result": {}})
+            return subprocess.CompletedProcess(args, 0, output, "")
+
+        with mock.patch.object(lifecycle, "live_workspaces", return_value=workspaces), \
+             mock.patch.object(lifecycle, "live_panes", return_value=[]), \
+             mock.patch.object(lifecycle, "adopt_current_workspaces", return_value={"roots": [str(self.repo)]}), \
+             mock.patch.object(lifecycle, "herdr", side_effect=fake_herdr) as herdr_mock, \
+             mock.patch.object(lifecycle, "setup_workspaces") as setup_mock:
+            lifecycle.reconcile()
+
+        self.assertIn(
+            ("workspace", "rename", "w-existing", checkout.name),
+            [call.args for call in herdr_mock.call_args_list],
+        )
+        self.assertFalse(any(call.args[:2] == ("worktree", "open") for call in herdr_mock.call_args_list))
+        setup_mock.assert_called_once_with([])
+
     def test_setup_workspaces_starts_every_layout_in_parallel(self):
         entered = threading.Barrier(3)
         release = threading.Event()

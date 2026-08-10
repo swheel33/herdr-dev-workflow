@@ -986,6 +986,7 @@ def setup_workspaces(workspaces):
 def reconcile():
     log_event("reconciliation.started")
     workspaces = live_workspaces()
+    workspace_labels = {workspace["workspace_id"]: workspace.get("label") for workspace in workspaces}
     adoption = adopt_current_workspaces(workspaces, live_panes(), announce=False)
     errors = []
     setup = []
@@ -1004,13 +1005,23 @@ def reconcile():
                     path = canonical(tree.get("path", ""))
                     if (
                         not tree.get("is_linked_worktree")
-                        or tree.get("open_workspace_id")
                         or path in pending_paths
                         or not Path(path).is_dir()
                     ):
                         continue
                     try:
                         label = worktree_label(tree, path)
+                        workspace_id = tree.get("open_workspace_id")
+                        if workspace_id:
+                            if workspace_labels.get(workspace_id) != label:
+                                herdr("workspace", "rename", workspace_id, label)
+                                log_event(
+                                    "reconciliation.workspace_renamed",
+                                    workspace_id=workspace_id,
+                                    checkout_path=path,
+                                    label=label,
+                                )
+                            continue
                         log_event("reconciliation.opening_worktree", repo_root=repo, checkout_path=path)
                         opened = response_result(
                             herdr(
