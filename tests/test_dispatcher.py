@@ -178,7 +178,7 @@ class DispatcherTest(unittest.TestCase):
             "",
         )
 
-    def test_successful_dispatch_focuses_worktree_then_closes_chat_tab(self):
+    def test_successful_dispatch_preserves_sole_tab_workspace_then_closes_chat(self):
         calls = []
         start_attempts = 0
 
@@ -197,6 +197,10 @@ class DispatcherTest(unittest.TestCase):
                     return subprocess.CompletedProcess(
                         args, 1, "", "agent_pane_busy: agent target pane w-task:p1 is not an available shell"
                     )
+            if args[:2] == ("tab", "list"):
+                return subprocess.CompletedProcess(
+                    args, 0, json.dumps({"result": {"tabs": [{"tab_id": "w-root:t-chat"}]}}), ""
+                )
             return subprocess.CompletedProcess(args, 0, json.dumps({"result": {"type": "ok"}}), "")
 
         with mock.patch.dict(os.environ, {
@@ -215,18 +219,147 @@ class DispatcherTest(unittest.TestCase):
         start_indexes = [index for index, call in enumerate(calls) if call[:2] == ("agent", "start")]
         start_index = start_indexes[0]
         prompt_index = next(index for index, call in enumerate(calls) if call[:2] == ("agent", "prompt"))
+        list_index = next(index for index, call in enumerate(calls) if call[:2] == ("tab", "list"))
+        create_tab_index = next(index for index, call in enumerate(calls) if call[:2] == ("tab", "create"))
         focus_index = next(index for index, call in enumerate(calls) if call[:2] == ("workspace", "focus"))
         close_index = next(index for index, call in enumerate(calls) if call[:2] == ("tab", "close"))
         self.assertLess(split_index, start_index)
         self.assertLess(start_index, prompt_index)
-        self.assertLess(prompt_index, focus_index)
+        self.assertLess(prompt_index, list_index)
+        self.assertLess(list_index, create_tab_index)
+        self.assertLess(create_tab_index, focus_index)
         self.assertLess(focus_index, close_index)
         self.assertEqual(len(start_indexes), 2)
         for index in start_indexes:
             self.assertEqual(calls[index][calls[index].index("--pane") + 1], "w-task:p1")
             self.assertNotIn("w-task:p2", calls[index])
         sleep.assert_called_once()
+        self.assertEqual(calls[create_tab_index], (
+            "tab", "create", "--workspace", "w-root", "--cwd", lifecycle.canonical(self.repo), "--no-focus",
+        ))
         self.assertEqual(calls[close_index], ("tab", "close", "w-root:t-chat"))
+
+    def test_finish_dispatch_does_not_create_replacement_when_other_tab_exists(self):
+        calls = []
+
+        def fake_herdr(*args, **_kwargs):
+            calls.append(args)
+            if args[:2] == ("tab", "list"):
+                output = {"result": {"tabs": [
+                    {"tab_id": "w-root:t-chat"},
+                    {"tab_id": "w-root:t-shell"},
+                ]}}
+                return subprocess.CompletedProcess(args, 0, json.dumps(output), "")
+            return subprocess.CompletedProcess(args, 0, "", "")
+
+        with mock.patch.object(dispatcher, "herdr", side_effect=fake_herdr):
+            dispatcher.finish_dispatch(str(self.repo), "task", "w-task", "w-root:t-chat", "w-root")
+
+        self.assertFalse(any(call[:2] == ("tab", "create") for call in calls))
+        self.assertEqual(calls[-2:], [
+            ("workspace", "focus", "w-task"),
+            ("tab", "close", "w-root:t-chat"),
+        ])
+
+    def test_replacement_failure_is_non_fatal_and_leaves_chat_open(self):
+        calls = []
+
+        def fake_herdr(*args, **_kwargs):
+            calls.append(args)
+            if args[:2] == ("worktree", "create"):
+                return self.created_response()
+            if args[:2] == ("pane", "split"):
+                return subprocess.CompletedProcess(
+                    args, 0, json.dumps({"result": {"pane": {"pane_id": "w-task:p2"}}}), ""
+                )
+            if args[:2] == ("tab", "list"):
+                output = {"result": {"tabs": [{"tab_id": "w-root:t-chat"}]}}
+                return subprocess.CompletedProcess(args, 0, json.dumps(output), "")
+            if args[:2] == ("tab", "create"):
+                raise dispatcher.DispatchFailure("replacement shell failed")
+            return subprocess.CompletedProcess(args, 0, "", "")
+
+        with mock.patch.dict(os.environ, {
+            "HERDR_DISPATCHER": "1",
+            "HERDR_DISPATCHER_PROJECT_ROOT": str(self.repo),
+            "HERDR_TAB_ID": "w-root:t-chat",
+            "HERDR_WORKSPACE_ID": "w-root",
+        }), mock.patch.object(dispatcher, "herdr", side_effect=fake_herdr), \
+             mock.patch.object(dispatcher, "notify") as notify:
+            self.assertEqual(dispatcher.dispatch_task("cleanup-warning", "Implement this request"), 0)
+
+        self.assertIn(("workspace", "focus", "w-task"), calls)
+        self.assertFalse(any(call[:2] == ("tab", "close") for call in calls))
+        notify.assert_called_once()
+        self.assertIn("Do not retry", notify.call_args.args[1])
+
+    def test_close_failure_is_non_fatal_and_restores_source_focus(self):
+        calls = []
+
+        def fake_herdr(*args, **_kwargs):
+            calls.append(args)
+            if args[:2] == ("tab", "list"):
+                output = {"result": {"tabs": [
+                    {"tab_id": "w-root:t-chat"},
+                    {"tab_id": "w-root:t-shell"},
+                ]}}
+                return subprocess.CompletedProcess(args, 0, json.dumps(output), "")
+            if args[:2] == ("tab", "close"):
+                raise dispatcher.DispatchFailure("confirmation_required")
+            return subprocess.CompletedProcess(args, 0, "", "")
+
+        with mock.patch.object(dispatcher, "herdr", side_effect=fake_herdr), \
+             mock.patch.object(dispatcher, "notify") as notify:
+            dispatcher.finish_dispatch(str(self.repo), "task", "w-task", "w-root:t-chat", "w-root")
+
+        implementation_focus = calls.index(("workspace", "focus", "w-task"))
+        close = calls.index(("tab", "close", "w-root:t-chat"))
+        restored_focus = calls.index(("workspace", "focus", "w-root"))
+        self.assertLess(implementation_focus, close)
+        self.assertLess(close, restored_focus)
+        self.assertIn("confirmation_required", notify.call_args.args[1])
+
+    def test_stale_source_tab_metadata_skips_close_but_focuses_implementation(self):
+        calls = []
+
+        def fake_herdr(*args, **_kwargs):
+            calls.append(args)
+            if args[:2] == ("tab", "list"):
+                output = {"result": {"tabs": [{"tab_id": "w-root:t-other"}]}}
+                return subprocess.CompletedProcess(args, 0, json.dumps(output), "")
+            return subprocess.CompletedProcess(args, 0, "", "")
+
+        with mock.patch.object(dispatcher, "herdr", side_effect=fake_herdr):
+            dispatcher.finish_dispatch(str(self.repo), "task", "w-task", "w-root:t-chat", "w-root")
+
+        self.assertIn(("workspace", "focus", "w-task"), calls)
+        self.assertFalse(any(call[:2] == ("tab", "close") for call in calls))
+
+    def test_unexpected_post_prompt_cleanup_failure_does_not_fail_dispatch(self):
+        calls = []
+
+        def fake_herdr(*args, **_kwargs):
+            calls.append(args)
+            if args[:2] == ("worktree", "create"):
+                return self.created_response()
+            if args[:2] == ("pane", "split"):
+                return subprocess.CompletedProcess(
+                    args, 0, json.dumps({"result": {"pane": {"pane_id": "w-task:p2"}}}), ""
+                )
+            return subprocess.CompletedProcess(args, 0, "", "")
+
+        with mock.patch.dict(os.environ, {
+            "HERDR_DISPATCHER": "1",
+            "HERDR_DISPATCHER_PROJECT_ROOT": str(self.repo),
+            "HERDR_TAB_ID": "w-root:t-chat",
+            "HERDR_WORKSPACE_ID": "w-root",
+        }), mock.patch.object(dispatcher, "herdr", side_effect=fake_herdr), \
+             mock.patch.object(dispatcher, "finish_dispatch", side_effect=ValueError("unexpected cleanup failure")), \
+             mock.patch.object(dispatcher, "notify") as notify:
+            self.assertEqual(dispatcher.dispatch_task("cleanup-boundary", "Implement this request"), 0)
+
+        self.assertTrue(any(call[:2] == ("agent", "prompt") for call in calls))
+        self.assertIn("Do not retry", notify.call_args.args[1])
 
     def test_agent_start_does_not_retry_non_readiness_failures(self):
         failure = subprocess.CompletedProcess(
@@ -268,6 +401,34 @@ class DispatcherTest(unittest.TestCase):
         command("git", "branch", "-D", "develop", cwd=self.repo)
         self.assertFalse(dispatcher.has_origin(self.repo))
         self.assertEqual(dispatcher.dispatch_base(self.repo), "main")
+
+    def test_prompt_failure_is_fatal_and_keeps_chat_tab_open(self):
+        calls = []
+
+        def fake_herdr(*args, **_kwargs):
+            calls.append(args)
+            if args[:2] == ("worktree", "create"):
+                return self.created_response()
+            if args[:2] == ("pane", "split"):
+                return subprocess.CompletedProcess(
+                    args, 0, json.dumps({"result": {"pane": {"pane_id": "w-task:p2"}}}), ""
+                )
+            if args[:2] == ("agent", "prompt"):
+                raise dispatcher.DispatchFailure("exact prompt failure")
+            return subprocess.CompletedProcess(args, 0, "", "")
+
+        with mock.patch.dict(os.environ, {
+            "HERDR_DISPATCHER": "1",
+            "HERDR_DISPATCHER_PROJECT_ROOT": str(self.repo),
+            "HERDR_TAB_ID": "w-root:t-chat",
+            "HERDR_WORKSPACE_ID": "w-root",
+        }), mock.patch.object(dispatcher, "herdr", side_effect=fake_herdr):
+            with self.assertRaisesRegex(dispatcher.DispatchFailure, "exact prompt failure"):
+                dispatcher.dispatch_task("prompt-failure", "Implement this request")
+
+        self.assertFalse(any(call[:2] == ("tab", "list") for call in calls))
+        self.assertFalse(any(call[:2] == ("workspace", "focus") for call in calls))
+        self.assertFalse(any(call[:2] == ("tab", "close") for call in calls))
 
 
 if __name__ == "__main__":

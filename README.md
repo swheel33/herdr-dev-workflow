@@ -109,10 +109,18 @@ A dispatched task receives this layout:
 
 The plugin fetches the selected repository, creates the linked worktree without
 focusing it, splits the root pane, starts one named OpenCode agent, and submits
-the complete request without waiting. It focuses the new workspace and closes
-only the source chat tab after every dispatch step succeeds. On failure, the
-exact error remains visible in the chat tab and the incomplete workspace is not
-focused.
+the complete request without waiting. After the prompt succeeds, it inspects the
+source workspace. If the Project Chat is its only tab, the plugin first creates
+an unfocused ordinary shell tab there at the primary project root. It then
+focuses the implementation workspace and closes only the source Project Chat;
+existing primary-workspace tabs are otherwise unchanged.
+
+Worktree preparation and agent prompting form the dispatch success boundary.
+Failures before that boundary remain fatal: the exact error remains visible in
+the open chat and the incomplete workspace is not focused. Replacement-tab,
+focus, or source-chat cleanup failures after that boundary are non-fatal. The
+plugin leaves the chat open when necessary and records and displays a cleanup
+warning that explicitly says not to retry the already-created dispatch.
 
 ## Worktree Cleanup
 
