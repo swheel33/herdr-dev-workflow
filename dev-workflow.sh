@@ -7,7 +7,7 @@ PLUGIN_ID="${HERDR_PLUGIN_ID:-wheels.dev-workflow}"
 PLUGIN_ROOT="${HERDR_PLUGIN_ROOT:-$(cd -P "$(dirname "${BASH_SOURCE[0]}")" && pwd)}"
 
 usage() {
-  printf 'Usage: dev-workflow.sh <layout-here|setup-workspace|open-pane|open-all|retry-cleanup|new-branch-pane|open-pane-entry|doctor>\n' >&2
+  printf 'Usage: dev-workflow.sh <setup-workspace|open-pane|open-all|new-branch-pane|open-pane-entry|doctor>\n' >&2
   exit 1
 }
 
@@ -66,13 +66,6 @@ raise SystemExit(0 if match and tuple(map(int, match.groups())) >= (0, 8, 0) els
     printf '  missing  dispatcher instruction %s\n' "$plugin_root/instructions/dispatcher.md"
     missing=1
   fi
-  if [[ -r "$plugin_root/opencode/dispatcher-tracker.js" ]]; then
-    printf '  ok       dispatcher tracker %s\n' "$plugin_root/opencode/dispatcher-tracker.js"
-  else
-    printf '  missing  dispatcher tracker %s\n' "$plugin_root/opencode/dispatcher-tracker.js"
-    missing=1
-  fi
-
   printf '\n'
   if [[ "$missing" == "0" ]]; then
     printf 'All required dependencies are available.\n'
@@ -751,22 +744,6 @@ notify() {
   "$HERDR_BIN" notification show "$title" --body "$body" --sound none >/dev/null 2>&1 || true
 }
 
-layout_here() {
-  local pane_id workspace_id directory label
-  pane_id="${HERDR_PANE_ID:-}"
-  workspace_id="${HERDR_WORKSPACE_ID:-}"
-  directory="$(pane_cwd_or_die)"
-  label="$(basename "$directory")"
-  if [[ -z "$workspace_id" ]]; then
-    printf 'Missing HERDR_WORKSPACE_ID; invoke this through a Herdr plugin action.\n' >&2
-    exit 1
-  fi
-  setup_layout_for_workspace "$workspace_id" "$directory" "$label" 0
-  if [[ -n "$pane_id" ]]; then
-    "$HERDR_BIN" workspace focus "$workspace_id" >/dev/null 2>&1 || true
-  fi
-}
-
 setup_workspace() {
   local workspace_id="${1:-}" directory="${2:-}" label="${3:-}"
   [[ -n "$workspace_id" && -n "$directory" && -n "$label" ]] || usage
@@ -813,13 +790,9 @@ main() {
   local command="${1:-}"
   shift || true
   case "$command" in
-    layout-here) layout_here "$@" ;;
     setup-workspace) setup_workspace "$@" ;;
     open-pane) open_plugin_pane "$@" ;;
     open-all) open_all "$@" ;;
-    retry-cleanup)
-      python3 "$(dirname "${BASH_SOURCE[0]}")/lifecycle.py" retry
-      ;;
     new-branch-pane)
       trap 'pause_on_error "$?"' EXIT
       new_branch_pane "$@"

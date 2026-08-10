@@ -10,7 +10,6 @@ import json
 import os
 from pathlib import Path
 import shlex
-import socket
 import subprocess
 import sys
 import time
@@ -931,21 +930,6 @@ def show_log_pane():
     except EOFError:
         pass
     return 0
-
-
-def socket_request(method, params):
-    path = os.environ.get("HERDR_SOCKET_PATH")
-    if not path:
-        raise RuntimeError("HERDR_SOCKET_PATH is not set")
-    request = json.dumps({"id": f"{PLUGIN_ID}-{os.getpid()}", "method": method, "params": params}) + "\n"
-    with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as connection:
-        connection.connect(path)
-        connection.sendall(request.encode())
-        stream = connection.makefile()
-        response = json.loads(stream.readline())
-    if "error" in response:
-        raise RuntimeError(json.dumps(response["error"], sort_keys=True))
-    return response.get("result", {})
 
 
 def live_workspaces():

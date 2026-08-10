@@ -1,24 +1,37 @@
 #!/usr/bin/env python3
 
 import argparse
+from concurrent.futures import as_completed, ThreadPoolExecutor
 import contextlib
+from datetime import datetime
 import fcntl
 import hashlib
 import json
 import os
 from pathlib import Path
 import re
-import socket
 import subprocess
 import sys
-import time
-import uuid
 
 from lifecycle import atomic_json, canonical, known_roots, log_event, state_dir
 
 
 class DispatchFailure(RuntimeError):
     pass
+
+
+CHAT_AGENT = "Project Chat"
+CHAT_TAB_LABEL = "New Chat"
+CHAT_TUI_DISABLED_KEYBINDS = (
+    "session_new",
+    "session_list",
+    "session_fork",
+    "session_delete",
+    "session_move",
+    "agent_list",
+    "agent_cycle",
+    "agent_cycle_reverse",
+)
 
 
 def run_command(command, *, check=True, input_text=None, cwd=None):
@@ -44,9 +57,7 @@ def run_command(command, *, check=True, input_text=None, cwd=None):
     )
     if check and result.returncode:
         detail = result.stderr.strip() or result.stdout.strip() or "no error output"
-        raise DispatchFailure(
-            f"Command failed ({result.returncode}): {' '.join(command)}\n{detail}"
-        )
+        raise DispatchFailure(f"Command failed ({result.returncode}): {' '.join(command)}\n{detail}")
     return result
 
 
@@ -80,11 +91,7 @@ def primary_repository(path):
 
 def current_project_root():
     context = plugin_context()
-    candidates = [
-        context.get("focused_pane_cwd"),
-        context.get("workspace_cwd"),
-        os.getcwd(),
-    ]
+    candidates = [context.get("focused_pane_cwd"), context.get("workspace_cwd"), os.getcwd()]
     for candidate in candidates:
         root = primary_repository(candidate)
         if root:
@@ -126,178 +133,243 @@ def pick_project(projects_root=None):
     if result.returncode in (1, 130):
         return None
     if result.returncode:
-        detail = result.stderr.strip() or result.stdout.strip() or "fzf failed"
-        raise DispatchFailure(detail)
+        raise DispatchFailure(result.stderr.strip() or result.stdout.strip() or "fzf failed")
     selected = result.stdout.rstrip("\n").split("\t", 1)
     if len(selected) != 2 or selected[1] not in roots:
         raise DispatchFailure("Project picker returned an invalid repository")
     return selected[1]
 
 
+def json_field(output, *path):
+    try:
+        value = json.loads(output)
+        for part in path:
+            value = value[part]
+        return value
+    except (json.JSONDecodeError, KeyError, TypeError) as error:
+        raise DispatchFailure(f"Invalid Herdr JSON response while reading {'.'.join(path)}: {error}") from error
+
+
 def dispatcher_instruction_path():
     return canonical(Path(__file__).parent / "instructions" / "dispatcher.md")
 
 
-def dispatcher_tracker_path():
-    return canonical(Path(__file__).parent / "opencode" / "dispatcher-tracker.js")
+def chat_title_plugin_path():
+    return canonical(Path(__file__).parent / "opencode" / "chat-tab-title.js")
 
 
-def normal_tui_config():
+def normal_tui_config_path():
     configured = os.environ.get("OPENCODE_TUI_CONFIG")
     if configured and Path(configured).is_file():
-        return canonical(configured)
-    xdg = os.environ.get("XDG_CONFIG_HOME")
-    candidate = Path(xdg) / "opencode" / "tui.json" if xdg else Path.home() / ".config" / "opencode" / "tui.json"
-    return canonical(candidate) if candidate.is_file() else None
+        return Path(configured)
+    config_home = Path(os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config"))
+    candidate = config_home / "opencode" / "tui.json"
+    return candidate if candidate.is_file() else None
 
 
-def discussion_sessions_dir():
-    return state_dir() / "discussion-sessions"
-
-
-def discussion_links_dir():
-    return state_dir() / "discussion-links"
-
-
-def discussion_link_path(session_id):
-    return discussion_links_dir() / f"{session_id}.json"
-
-
-def load_discussions():
-    records = {}
-    for directory in (discussion_sessions_dir(), discussion_links_dir()):
-        if not directory.exists():
-            continue
-        for path in sorted(directory.glob("*.json")):
-            try:
-                value = json.loads(path.read_text())
-            except (OSError, json.JSONDecodeError):
-                continue
-            session_id = value.get("session_id")
-            if session_id:
-                records.setdefault(session_id, {}).update(value)
-    return list(records.values())
-
-
-def save_discussion(session_id, **updates):
-    path = discussion_link_path(session_id)
-    lock_path = state_dir() / "locks" / f"discussion-write-{hashlib.sha256(session_id.encode()).hexdigest()[:24]}.lock"
-    lock_path.parent.mkdir(parents=True, exist_ok=True)
-    with lock_path.open("a+") as handle:
-        fcntl.flock(handle, fcntl.LOCK_EX)
-        current = {}
-        if path.exists():
-            try:
-                current = json.loads(path.read_text())
-            except (OSError, json.JSONDecodeError):
-                pass
-        current.update({"session_id": session_id, "updated_at": int(time.time() * 1000), **updates})
-        atomic_json(path, current)
-    return current
-
-
-@contextlib.contextmanager
-def dispatch_session_lock(session_id):
-    identifier = hashlib.sha256(session_id.encode()).hexdigest()[:24]
-    path = state_dir() / "locks" / f"dispatcher-session-{identifier}.lock"
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with path.open("a+") as handle:
-        fcntl.flock(handle, fcntl.LOCK_EX)
-        yield
-
-
-def active_session_id():
-    instance = os.environ.get("HERDR_DISPATCHER_INSTANCE_ID")
-    if instance:
-        path = state_dir() / "dispatcher-instances" / f"{instance}.json"
+def project_chat_tui_config():
+    config = {}
+    source = normal_tui_config_path()
+    if source:
         try:
-            session_id = json.loads(path.read_text()).get("session_id")
-            if session_id:
-                return session_id
-        except (OSError, json.JSONDecodeError):
-            pass
-    return os.environ.get("HERDR_DISPATCHER_SESSION_ID")
+            config = json.loads(source.read_text())
+        except (OSError, json.JSONDecodeError) as error:
+            raise DispatchFailure(f"Could not read normal OpenCode TUI config {source}: {error}") from error
+        if not isinstance(config, dict):
+            raise DispatchFailure(f"OpenCode TUI config {source} must contain a JSON object")
+    keybinds = config.get("keybinds", {})
+    if not isinstance(keybinds, dict):
+        raise DispatchFailure("OpenCode TUI keybinds must be an object")
+    config["keybinds"] = {**keybinds, **{key: "none" for key in CHAT_TUI_DISABLED_KEYBINDS}}
+    path = state_dir() / "project-chat-tui.json"
+    atomic_json(path, config)
+    return canonical(path)
 
 
 def dispatcher_environment(root, session_id=None):
     environment = os.environ.copy()
-    config_home = Path(os.environ.get("HERDR_PLUGIN_STATE_DIR", Path.home() / ".local/state/herdr-dev-workflow")) / "dispatcher-config"
-    config_home.mkdir(parents=True, exist_ok=True)
-    environment["XDG_CONFIG_HOME"] = str(config_home)
-    environment.pop("OPENCODE_CONFIG", None)
-    environment.pop("OPENCODE_CONFIG_DIR", None)
+    inline = {}
+    if environment.get("OPENCODE_CONFIG_CONTENT"):
+        try:
+            inline = json.loads(environment["OPENCODE_CONFIG_CONTENT"])
+        except json.JSONDecodeError as error:
+            raise DispatchFailure(f"OPENCODE_CONFIG_CONTENT must be valid JSON: {error}") from error
+        if not isinstance(inline, dict):
+            raise DispatchFailure("OPENCODE_CONFIG_CONTENT must contain a JSON object")
+    agents = inline.get("agent", {})
+    if not isinstance(agents, dict):
+        raise DispatchFailure("OPENCODE_CONFIG_CONTENT agent must be an object")
+    plugins = inline.get("plugin", [])
+    if not isinstance(plugins, list):
+        raise DispatchFailure("OPENCODE_CONFIG_CONTENT plugin must be an array")
+    build = agents.get("build") if isinstance(agents.get("build"), dict) else {}
+    plan = agents.get("plan") if isinstance(agents.get("plan"), dict) else {}
+    inline["agent"] = {
+        **agents,
+        "build": {**build, "disable": True},
+        "plan": {**plan, "disable": True},
+        CHAT_AGENT: {
+            "description": "Project Chat",
+            "mode": "primary",
+            "prompt": Path(dispatcher_instruction_path()).read_text(),
+            "permission": {
+                "edit": "deny",
+                "bash": {
+                    "*": "ask",
+                    "python3 *dispatcher.py dispatch *": "allow",
+                },
+            },
+        },
+    }
+    title_plugin = f"file://{chat_title_plugin_path()}"
+    inline["plugin"] = [*plugins, *([] if title_plugin in plugins else [title_plugin])]
+    environment["OPENCODE_CONFIG_CONTENT"] = json.dumps(inline, separators=(",", ":"))
     environment["HERDR_DISPATCHER"] = "1"
-    environment["HERDR_DISPATCHER_PROJECT_ROOT"] = root
-    environment["HERDR_DISPATCHER_INSTANCE_ID"] = uuid.uuid4().hex
+    environment["HERDR_DISPATCHER_PROJECT_ROOT"] = canonical(root)
+    environment["OPENCODE_TUI_CONFIG"] = project_chat_tui_config()
     if session_id:
         environment["HERDR_DISPATCHER_SESSION_ID"] = session_id
     else:
         environment.pop("HERDR_DISPATCHER_SESSION_ID", None)
-    tui_config = normal_tui_config()
-    if tui_config:
-        environment["OPENCODE_TUI_CONFIG"] = tui_config
-    environment["OPENCODE_CONFIG_CONTENT"] = json.dumps(
-        {
-            "instructions": [dispatcher_instruction_path()],
-            "plugin": [f"file://{dispatcher_tracker_path()}"],
-        },
-        separators=(",", ":"),
-    )
     return environment
 
 
-def launch_session(root, session_id=None, exec_fn=os.execvpe):
+def primary_workspace(root):
     root = canonical(root)
-    arguments = ["opencode", root]
+    listed = json_field(herdr("workspace", "list").stdout, "result", "workspaces")
+    for workspace in listed:
+        provenance = workspace.get("worktree") or {}
+        checkout = provenance.get("checkout_path")
+        if checkout and not provenance.get("is_linked_worktree") and canonical(checkout) == root:
+            return workspace["workspace_id"]
+    listing = json_field(herdr("worktree", "list", "--cwd", root, "--json").stdout, "result")
+    for tree in listing.get("worktrees", []):
+        if tree.get("path") and canonical(tree["path"]) == root and tree.get("open_workspace_id"):
+            return tree["open_workspace_id"]
+    source = listing.get("source") or {}
+    if source.get("source_checkout_path") and canonical(source["source_checkout_path"]) == root and source.get("source_workspace_id"):
+        return source["source_workspace_id"]
+    opened = herdr(
+        "worktree", "open", "--cwd", root, "--path", root,
+        "--label", Path(root).name, "--no-focus", "--json",
+    )
+    return json_field(opened.stdout, "result", "workspace", "workspace_id")
+
+
+def open_chat_tab(root, session_id=None, label=CHAT_TAB_LABEL):
+    root = canonical(root)
+    workspace_id = primary_workspace(root)
+    command = [
+        "plugin", "pane", "open",
+        "--plugin", os.environ.get("HERDR_PLUGIN_ID", "wheels.dev-workflow"),
+        "--entrypoint", "dispatcher-chat",
+        "--placement", "tab",
+        "--workspace", workspace_id,
+        "--cwd", root,
+        "--env", f"HERDR_DISPATCHER_PROJECT_ROOT={root}",
+        "--env", f"HERDR_CHAT_TAB_LABEL={label}",
+    ]
+    if session_id:
+        command.extend(("--env", f"HERDR_DISPATCHER_SESSION_ID={session_id}"))
+    command.append("--focus")
+    herdr(*command)
+    log_event("dispatcher.chat_tab_opened", project_root=root, workspace_id=workspace_id, session_id=session_id)
+    return workspace_id
+
+
+def open_selector(entrypoint):
+    context = plugin_context()
+    cwd = context.get("focused_pane_cwd") or context.get("workspace_cwd") or os.getcwd()
+    herdr(
+        "plugin", "pane", "open",
+        "--plugin", os.environ.get("HERDR_PLUGIN_ID", "wheels.dev-workflow"),
+        "--entrypoint", entrypoint,
+        "--cwd", cwd,
+        "--focus",
+    )
+
+
+def run_chat(exec_fn=os.execvpe):
+    root = validate_selected_repository(os.environ.get("HERDR_DISPATCHER_PROJECT_ROOT", ""))
+    session_id = os.environ.get("HERDR_DISPATCHER_SESSION_ID")
+    tab_id = os.environ.get("HERDR_TAB_ID") or plugin_context().get("tab_id")
+    if tab_id:
+        herdr("tab", "rename", tab_id, os.environ.get("HERDR_CHAT_TAB_LABEL", CHAT_TAB_LABEL), check=False)
+    arguments = ["opencode", root, "--agent", CHAT_AGENT]
     if session_id:
         arguments.extend(("--session", session_id))
     log_event("dispatcher.session_launching", project_root=root, fresh=not bool(session_id), session_id=session_id)
     exec_fn("opencode", arguments, dispatcher_environment(root, session_id))
 
 
-def launch_fresh_session(root, exec_fn=os.execvpe):
-    launch_session(root, exec_fn=exec_fn)
-
-
 def chat_current():
     root = current_project_root()
     if root is None:
         log_event("dispatcher.current_falling_back_to_picker")
-        root = pick_project()
-    if root:
-        launch_fresh_session(root)
+        open_selector("dispatcher-picker")
+        return 0
+    open_chat_tab(root)
     return 0
 
 
 def chat_picker():
     root = pick_project()
     if root:
-        launch_fresh_session(root)
+        open_chat_tab(root)
     return 0
 
 
 def opencode_sessions(root):
     result = run_command(["opencode", "session", "list", "--format", "json"], cwd=root)
     try:
-        return json.loads(result.stdout)
+        sessions = json.loads(result.stdout)
     except json.JSONDecodeError as error:
         raise DispatchFailure(f"Invalid OpenCode session list JSON: {error}") from error
+    return sessions if isinstance(sessions, list) else []
 
 
-def pick_discussion(root):
-    root = canonical(root)
-    tracked = {item.get("session_id"): item for item in load_discussions() if item.get("project_root") == root}
-    sessions = [item for item in opencode_sessions(root) if item.get("id") in tracked]
+def checkout_root(path):
+    result = git(path, "rev-parse", "--path-format=absolute", "--show-toplevel", check=False)
+    return canonical(result.stdout.strip()) if result.returncode == 0 and result.stdout.strip() else None
+
+
+def general_chat_sessions():
+    sessions = {}
+    roots = discover_project_roots()
+    with ThreadPoolExecutor(max_workers=len(roots) or 1) as executor:
+        futures = {executor.submit(opencode_sessions, root): root for root in roots}
+        for future in as_completed(futures):
+            root = futures[future]
+            try:
+                root_sessions = future.result()
+            except DispatchFailure as error:
+                log_event("dispatcher.chat_history_project_failed", project_root=root, error=str(error))
+                continue
+            for session in root_sessions:
+                session_id = session.get("id")
+                directory = session.get("directory")
+                if not session_id or not directory or checkout_root(directory) != canonical(root):
+                    continue
+                sessions.setdefault(session_id, {**session, "project_root": root})
+    return sorted(sessions.values(), key=lambda item: item.get("updated", 0), reverse=True)
+
+
+def pick_chat():
+    sessions = general_chat_sessions()
     if not sessions:
-        raise DispatchFailure(f"No previous dispatcher chats found for {root}")
-    sessions.sort(key=lambda item: item.get("updated", 0), reverse=True)
+        raise DispatchFailure("No previous project chats found")
     rows = []
+    valid = {}
     for session in sessions:
-        link = tracked[session["id"]].get("active_task") or {}
-        status = f" [{link.get('branch')}]" if link.get("branch") else ""
-        rows.append(f"{session.get('title') or 'Untitled'}{status}\t{session['id']}\n")
+        session_id = session["id"]
+        valid[session_id] = session
+        updated = session.get("updated", 0) / 1000
+        timestamp = datetime.fromtimestamp(updated).strftime("%Y-%m-%d %H:%M") if updated else "unknown"
+        rows.append(
+            f"{Path(session['project_root']).name}\t{session.get('title') or 'Untitled'}\t{timestamp}\t{session_id}\n"
+        )
     result = run_command(
-        ["fzf", "--prompt", "chat> ", "--height", "100%", "--reverse", "--with-nth", "1"],
+        ["fzf", "--prompt", "chat> ", "--height", "100%", "--reverse", "--with-nth", "1,2,3"],
         check=False,
         input_text="".join(rows),
     )
@@ -306,19 +378,16 @@ def pick_discussion(root):
     if result.returncode:
         raise DispatchFailure(result.stderr.strip() or "Chat picker failed")
     selected = result.stdout.rstrip("\n").rsplit("\t", 1)
-    if len(selected) != 2 or selected[1] not in tracked:
+    if len(selected) != 2 or selected[1] not in valid:
         raise DispatchFailure("Chat picker returned an invalid OpenCode session")
-    return selected[1]
+    session = valid[selected[1]]
+    return session["project_root"], session["id"], session.get("title") or CHAT_TAB_LABEL
 
 
 def chat_history():
-    root = current_project_root()
-    if root is None:
-        root = pick_project()
-    if root:
-        session_id = pick_discussion(root)
-        if session_id:
-            launch_session(root, session_id)
+    selected = pick_chat()
+    if selected:
+        open_chat_tab(*selected)
     return 0
 
 
@@ -334,9 +403,7 @@ def validate_selected_repository(root):
     root = canonical(root)
     resolved = primary_repository(root)
     if resolved != root:
-        raise DispatchFailure(
-            f"Selected repository mismatch: expected primary root {root}, resolved {resolved or 'no repository'}"
-        )
+        raise DispatchFailure(f"Selected repository mismatch: expected primary root {root}, resolved {resolved or 'no repository'}")
     return root
 
 
@@ -349,103 +416,55 @@ def dispatch_base(root):
     raise DispatchFailure("Could not determine a base: origin/develop and origin/HEAD are unavailable")
 
 
-def json_field(output, *path):
-    try:
-        value = json.loads(output)
-        for part in path:
-            value = value[part]
-        return value
-    except (json.JSONDecodeError, KeyError, TypeError) as error:
-        raise DispatchFailure(f"Invalid Herdr JSON response while reading {'.'.join(path)}: {error}") from error
-
-
 def agent_name(slug, pane_id):
     pane = re.sub(r"[^a-z0-9]", "", pane_id.lower())[-8:] or "pane"
     prefix = re.sub(r"[^a-z0-9]", "", slug.lower())[:18] or "task"
     return f"oc-{prefix}-{pane}"[:32]
 
 
-def socket_request(method, params):
-    path = os.environ.get("HERDR_SOCKET_PATH")
-    if not path:
-        raise DispatchFailure("HERDR_SOCKET_PATH is not set; cannot close dispatcher popup")
-    request = json.dumps({"id": f"dispatcher-{os.getpid()}", "method": method, "params": params}) + "\n"
-    try:
-        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as connection:
-            connection.connect(path)
-            connection.sendall(request.encode())
-            response = json.loads(connection.makefile().readline())
-    except (OSError, json.JSONDecodeError) as error:
-        raise DispatchFailure(f"Herdr socket request {method} failed: {error}") from error
-    if "error" in response:
-        raise DispatchFailure(f"Herdr socket request {method} failed: {json.dumps(response['error'], sort_keys=True)}")
-    return response.get("result", {})
+@contextlib.contextmanager
+def dispatch_lock(root):
+    identifier = hashlib.sha256(canonical(root).encode()).hexdigest()[:24]
+    path = state_dir() / "locks" / f"dispatcher-{identifier}.lock"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("a+") as handle:
+        fcntl.flock(handle, fcntl.LOCK_EX)
+        yield
 
 
-def active_linked_task(session_id):
-    if not session_id:
-        return None
-    try:
-        discussion = next(item for item in load_discussions() if item.get("session_id") == session_id)
-    except StopIteration:
-        return None
-    task = discussion.get("active_task")
-    if not task or not task.get("agent") or not task.get("workspace_id"):
-        return None
-    result = herdr("agent", "get", task["agent"], check=False)
-    if result.returncode:
-        return None
-    try:
-        agent = json.loads(result.stdout).get("result", {}).get("agent", {})
-    except json.JSONDecodeError:
-        return None
-    if agent.get("workspace_id") != task["workspace_id"] or agent.get("interactive_ready") is not True:
-        return None
-    checkout = task.get("checkout_path")
-    cwd = agent.get("foreground_cwd") or agent.get("cwd")
-    if checkout:
-        if not cwd:
-            return None
-        checkout_path = Path(canonical(checkout))
-        cwd_path = Path(canonical(cwd))
-        if cwd_path != checkout_path and checkout_path not in cwd_path.parents:
-            return None
-    return task
-
-
-def finish_dispatch(workspace_id, original_workspace_id):
+def finish_dispatch(workspace_id, chat_tab_id, chat_workspace_id):
     herdr("workspace", "focus", workspace_id)
     try:
-        socket_request("popup.close", {})
+        herdr("tab", "close", chat_tab_id)
     except DispatchFailure as close_error:
-        if original_workspace_id:
+        if chat_workspace_id:
             try:
-                herdr("workspace", "focus", original_workspace_id)
+                herdr("workspace", "focus", chat_workspace_id)
             except DispatchFailure as restore_error:
-                raise DispatchFailure(f"{close_error}\nAlso failed to restore workspace focus: {restore_error}") from close_error
+                raise DispatchFailure(f"{close_error}\nAlso failed to restore chat workspace focus: {restore_error}") from close_error
         raise
 
 
 def dispatch_task(slug, request):
     if os.environ.get("HERDR_DISPATCHER") != "1":
-        raise DispatchFailure("dispatch is only available inside a dispatcher popup")
+        raise DispatchFailure("dispatch is only available inside a project chat tab")
     root = validate_selected_repository(os.environ.get("HERDR_DISPATCHER_PROJECT_ROOT", ""))
     slug = slugify(slug)
     request = request.strip()
     if not request:
         raise DispatchFailure("Dispatch request must not be empty")
-    original_workspace_id = plugin_context().get("workspace_id")
-    session_id = active_session_id()
-    if not session_id:
-        raise DispatchFailure("Dispatcher session tracking is not ready; retry the request in this popup")
-    with dispatch_session_lock(session_id):
-        return dispatch_task_locked(root, slug, request, session_id, original_workspace_id)
+    context = plugin_context()
+    chat_tab_id = os.environ.get("HERDR_TAB_ID") or context.get("tab_id")
+    chat_workspace_id = os.environ.get("HERDR_WORKSPACE_ID") or context.get("workspace_id")
+    if not chat_tab_id:
+        raise DispatchFailure("HERDR_TAB_ID is not set; cannot close the project chat tab")
+    with dispatch_lock(root):
+        return dispatch_task_locked(root, slug, request, chat_tab_id, chat_workspace_id)
 
 
-def dispatch_task_locked(root, slug, request, session_id, original_workspace_id):
+def dispatch_task_locked(root, slug, request, chat_tab_id, chat_workspace_id):
     branch = f"wheels/{slug}"
     checkout = str(Path(root) / ".worktrees" / slug)
-    save_discussion(session_id, project_root=root)
     log_event(
         "dispatcher.dispatch_started",
         project_root=root,
@@ -455,43 +474,6 @@ def dispatch_task_locked(root, slug, request, session_id, original_workspace_id)
         request=request,
     )
     try:
-        linked = active_linked_task(session_id)
-        if linked:
-            delivered_at = linked.get("last_delivered_at", 0)
-            if linked.get("last_request") == request and int(time.time() * 1000) - delivered_at < 60_000:
-                raise DispatchFailure("This exact request was already delivered in the last minute; do not resend it")
-            if linked.get("last_delivery_status") == "ui_failed" and linked.get("last_request") == request:
-                raise DispatchFailure(
-                    "This exact follow-up was already delivered, but popup focus/closure failed; do not resend it"
-                )
-            herdr("agent", "prompt", linked["agent"], request)
-            save_discussion(
-                session_id,
-                project_root=root,
-                active_task={
-                    **linked,
-                    "last_prompted_at": int(time.time() * 1000),
-                    "last_request": request,
-                    "last_delivery_status": "delivered",
-                    "last_delivered_at": int(time.time() * 1000),
-                },
-            )
-            try:
-                finish_dispatch(linked["workspace_id"], original_workspace_id)
-            except DispatchFailure:
-                save_discussion(
-                    session_id,
-                    project_root=root,
-                    active_task={**linked, "last_request": request, "last_delivery_status": "ui_failed"},
-                )
-                raise
-            log_event(
-                "dispatcher.followup_routed",
-                session_id=session_id,
-                workspace_id=linked["workspace_id"],
-                agent=linked["agent"],
-            )
-            return 0
         git(root, "fetch", "origin", "--prune")
         if git(root, "show-ref", "--verify", "--quiet", f"refs/heads/{branch}", check=False).returncode == 0:
             raise DispatchFailure(f"Local branch already exists: {branch}")
@@ -512,48 +494,11 @@ def dispatch_task_locked(root, slug, request, session_id, original_workspace_id)
         )
         workspace_id = json_field(created.stdout, "result", "workspace", "workspace_id")
         root_pane = json_field(created.stdout, "result", "root_pane", "pane_id")
-        herdr(
-            "pane", "split", root_pane,
-            "--direction", "down",
-            "--ratio", "0.70",
-            "--cwd", checkout,
-            "--no-focus",
-        )
+        herdr("pane", "split", root_pane, "--direction", "down", "--ratio", "0.70", "--cwd", checkout, "--no-focus")
         name = agent_name(slug, root_pane)
         herdr("agent", "start", name, "--kind", "opencode", "--pane", root_pane, "--", checkout)
         herdr("agent", "prompt", name, request)
-        if session_id:
-            save_discussion(
-                session_id,
-                project_root=root,
-                active_task={
-                    "branch": branch,
-                    "checkout_path": checkout,
-                    "workspace_id": workspace_id,
-                    "agent": name,
-                    "dispatched_at": int(time.time() * 1000),
-                    "last_request": request,
-                    "last_delivery_status": "delivered",
-                    "last_delivered_at": int(time.time() * 1000),
-                },
-            )
-        try:
-            finish_dispatch(workspace_id, original_workspace_id)
-        except DispatchFailure:
-            save_discussion(
-                session_id,
-                project_root=root,
-                active_task={
-                    "branch": branch,
-                    "checkout_path": checkout,
-                    "workspace_id": workspace_id,
-                    "agent": name,
-                    "dispatched_at": int(time.time() * 1000),
-                    "last_request": request,
-                    "last_delivery_status": "ui_failed",
-                },
-            )
-            raise
+        finish_dispatch(workspace_id, chat_tab_id, chat_workspace_id)
     except (DispatchFailure, OSError) as error:
         log_event("dispatcher.dispatch_failed", project_root=root, slug=slug, error=str(error))
         raise
@@ -567,6 +512,7 @@ def parse_args():
     commands.add_parser("chat-current")
     commands.add_parser("chat-picker")
     commands.add_parser("chat-history")
+    commands.add_parser("run-chat")
     dispatch = commands.add_parser("dispatch")
     dispatch.add_argument("--slug", required=True)
     dispatch.add_argument("--request", required=True)
@@ -582,11 +528,13 @@ def main():
             return chat_picker()
         if args.command == "chat-history":
             return chat_history()
+        if args.command == "run-chat":
+            return run_chat()
         if args.command == "dispatch":
             return dispatch_task(args.slug, args.request)
     except DispatchFailure as error:
         print(str(error), file=sys.stderr)
-        print("\nDispatcher remains open. Fix the error or continue chatting.", file=sys.stderr)
+        print("\nThe project chat tab remains open. Fix the error or continue chatting.", file=sys.stderr)
         return 1
     return 2
 

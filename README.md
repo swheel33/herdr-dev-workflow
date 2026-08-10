@@ -46,25 +46,36 @@ current user.
 
 ## Dispatcher
 
-The dispatcher opens a fresh OpenCode TUI for project discussion and task
-delegation. Every invocation starts a new conversation.
+The dispatcher opens normal OpenCode chat tabs in each project's primary
+workspace. Chats inherit the user's complete OpenCode configuration, including
+MCPs, plugins, credentials, and TUI settings.
 
 - **Chat for current project** resolves the repository behind the focused pane.
 - Linked worktree paths resolve back to their primary repository.
 - If the focused pane is not in a repository, the project picker opens.
-- **Chat for another project** always opens the picker.
-- **Previous project chats** lists dispatcher discussions tracked by OpenCode and resumes the selected session.
-- The picker combines known cleanup repositories with Git repositories under
-  `~/Projects`, excludes `.worktrees` checkouts, and deduplicates primary roots.
+- **Chat for another project** always opens the project picker.
+- **Chats** searches native OpenCode sessions across every known project and
+  resumes the selection in its primary workspace.
+- Project discovery combines known cleanup repositories with Git repositories
+  under `~/Projects`, excludes `.worktrees`, and deduplicates primary roots.
 
-Discussion, questions, reviews, exploration, and planning stay in the popup.
+Discussion, questions, reviews, exploration, and planning remain in root
+workspace tabs. The sidebar therefore contains primary projects and their
+implementation worktrees rather than separate discussion workspaces. Chats can
+remain open while the user moves between workspaces.
+
+Chat tabs use a fixed **Project Chat** agent that denies direct edits in the
+primary checkout. OpenCode's new/list/fork/delete/move session controls and
+agent switching are disabled in these tabs; use `prefix+space` for another chat
+and `prefix+c` for history. Normal implementation workspaces retain the usual
+Build and Plan agents.
+
+The Chats picker includes sessions rooted at primary checkouts and excludes
+linked-worktree implementation sessions. OpenCode remains the sole source of
+truth for transcripts; the plugin does not maintain a second history.
+
 Requests requiring code changes are dispatched to a new `wheels/<slug>` branch
 at `<repo>/.worktrees/<slug>`.
-
-OpenCode remains the source of truth for discussion transcripts. The plugin
-stores only project and dispatched-task linkage. A resumed discussion routes
-implementation follow-ups to its linked agent while that agent is still live;
-after the workspace closes, its next code task creates a new worktree.
 
 A dispatched task receives this layout:
 
@@ -74,8 +85,9 @@ A dispatched task receives this layout:
 The plugin fetches the selected repository, creates the linked worktree without
 focusing it, splits the root pane, starts one named OpenCode agent, and submits
 the complete request without waiting. It focuses the new workspace and closes
-the popup only after every dispatch step succeeds. On failure, the exact error
-remains visible in the open popup and the incomplete workspace is not focused.
+only the source chat tab after every dispatch step succeeds. On failure, the
+exact error remains visible in the chat tab and the incomplete workspace is not
+focused.
 
 ## Worktree Cleanup
 
@@ -113,7 +125,6 @@ Available actions:
 - **Retry pending worktree cleanup**
 - **Show pending worktree cleanup failures**
 - **Show worktree cleanup log**
-- **Previous project chats**
 - **Adopt current workspaces**
 
 ## Startup Reconciliation
@@ -124,10 +135,11 @@ At startup the plugin:
 2. Discovers and maintains known primary repository roots.
 3. Leaves unresolved cleanup paths closed.
 4. Opens linked worktrees that do not already have a workspace.
-5. Applies the standard 70/30 OpenCode and shell layout to newly opened workspaces.
+5. Applies the standard 70/30 OpenCode and shell layout to newly opened linked workspaces in parallel.
 6. Starts the hourly merged-PR cleanup poller.
 
-Cleanup and reconciliation are serialized per repository.
+Cleanup and workspace opening are serialized per repository; independent layout
+startup runs concurrently.
 
 **Adopt current workspaces** resolves every live workspace and pane back to its
 primary Git repository and persists those roots in plugin state. Git worktree
@@ -150,8 +162,9 @@ terminal processes or scrollback.
 
 ## Sidebar
 
-The example keeps Herdr's default Space rows and leaves Agent rows empty. The
-plugin does not install a transient Agent view or report sidebar-only metadata.
+Primary project workspaces hold general chat tabs. Linked child workspaces hold
+implementation agents. The example keeps Herdr's default Space rows and leaves
+Agent rows empty.
 
 ## Logs
 
@@ -174,8 +187,7 @@ Suggested bindings from [`keybindings.example.toml`](keybindings.example.toml):
 
 - `prefix+space`: chat for current project
 - `prefix+shift+space`: chat for another project
-- `prefix+shift+h`: previous project chats
-- `prefix+l`: set up the standard layout here
+- `prefix+c`: search chats across all projects
 - `prefix+n`: create a personal worktree
 - `prefix+o`: open a worktree or `origin/*` branch
 - `prefix+a`: open all managed worktrees

@@ -6,12 +6,6 @@ description = "Personal Herdr workflows for managed git worktrees and developmen
 platforms = ["macos", "linux"]
 
 [[actions]]
-id = "layout-here"
-title = "Set up dev layout here"
-contexts = ["workspace"]
-command = ["bash", "-lc", "exec \"$HERDR_PLUGIN_ROOT/dev-workflow.sh\" layout-here"]
-
-[[actions]]
 id = "new-branch"
 title = "New personal branch"
 contexts = ["workspace"]
@@ -39,7 +33,7 @@ command = ["bash", "-lc", "exec python3 \"$HERDR_PLUGIN_ROOT/lifecycle.py\" adop
 id = "chat-current"
 title = "Chat for current project"
 contexts = ["workspace"]
-command = ["bash", "-lc", "exec \"$HERDR_PLUGIN_ROOT/dev-workflow.sh\" open-pane dispatcher-current"]
+command = ["bash", "-lc", "exec python3 \"$HERDR_PLUGIN_ROOT/dispatcher.py\" chat-current"]
 
 [[actions]]
 id = "chat-picker"
@@ -49,7 +43,7 @@ command = ["bash", "-lc", "exec \"$HERDR_PLUGIN_ROOT/dev-workflow.sh\" open-pane
 
 [[actions]]
 id = "chat-history"
-title = "Previous project chats"
+title = "Chats"
 contexts = ["workspace"]
 command = ["bash", "-lc", "exec \"$HERDR_PLUGIN_ROOT/dev-workflow.sh\" open-pane dispatcher-history"]
 
@@ -120,27 +114,25 @@ height = "70%"
 command = ["bash", "-lc", "exec \"$HERDR_PLUGIN_ROOT/dev-workflow.sh\" open-pane-entry"]
 
 [[panes]]
-id = "dispatcher-current"
-title = "Chat for current project"
-placement = "popup"
-width = "95%"
-height = "90%"
-command = ["bash", "-lc", "exec python3 \"$HERDR_PLUGIN_ROOT/dispatcher.py\" chat-current"]
+id = "dispatcher-chat"
+title = "Project chat"
+placement = "tab"
+command = ["bash", "-lc", "exec python3 \"$HERDR_PLUGIN_ROOT/dispatcher.py\" run-chat"]
 
 [[panes]]
 id = "dispatcher-picker"
 title = "Chat for another project"
 placement = "popup"
-width = "95%"
-height = "90%"
+width = "80%"
+height = "70%"
 command = ["bash", "-lc", "exec python3 \"$HERDR_PLUGIN_ROOT/dispatcher.py\" chat-picker"]
 
 [[panes]]
 id = "dispatcher-history"
-title = "Previous project chats"
+title = "Chats"
 placement = "popup"
-width = "95%"
-height = "90%"
+width = "90%"
+height = "75%"
 command = ["bash", "-lc", "exec python3 \"$HERDR_PLUGIN_ROOT/dispatcher.py\" chat-history"]
 
 [[panes]]

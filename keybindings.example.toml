@@ -1,10 +1,4 @@
 [[keys.command]]
-key = "prefix+l"
-type = "plugin_action"
-command = "wheels.dev-workflow.layout-here"
-description = "set up dev layout here"
-
-[[keys.command]]
 key = "prefix+n"
 type = "plugin_action"
 command = "wheels.dev-workflow.new-branch"
@@ -35,10 +29,10 @@ command = "wheels.dev-workflow.chat-picker"
 description = "chat for another project"
 
 [[keys.command]]
-key = "prefix+shift+h"
+key = "prefix+c"
 type = "plugin_action"
 command = "wheels.dev-workflow.chat-history"
-description = "previous project chats"
+description = "chats"
 
 [[keys.command]]
 key = "prefix+p"
