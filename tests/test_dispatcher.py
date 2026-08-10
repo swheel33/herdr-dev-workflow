@@ -396,6 +396,25 @@ class DispatcherTest(unittest.TestCase):
         self.assertFalse(any(call[:2] == ("workspace", "focus") for call in calls))
         self.assertFalse(any(call[:2] == ("tab", "close") for call in calls))
 
+    def test_dispatch_reports_dirty_primary_main_without_discarding_changes(self):
+        dirty = self.repo / "local.txt"
+        dirty.write_text("keep me\n")
+        with mock.patch.dict(os.environ, {
+            "HERDR_DISPATCHER": "1",
+            "HERDR_DISPATCHER_PROJECT_ROOT": str(self.repo),
+            "HERDR_TAB_ID": "w-root:t-chat",
+            "HERDR_WORKSPACE_ID": "w-root",
+        }), mock.patch.object(
+            dispatcher,
+            "synchronize_primary_main",
+            return_value={"status": "dirty"},
+        ), mock.patch.object(dispatcher, "herdr") as herdr_mock:
+            with self.assertRaisesRegex(dispatcher.DispatchFailure, "synchronization blocked: dirty"):
+                dispatcher.dispatch_task("blocked", "Implement this request")
+
+        self.assertEqual(dirty.read_text(), "keep me\n")
+        herdr_mock.assert_not_called()
+
     def test_local_only_repository_uses_local_main_as_dispatch_base(self):
         command("git", "remote", "remove", "origin", cwd=self.repo)
         command("git", "branch", "-D", "develop", cwd=self.repo)

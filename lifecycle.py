@@ -725,6 +725,29 @@ def block_auto_prune(repo, checkout, branch, head_oid, pull_request, reasons):
     return True
 
 
+def prune_auto_prune_blocks(active_keys, preserve_repos):
+    path = auto_prune_blocks_path()
+    if not path.exists():
+        return
+    lock_path = state_dir() / "locks" / "auto-prune-blocks.lock"
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    preserve_repos = {canonical(repo) for repo in preserve_repos}
+    with lock_path.open("a+") as handle:
+        fcntl.flock(handle, fcntl.LOCK_EX)
+        blocks = load_auto_prune_blocks()
+        retained = {
+            key: block for key, block in blocks.items()
+            if key in active_keys or canonical(block.get("repo_root", "")) in preserve_repos
+        }
+        if retained == blocks:
+            return
+        if retained:
+            atomic_json(path, {"blocks": retained})
+        else:
+            path.unlink(missing_ok=True)
+        log_event("auto_prune.stale_blocks_removed", removed=len(blocks) - len(retained))
+
+
 def merged_pull_request(repo, branch, head_oid):
     command = [
         "gh", "pr", "list",
@@ -752,9 +775,106 @@ def merged_pull_request(repo, branch, head_oid):
     )
 
 
+def branch_head_integrated_into_main(repo, branch, head_oid):
+    remote_ref = "refs/remotes/origin/main"
+    remote_main = git(repo, "show-ref", "--verify", "--quiet", remote_ref, check=False)
+    if remote_main.returncode == 1:
+        return False
+    if remote_main.returncode:
+        command = ["git", "-C", str(repo), "show-ref", "--verify", "--quiet", remote_ref]
+        raise GitFailure(command, remote_main, "Could not inspect origin/main while checking worktree cleanup")
+    ancestry = git(repo, "merge-base", "--is-ancestor", head_oid, remote_ref, check=False)
+    if ancestry.returncode == 1:
+        return False
+    if ancestry.returncode:
+        command = ["git", "-C", str(repo), "merge-base", "--is-ancestor", head_oid, remote_ref]
+        raise GitFailure(command, ancestry, "Could not compare the worktree head with origin/main")
+    reflog = git(repo, "reflog", "show", "--format=%H", f"refs/heads/{branch}")
+    entries = reflog.stdout.splitlines()
+    return bool(entries) and head_oid != entries[-1]
+
+
 def checkout_is_dirty(checkout):
     result = git(checkout, "status", "--porcelain", "--untracked-files=all")
     return bool(result.stdout.strip())
+
+
+def synchronize_primary_main(repo):
+    repo = canonical(repo)
+    with repository_lock(repo):
+        return synchronize_primary_main_locked(repo)
+
+
+def synchronize_primary_main_locked(repo):
+    remote = git(repo, "remote", "get-url", "origin", check=False)
+    if remote.returncode:
+        result = {"status": "no_remote", "repo_root": repo}
+        log_event("main_sync.skipped", **result)
+        return result
+
+    try:
+        git(repo, "fetch", "origin", "--prune")
+    except GitFailure as error:
+        raise GitFailure(error.command, error.result, "Could not fetch origin while synchronizing local main") from error
+
+    local_ref = "refs/heads/main"
+    remote_ref = "refs/remotes/origin/main"
+    if not local_branch_exists(repo, "main"):
+        result = {"status": "missing_local", "repo_root": repo}
+        log_event("main_sync.skipped", **result)
+        return result
+    remote_main = git(repo, "show-ref", "--verify", "--quiet", remote_ref, check=False)
+    if remote_main.returncode == 1:
+        result = {"status": "missing_remote", "repo_root": repo}
+        log_event("main_sync.skipped", **result)
+        return result
+    if remote_main.returncode:
+        command = ["git", "-C", repo, "show-ref", "--verify", "--quiet", remote_ref]
+        raise GitFailure(command, remote_main, "Could not inspect origin/main while synchronizing local main")
+
+    primary = primary_record(repo)
+    if not primary or primary.get("branch") != "main":
+        result = {
+            "status": "main_not_primary",
+            "repo_root": repo,
+            "primary_branch": None if not primary else primary.get("branch"),
+        }
+        log_event("main_sync.skipped", **result)
+        return result
+
+    local_oid = git(repo, "rev-parse", local_ref).stdout.strip()
+    remote_oid = git(repo, "rev-parse", remote_ref).stdout.strip()
+    common = {"repo_root": repo, "local_oid": local_oid, "remote_oid": remote_oid}
+    if local_oid == remote_oid:
+        result = {"status": "current", **common}
+        log_event("main_sync.current", **result)
+        return result
+    if checkout_is_dirty(primary["path"]):
+        result = {"status": "dirty", **common}
+        log_event("main_sync.blocked", **result)
+        return result
+
+    local_is_ancestor = git(repo, "merge-base", "--is-ancestor", local_ref, remote_ref, check=False)
+    if local_is_ancestor.returncode not in (0, 1):
+        command = ["git", "-C", repo, "merge-base", "--is-ancestor", local_ref, remote_ref]
+        raise GitFailure(command, local_is_ancestor, "Could not compare local main with origin/main")
+    if local_is_ancestor.returncode == 1:
+        remote_is_ancestor = git(repo, "merge-base", "--is-ancestor", remote_ref, local_ref, check=False)
+        if remote_is_ancestor.returncode not in (0, 1):
+            command = ["git", "-C", repo, "merge-base", "--is-ancestor", remote_ref, local_ref]
+            raise GitFailure(command, remote_is_ancestor, "Could not compare origin/main with local main")
+        status = "ahead" if remote_is_ancestor.returncode == 0 else "diverged"
+        result = {"status": status, **common}
+        log_event("main_sync.blocked", **result)
+        return result
+
+    try:
+        git(primary["path"], "merge", "--ff-only", remote_ref)
+    except GitFailure as error:
+        raise GitFailure(error.command, error.result, "Could not fast-forward local main to origin/main") from error
+    result = {"status": "updated", **common}
+    log_event("main_sync.updated", **result)
+    return result
 
 
 def scan_merged_pull_requests():
@@ -766,16 +886,21 @@ def scan_merged_pull_requests():
         for provenance in [workspace.get("worktree") or {}]
         if provenance.get("is_linked_worktree") and provenance.get("checkout_path")
     }
-    blocks = load_auto_prune_blocks()
     sessions = running_session_count()
     checked = pruned = blocked = failures = 0
+    active_block_keys = set()
+    preserve_block_repos = set()
     for repo in adoption["roots"]:
         try:
+            sync = synchronize_primary_main(repo)
+            if sync["status"] in {"dirty", "diverged"}:
+                failures += 1
             primary = primary_record(repo)
             primary_path = canonical(primary["path"]) if primary else None
             records = worktrees(repo)
         except (GitFailure, OSError) as error:
             failures += 1
+            preserve_block_repos.add(repo)
             log_event("auto_prune.repository_failed", repo_root=repo, error=str(error))
             continue
         for record in records:
@@ -789,17 +914,17 @@ def scan_merged_pull_requests():
                 continue
             head_oid = head.stdout.strip()
             key = auto_prune_key(repo, checkout, branch, head_oid)
-            if key in blocks:
-                blocked += 1
-                continue
+            active_block_keys.add(key)
             try:
-                pull_request = merged_pull_request(repo, branch, head_oid)
+                integrated = branch_head_integrated_into_main(repo, branch, head_oid)
+                pull_request = None if integrated else merged_pull_request(repo, branch, head_oid)
             except (GitFailure, OSError) as error:
                 failures += 1
-                log_event("auto_prune.github_failed", repo_root=repo, branch=branch, error=str(error))
+                log_event("auto_prune.merge_check_failed", repo_root=repo, branch=branch, error=str(error))
                 continue
-            if not pull_request:
+            if not integrated and not pull_request:
                 continue
+            merge_source = "origin/main" if integrated else "merged_pull_request"
             workspace = workspace_by_checkout.get(checkout)
             reasons = []
             if sessions != 1:
@@ -828,6 +953,7 @@ def scan_merged_pull_requests():
                     checkout_path=checkout,
                     branch=branch,
                     pull_request=pull_request,
+                    merge_source=merge_source,
                     reasons=reasons,
                 )
                 continue
@@ -844,8 +970,10 @@ def scan_merged_pull_requests():
                 checkout_path=checkout,
                 branch=branch,
                 pull_request=pull_request,
+                merge_source=merge_source,
                 via_workspace=True,
             )
+    prune_auto_prune_blocks(active_block_keys, preserve_block_repos)
     result = {"checked": checked, "pruned": pruned, "blocked": blocked, "failures": failures}
     log_event("auto_prune.scan_finished", **result)
     return result

@@ -107,9 +107,10 @@ A dispatched task receives this layout:
 - top 70%: the only OpenCode agent
 - bottom 30%: unused interactive shell
 
-The plugin fetches the selected repository, creates the linked worktree without
-focusing it, splits the root pane, starts one named OpenCode agent, and submits
-the complete request without waiting. After the prompt succeeds, it inspects the
+The plugin fetches the selected repository and safely synchronizes its primary
+`main` checkout with `origin/main` before creating the linked worktree. It then
+splits the root pane, starts one named OpenCode agent, and submits the complete
+request without waiting. After the prompt succeeds, it inspects the
 source workspace. If the Project Chat is its only tab, the plugin first creates
 an unfocused ordinary shell tab there at the primary project root. It then
 focuses the implementation workspace and closes only the source Project Chat;
@@ -121,6 +122,14 @@ the open chat and the incomplete workspace is not focused. Replacement-tab,
 focus, or source-chat cleanup failures after that boundary are non-fatal. The
 plugin leaves the chat open when necessary and records and displays a cleanup
 warning that explicitly says not to retry the already-created dispatch.
+
+Synchronization fetches `origin`, compares both tips, and runs only
+`git merge --ff-only origin/main` when local `main` is a clean ancestor. An
+already-current or locally-ahead branch is left alone. Dirty primary checkouts
+and diverged branches are never reset or force-updated; dispatch stops with a
+clear error while polling records the blocked state and continues checking
+worktree cleanup. Repositories without an `origin` continue to use their local
+dispatch base.
 
 ## Worktree Cleanup
 
@@ -143,15 +152,26 @@ Each hook, startup, or manual retry makes one attempt. Already-missing resources
 count as completed phases, and successful jobs are removed. Do not recreate a
 pending job's branch or checkout path before retrying it.
 
-A singleton plugin process also checks GitHub immediately at startup and every
-hour. A `wheels/*` worktree is automatically closed and cleaned only when a
-merged pull request matches both its branch and exact head commit. Closed but
-unmerged pull requests and reused branch names are ignored. If multiple Herdr
+A singleton plugin process also fetches and synchronizes known repositories,
+then checks GitHub immediately at startup and every hour. This keeps local
+`main` current whenever upstream advances, independently of whether a matching
+worktree still exists. A `wheels/*` worktree is automatically closed and cleaned
+when its current head commit is contained in `origin/main`, or when a merged pull
+request matches both its branch and exact head commit (including squash merges).
+The direct-main path also requires the branch head to have moved since branch
+creation, so an untouched worktree is not mistaken for integrated code merely
+because its base is an ancestor of `main`. Closed but unmerged pull requests and
+reused branch names are ignored. If multiple Herdr
 sessions are running, the workspace is focused, the agent is not idle/done, or
 the checkout is dirty, the plugin notifies once and leaves that worktree for
 manual cleanup. Set
 `HERDR_AUTO_PRUNE_INTERVAL_SECONDS` to change the interval; values below 60
 seconds are clamped.
+
+Unsafe merged worktrees are re-evaluated on later polls. Their persisted block
+record suppresses duplicate notifications but no longer prevents cleanup after
+the workspace becomes safe; records for worktrees that no longer exist are
+pruned automatically.
 
 Available actions:
 

@@ -14,7 +14,16 @@ import subprocess
 import sys
 import time
 
-from lifecycle import atomic_json, canonical, known_roots, log_event, notify, state_dir
+from lifecycle import (
+    atomic_json,
+    canonical,
+    GitFailure,
+    known_roots,
+    log_event,
+    notify,
+    state_dir,
+    synchronize_primary_main,
+)
 
 
 class DispatchFailure(RuntimeError):
@@ -583,7 +592,16 @@ def dispatch_task_locked(root, slug, request, chat_tab_id, chat_workspace_id):
     try:
         origin = has_origin(root)
         if origin:
-            git(root, "fetch", "origin", "--prune")
+            try:
+                sync = synchronize_primary_main(root)
+            except GitFailure as error:
+                detail = "" if error.result is None else (error.result.stderr.strip() or error.result.stdout.strip())
+                raise DispatchFailure(f"{error.message}{f': {detail}' if detail else ''}") from error
+            if sync["status"] in {"dirty", "diverged"}:
+                raise DispatchFailure(
+                    f"Local main synchronization blocked: {sync['status']}. "
+                    "The primary checkout and branch were left unchanged."
+                )
         if git(root, "show-ref", "--verify", "--quiet", f"refs/heads/{branch}", check=False).returncode == 0:
             raise DispatchFailure(f"Local branch already exists: {branch}")
         if origin and git(root, "show-ref", "--verify", "--quiet", f"refs/remotes/origin/{branch}", check=False).returncode == 0:

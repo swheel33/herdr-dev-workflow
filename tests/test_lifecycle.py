@@ -80,6 +80,64 @@ class LifecycleIntegrationTest(unittest.TestCase):
         )
         return result.returncode == 0
 
+    def advance_remote_main(self, content="upstream\n"):
+        clone = self.temp / f"upstream-{len(list(self.temp.glob('upstream-*')))}"
+        command("git", "clone", str(self.remote), str(clone))
+        command("git", "config", "user.email", "upstream@example.com", cwd=clone)
+        command("git", "config", "user.name", "Upstream User", cwd=clone)
+        (clone / "upstream.txt").write_text(content)
+        command("git", "add", "upstream.txt", cwd=clone)
+        command("git", "commit", "-m", "advance main", cwd=clone)
+        command("git", "push", "origin", "main", cwd=clone)
+        return command("git", "rev-parse", "HEAD", cwd=clone).stdout.strip()
+
+    def test_primary_main_fast_forwards_to_origin(self):
+        remote_oid = self.advance_remote_main()
+
+        result = lifecycle.synchronize_primary_main(self.repo)
+
+        self.assertEqual(result["status"], "updated")
+        self.assertEqual(command("git", "rev-parse", "main", cwd=self.repo).stdout.strip(), remote_oid)
+
+    def test_primary_main_already_current_is_unchanged(self):
+        before = command("git", "rev-parse", "main", cwd=self.repo).stdout.strip()
+
+        result = lifecycle.synchronize_primary_main(self.repo)
+
+        self.assertEqual(result["status"], "current")
+        self.assertEqual(command("git", "rev-parse", "main", cwd=self.repo).stdout.strip(), before)
+
+    def test_dirty_primary_main_is_preserved_and_not_fast_forwarded(self):
+        before = command("git", "rev-parse", "main", cwd=self.repo).stdout.strip()
+        remote_oid = self.advance_remote_main()
+        dirty = self.repo / "local.txt"
+        dirty.write_text("keep me\n")
+
+        result = lifecycle.synchronize_primary_main(self.repo)
+
+        self.assertEqual(result["status"], "dirty")
+        self.assertEqual(command("git", "rev-parse", "main", cwd=self.repo).stdout.strip(), before)
+        self.assertNotEqual(before, remote_oid)
+        self.assertEqual(dirty.read_text(), "keep me\n")
+
+    def test_diverged_primary_main_is_preserved(self):
+        (self.repo / "local.txt").write_text("local\n")
+        command("git", "add", "local.txt", cwd=self.repo)
+        command("git", "commit", "-m", "local main", cwd=self.repo)
+        local_oid = command("git", "rev-parse", "main", cwd=self.repo).stdout.strip()
+        self.advance_remote_main()
+
+        result = lifecycle.synchronize_primary_main(self.repo)
+
+        self.assertEqual(result["status"], "diverged")
+        self.assertEqual(command("git", "rev-parse", "main", cwd=self.repo).stdout.strip(), local_oid)
+
+    def test_primary_main_fetch_failure_is_reported(self):
+        command("git", "remote", "set-url", "origin", str(self.temp / "missing.git"), cwd=self.repo)
+
+        with self.assertRaisesRegex(lifecycle.GitFailure, "Could not fetch origin"):
+            lifecycle.synchronize_primary_main(self.repo)
+
     def test_normal_close_removes_checkout_remote_local_and_metadata(self):
         checkout = self.add_worktree()
         self.assertTrue(lifecycle.enqueue(self.repo, checkout, "feature/test", label="test"))
@@ -363,8 +421,23 @@ class LifecycleIntegrationTest(unittest.TestCase):
         self.assertEqual(pull_request["number"], 2)
         self.assertEqual(run_mock.call_args.kwargs["cwd"], self.repo)
 
+    def test_branch_head_in_main_requires_a_commit_after_branch_creation(self):
+        checkout = self.add_worktree("wheels/integrated", push=False)
+        initial = command("git", "rev-parse", "HEAD", cwd=checkout).stdout.strip()
+        self.assertFalse(lifecycle.branch_head_integrated_into_main(self.repo, "wheels/integrated", initial))
+
+        (checkout / "integrated.txt").write_text("integrated\n")
+        command("git", "add", "integrated.txt", cwd=checkout)
+        command("git", "commit", "-m", "integrated change", cwd=checkout)
+        head = command("git", "rev-parse", "HEAD", cwd=checkout).stdout.strip()
+        command("git", "push", "origin", "HEAD:main", cwd=checkout)
+        command("git", "fetch", "origin", cwd=self.repo)
+
+        self.assertTrue(lifecycle.branch_head_integrated_into_main(self.repo, "wheels/integrated", head))
+
     def test_hourly_scan_closes_clean_idle_merged_workspace(self):
         checkout = self.add_worktree("wheels/merged", push=False)
+        remote_oid = self.advance_remote_main()
         lifecycle.remember_root(self.repo)
         workspace = {
             "workspace_id": "w-merged",
@@ -386,7 +459,48 @@ class LifecycleIntegrationTest(unittest.TestCase):
              mock.patch.object(lifecycle, "herdr") as herdr_mock:
             result = lifecycle.scan_merged_pull_requests()
         self.assertEqual(result, {"checked": 1, "pruned": 1, "blocked": 0, "failures": 0})
+        self.assertEqual(command("git", "rev-parse", "main", cwd=self.repo).stdout.strip(), remote_oid)
         herdr_mock.assert_called_once_with("workspace", "close", "w-merged")
+
+    def test_hourly_scan_syncs_main_without_a_merged_worktree(self):
+        remote_oid = self.advance_remote_main()
+        lifecycle.remember_root(self.repo)
+
+        with mock.patch.object(lifecycle, "live_workspaces", return_value=[]), \
+             mock.patch.object(lifecycle, "live_panes", return_value=[]), \
+             mock.patch.object(lifecycle, "running_session_count", return_value=1):
+            result = lifecycle.scan_merged_pull_requests()
+
+        self.assertEqual(result, {"checked": 0, "pruned": 0, "blocked": 0, "failures": 0})
+        self.assertEqual(command("git", "rev-parse", "main", cwd=self.repo).stdout.strip(), remote_oid)
+
+    def test_hourly_scan_closes_workspace_whose_head_was_pushed_to_main(self):
+        checkout = self.add_worktree("wheels/pushed", push=False)
+        (checkout / "pushed.txt").write_text("pushed\n")
+        command("git", "add", "pushed.txt", cwd=checkout)
+        command("git", "commit", "-m", "pushed change", cwd=checkout)
+        command("git", "push", "origin", "HEAD:main", cwd=checkout)
+        lifecycle.remember_root(self.repo)
+        workspace = {
+            "workspace_id": "w-pushed",
+            "agent_status": "done",
+            "worktree": {
+                "repo_root": str(self.repo),
+                "checkout_path": str(checkout),
+                "is_linked_worktree": True,
+            },
+        }
+
+        with mock.patch.object(lifecycle, "live_workspaces", return_value=[workspace]), \
+             mock.patch.object(lifecycle, "live_panes", return_value=[]), \
+             mock.patch.object(lifecycle, "running_session_count", return_value=1), \
+             mock.patch.object(lifecycle, "merged_pull_request") as pr_mock, \
+             mock.patch.object(lifecycle, "herdr") as herdr_mock:
+            result = lifecycle.scan_merged_pull_requests()
+
+        self.assertEqual(result, {"checked": 1, "pruned": 1, "blocked": 0, "failures": 0})
+        pr_mock.assert_not_called()
+        herdr_mock.assert_called_once_with("workspace", "close", "w-pushed")
 
     def test_hourly_scan_notifies_once_and_never_prunes_unsafe_merge(self):
         checkout = self.add_worktree("wheels/unsafe", dirty=True, push=False)
@@ -421,6 +535,58 @@ class LifecycleIntegrationTest(unittest.TestCase):
         self.assertIn("multiple Herdr sessions are running", block["reasons"])
         self.assertIn("workspace is focused", block["reasons"])
         self.assertIn("checkout has uncommitted changes", block["reasons"])
+
+    def test_hourly_scan_reconsiders_a_previously_blocked_workspace(self):
+        checkout = self.add_worktree("wheels/reconsider", push=False)
+        (checkout / "reconsider.txt").write_text("merged\n")
+        command("git", "add", "reconsider.txt", cwd=checkout)
+        command("git", "commit", "-m", "reconsider change", cwd=checkout)
+        command("git", "push", "origin", "HEAD:main", cwd=checkout)
+        lifecycle.remember_root(self.repo)
+        workspace = {
+            "workspace_id": "w-reconsider",
+            "agent_status": "working",
+            "focused": True,
+            "worktree": {
+                "repo_root": str(self.repo),
+                "checkout_path": str(checkout),
+                "is_linked_worktree": True,
+            },
+        }
+
+        with mock.patch.object(lifecycle, "live_workspaces", return_value=[workspace]), \
+             mock.patch.object(lifecycle, "live_panes", return_value=[]), \
+             mock.patch.object(lifecycle, "running_session_count", return_value=1), \
+             mock.patch.object(lifecycle, "herdr") as herdr_mock:
+            first = lifecycle.scan_merged_pull_requests()
+            workspace["focused"] = False
+            workspace["agent_status"] = "idle"
+            second = lifecycle.scan_merged_pull_requests()
+
+        self.assertEqual(first["blocked"], 1)
+        self.assertEqual(second["pruned"], 1)
+        herdr_mock.assert_called_once_with("workspace", "close", "w-reconsider")
+
+    def test_hourly_scan_removes_stale_auto_prune_blocks(self):
+        checkout = self.add_worktree("wheels/stale-block", push=False)
+        head_oid = command("git", "rev-parse", "HEAD", cwd=checkout).stdout.strip()
+        lifecycle.block_auto_prune(
+            self.repo,
+            checkout,
+            "wheels/stale-block",
+            head_oid,
+            None,
+            ["workspace is focused"],
+        )
+        command("git", "worktree", "remove", "--force", str(checkout), cwd=self.repo)
+        lifecycle.remember_root(self.repo)
+
+        with mock.patch.object(lifecycle, "live_workspaces", return_value=[]), \
+             mock.patch.object(lifecycle, "live_panes", return_value=[]), \
+             mock.patch.object(lifecycle, "running_session_count", return_value=1):
+            lifecycle.scan_merged_pull_requests()
+
+        self.assertEqual(lifecycle.load_auto_prune_blocks(), {})
 
     def test_event_path_mismatch_is_rejected(self):
         checkout = self.add_worktree("feature/mismatch")
