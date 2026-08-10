@@ -117,9 +117,8 @@ active tab or window. The existing functional Project Chat remains open in the
 primary workspace, including when it is that workspace's only tab.
 
 Failures remain visible in the active Project Chat, and an incomplete
-implementation workspace is never focused. Once the agent prompt succeeds, the
-dispatch is complete; the user can continue chatting or switch to the
-implementation workspace when desired.
+implementation workspace is never focused. Prompt submission succeeds only
+after Herdr confirms a working transition with an OpenCode session identity.
 
 Synchronization fetches `origin`, compares both tips, and runs only
 `git merge --ff-only origin/main` when local `main` is a clean ancestor. An

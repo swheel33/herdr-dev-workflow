@@ -178,6 +178,26 @@ class DispatcherTest(unittest.TestCase):
             "",
         )
 
+    def agent_response(self, args, *, status="idle", state_change_seq=10, session=False, interactive_ready=True):
+        agent = {
+            "agent": "opencode",
+            "agent_status": status,
+            "interactive_ready": interactive_ready,
+            "name": args[2],
+            "pane_id": "w-task:p1",
+            "state_change_seq": state_change_seq,
+        }
+        if session:
+            agent["agent_session"] = {
+                "source": "herdr:opencode",
+                "agent": "opencode",
+                "kind": "id",
+                "value": "ses-dispatched",
+            }
+        return subprocess.CompletedProcess(
+            args, 0, json.dumps({"result": {"agent": agent}}), ""
+        )
+
     def test_successful_dispatch_keeps_project_chat_active(self):
         calls = []
         start_attempts = 0
@@ -197,6 +217,9 @@ class DispatcherTest(unittest.TestCase):
                     return subprocess.CompletedProcess(
                         args, 1, "", "agent_pane_busy: agent target pane w-task:p1 is not an available shell"
                     )
+                return self.agent_response(args)
+            if args[:2] == ("agent", "prompt"):
+                return self.agent_response(args, status="working", state_change_seq=11, session=True)
             return subprocess.CompletedProcess(args, 0, json.dumps({"result": {"type": "ok"}}), "")
 
         with mock.patch.dict(os.environ, {
@@ -221,6 +244,10 @@ class DispatcherTest(unittest.TestCase):
         for index in start_indexes:
             self.assertEqual(calls[index][calls[index].index("--pane") + 1], "w-task:p1")
             self.assertNotIn("w-task:p2", calls[index])
+            self.assertIn("--timeout", calls[index])
+        self.assertEqual(calls[prompt_index][-5:], (
+            "--wait", "--until", "working", "--timeout", str(dispatcher.PROMPT_DELIVERY_TIMEOUT_MS),
+        ))
         sleep.assert_called_once()
         self.assertFalse(any(call[0] in {"tab", "workspace"} for call in calls))
 
@@ -231,6 +258,14 @@ class DispatcherTest(unittest.TestCase):
             calls.append(args)
             if args[:2] == ("worktree", "create"):
                 return self.created_response()
+            if args[:2] == ("pane", "split"):
+                return subprocess.CompletedProcess(
+                    args, 0, json.dumps({"result": {"pane": {"pane_id": "w-task:p2"}}}), ""
+                )
+            if args[:2] == ("agent", "start"):
+                return self.agent_response(args)
+            if args[:2] == ("agent", "prompt"):
+                return self.agent_response(args, status="working", state_change_seq=11, session=True)
             return subprocess.CompletedProcess(args, 0, json.dumps({"result": {}}), "")
 
         with mock.patch.dict(os.environ, {
@@ -253,6 +288,14 @@ class DispatcherTest(unittest.TestCase):
 
         herdr_mock.assert_called_once()
         sleep.assert_not_called()
+
+    def test_agent_start_requires_structured_idle_readiness(self):
+        response = self.agent_response(
+            ("agent", "start", "agent"), interactive_ready=False
+        )
+        with mock.patch.object(dispatcher, "herdr", return_value=response):
+            with self.assertRaisesRegex(dispatcher.DispatchFailure, "authoritative idle readiness"):
+                dispatcher.start_agent_when_shell_ready("agent", "w-task:p1", "/checkout")
 
     def test_dispatch_failure_keeps_chat_tab_open(self):
         calls = []
@@ -313,6 +356,8 @@ class DispatcherTest(unittest.TestCase):
                 return subprocess.CompletedProcess(
                     args, 0, json.dumps({"result": {"pane": {"pane_id": "w-task:p2"}}}), ""
                 )
+            if args[:2] == ("agent", "start"):
+                return self.agent_response(args)
             if args[:2] == ("agent", "prompt"):
                 raise dispatcher.DispatchFailure("exact prompt failure")
             return subprocess.CompletedProcess(args, 0, "", "")
@@ -329,6 +374,63 @@ class DispatcherTest(unittest.TestCase):
         self.assertFalse(any(call[:2] == ("tab", "list") for call in calls))
         self.assertFalse(any(call[:2] == ("workspace", "focus") for call in calls))
         self.assertFalse(any(call[:2] == ("tab", "close") for call in calls))
+
+    def test_prompt_delivery_timeout_submits_once_and_keeps_chat_open(self):
+        calls = []
+
+        def fake_herdr(*args, **_kwargs):
+            calls.append(args)
+            if args[:2] == ("worktree", "create"):
+                return self.created_response()
+            if args[:2] == ("pane", "split"):
+                return subprocess.CompletedProcess(args, 0, "", "")
+            if args[:2] == ("agent", "start"):
+                return self.agent_response(args)
+            if args[:2] == ("agent", "prompt"):
+                raise dispatcher.DispatchFailure("agent_prompt_stalled: no observed state change")
+            return subprocess.CompletedProcess(args, 0, "", "")
+
+        with mock.patch.dict(os.environ, {
+            "HERDR_DISPATCHER": "1",
+            "HERDR_DISPATCHER_PROJECT_ROOT": str(self.repo),
+            "HERDR_TAB_ID": "w-root:t-chat",
+            "HERDR_WORKSPACE_ID": "w-root",
+        }), mock.patch.object(dispatcher, "herdr", side_effect=fake_herdr):
+            with self.assertRaisesRegex(dispatcher.DispatchFailure, "agent_prompt_stalled"):
+                dispatcher.dispatch_task("delivery-timeout", "Implement this request")
+
+        prompts = [call for call in calls if call[:2] == ("agent", "prompt")]
+        self.assertEqual(len(prompts), 1)
+        self.assertEqual(prompts[0][-5:], (
+            "--wait", "--until", "working", "--timeout", str(dispatcher.PROMPT_DELIVERY_TIMEOUT_MS),
+        ))
+        self.assertFalse(any(call[:2] == ("tab", "list") for call in calls))
+        self.assertFalse(any(call[:2] == ("workspace", "focus") for call in calls))
+        self.assertFalse(any(call[:2] == ("tab", "close") for call in calls))
+
+    def test_prompt_exit_zero_without_session_confirmation_is_fatal(self):
+        response = self.agent_response(
+            ("agent", "prompt", "agent"), status="working", state_change_seq=11
+        )
+        with mock.patch.object(dispatcher, "herdr", return_value=response) as herdr_mock:
+            with self.assertRaisesRegex(dispatcher.DispatchFailure, "not confirmed"):
+                dispatcher.prompt_agent_and_confirm_delivery("agent", "request", 10)
+
+        herdr_mock.assert_called_once_with(
+            "agent", "prompt", "agent", "request",
+            "--wait", "--until", "working",
+            "--timeout", str(dispatcher.PROMPT_DELIVERY_TIMEOUT_MS),
+        )
+
+    def test_prompt_confirmation_requires_a_new_state_transition(self):
+        response = self.agent_response(
+            ("agent", "prompt", "agent"), status="working", state_change_seq=10, session=True
+        )
+        with mock.patch.object(dispatcher, "herdr", return_value=response) as herdr_mock:
+            with self.assertRaisesRegex(dispatcher.DispatchFailure, "not confirmed"):
+                dispatcher.prompt_agent_and_confirm_delivery("agent", "request", 10)
+
+        herdr_mock.assert_called_once()
 
 
 if __name__ == "__main__":

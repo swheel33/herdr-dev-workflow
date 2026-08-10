@@ -13,5 +13,5 @@ python3 "$HERDR_PLUGIN_ROOT/dispatcher.py" dispatch --slug "<slug>" --request "<
 
 - The command creates `wheels/<slug>` at `<repo>/.worktrees/<slug>`, prepares its workspace without changing focus, and starts and prompts its OpenCode agent. This Project Chat remains open and active.
 - Do not reproduce the Herdr or Git steps manually.
-- If dispatch fails, quote the exact error and do not retry blindly. This tab remains open.
-- Once the agent is prompted, dispatch succeeded. Continue the Project Chat normally without switching to the implementation workspace unless the user chooses to do so.
+- If dispatch fails before prompt delivery is confirmed, quote the exact error and do not retry blindly. This tab remains open.
+- Once Herdr confirms the prompt started an OpenCode session, dispatch succeeded.

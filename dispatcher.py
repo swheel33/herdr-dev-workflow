@@ -46,6 +46,8 @@ CHAT_TUI_DISABLED_KEYBINDS = (
     "agent_cycle",
     "agent_cycle_reverse",
 )
+AGENT_START_TIMEOUT_SECONDS = 30
+PROMPT_DELIVERY_TIMEOUT_MS = 30_000
 
 
 def run_command(command, *, check=True, input_text=None, cwd=None):
@@ -459,18 +461,34 @@ def agent_name(slug, pane_id):
     return f"oc-{prefix}-{pane}"[:32]
 
 
-def start_agent_when_shell_ready(name, pane_id, checkout, timeout=30):
+def start_agent_when_shell_ready(name, pane_id, checkout, timeout=AGENT_START_TIMEOUT_SECONDS):
     deadline = time.monotonic() + timeout
     while True:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise DispatchFailure(f"Timed out waiting for agent target pane {pane_id} to become an available shell")
         result = herdr(
             "agent", "start", name,
             "--kind", "opencode",
             "--pane", pane_id,
+            "--timeout", str(max(1, int(remaining * 1000))),
             "--", checkout,
             check=False,
         )
         if result.returncode == 0:
-            return
+            agent = json_field(result.stdout, "result", "agent")
+            if (
+                not isinstance(agent, dict)
+                or agent.get("name") != name
+                or agent.get("pane_id") != pane_id
+                or agent.get("agent") != "opencode"
+                or agent.get("agent_status") != "idle"
+                or agent.get("interactive_ready") is not True
+                or agent.get("launch_pending") is True
+                or type(agent.get("state_change_seq")) is not int
+            ):
+                raise DispatchFailure(f"Agent {name} started without authoritative idle readiness state")
+            return agent
         detail = result.stderr.strip() or result.stdout.strip() or "no error output"
         if "agent_pane_busy" not in detail:
             raise DispatchFailure(f"Could not start agent {name}: {detail}")
@@ -478,6 +496,33 @@ def start_agent_when_shell_ready(name, pane_id, checkout, timeout=30):
         if remaining <= 0:
             raise DispatchFailure(f"Timed out waiting for agent target pane {pane_id} to become an available shell: {detail}")
         time.sleep(min(0.05, remaining))
+
+
+def prompt_agent_and_confirm_delivery(name, request, initial_state_change_seq, timeout_ms=PROMPT_DELIVERY_TIMEOUT_MS):
+    result = herdr(
+        "agent", "prompt", name, request,
+        "--wait",
+        "--until", "working",
+        "--timeout", str(timeout_ms),
+    )
+    agent = json_field(result.stdout, "result", "agent")
+    session = agent.get("agent_session") if isinstance(agent, dict) else None
+    if (
+        not isinstance(agent, dict)
+        or agent.get("name") != name
+        or agent.get("agent") != "opencode"
+        or agent.get("agent_status") != "working"
+        or type(agent.get("state_change_seq")) is not int
+        or agent["state_change_seq"] <= initial_state_change_seq
+        or not isinstance(session, dict)
+        or session.get("source") != "herdr:opencode"
+        or session.get("agent") != "opencode"
+        or session.get("kind") != "id"
+        or not isinstance(session.get("value"), str)
+        or not session["value"]
+    ):
+        raise DispatchFailure(f"Prompt delivery to agent {name} was not confirmed by an OpenCode session transition")
+    return agent
 
 
 @contextlib.contextmanager
@@ -547,12 +592,17 @@ def dispatch_task_locked(root, slug, request):
         root_pane = json_field(created.stdout, "result", "root_pane", "pane_id")
         herdr("pane", "split", root_pane, "--direction", "down", "--ratio", "0.70", "--cwd", checkout, "--no-focus")
         name = agent_name(slug, root_pane)
-        start_agent_when_shell_ready(name, root_pane, checkout)
-        herdr("agent", "prompt", name, request)
+        started_agent = start_agent_when_shell_ready(name, root_pane, checkout)
+        delivered_agent = prompt_agent_and_confirm_delivery(name, request, started_agent["state_change_seq"])
     except (DispatchFailure, OSError) as error:
         log_event("dispatcher.dispatch_failed", project_root=root, slug=slug, error=str(error))
         raise
-    log_event("dispatcher.dispatch_succeeded", workspace_id=workspace_id, agent=name)
+    log_event(
+        "dispatcher.dispatch_succeeded",
+        workspace_id=workspace_id,
+        agent=name,
+        agent_session=delivered_agent["agent_session"]["value"],
+    )
     return 0
 
 
