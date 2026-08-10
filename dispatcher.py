@@ -1,6 +1,9 @@
 #!/usr/bin/env python3
 
 import argparse
+import contextlib
+import fcntl
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -8,16 +11,18 @@ import re
 import socket
 import subprocess
 import sys
+import time
+import uuid
 
-from lifecycle import canonical, known_roots, log_event
+from lifecycle import atomic_json, canonical, known_roots, log_event, state_dir
 
 
 class DispatchFailure(RuntimeError):
     pass
 
 
-def run_command(command, *, check=True, input_text=None):
-    log_event("dispatcher.command_started", command=command)
+def run_command(command, *, check=True, input_text=None, cwd=None):
+    log_event("dispatcher.command_started", command=command, cwd=cwd)
     try:
         result = subprocess.run(
             command,
@@ -25,6 +30,7 @@ def run_command(command, *, check=True, input_text=None):
             text=True,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
+            cwd=cwd,
         )
     except OSError as error:
         log_event("dispatcher.command_spawn_failed", command=command, error=str(error))
@@ -132,7 +138,88 @@ def dispatcher_instruction_path():
     return canonical(Path(__file__).parent / "instructions" / "dispatcher.md")
 
 
-def dispatcher_environment(root):
+def dispatcher_tracker_path():
+    return canonical(Path(__file__).parent / "opencode" / "dispatcher-tracker.js")
+
+
+def normal_tui_config():
+    configured = os.environ.get("OPENCODE_TUI_CONFIG")
+    if configured and Path(configured).is_file():
+        return canonical(configured)
+    xdg = os.environ.get("XDG_CONFIG_HOME")
+    candidate = Path(xdg) / "opencode" / "tui.json" if xdg else Path.home() / ".config" / "opencode" / "tui.json"
+    return canonical(candidate) if candidate.is_file() else None
+
+
+def discussion_sessions_dir():
+    return state_dir() / "discussion-sessions"
+
+
+def discussion_links_dir():
+    return state_dir() / "discussion-links"
+
+
+def discussion_link_path(session_id):
+    return discussion_links_dir() / f"{session_id}.json"
+
+
+def load_discussions():
+    records = {}
+    for directory in (discussion_sessions_dir(), discussion_links_dir()):
+        if not directory.exists():
+            continue
+        for path in sorted(directory.glob("*.json")):
+            try:
+                value = json.loads(path.read_text())
+            except (OSError, json.JSONDecodeError):
+                continue
+            session_id = value.get("session_id")
+            if session_id:
+                records.setdefault(session_id, {}).update(value)
+    return list(records.values())
+
+
+def save_discussion(session_id, **updates):
+    path = discussion_link_path(session_id)
+    lock_path = state_dir() / "locks" / f"discussion-write-{hashlib.sha256(session_id.encode()).hexdigest()[:24]}.lock"
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    with lock_path.open("a+") as handle:
+        fcntl.flock(handle, fcntl.LOCK_EX)
+        current = {}
+        if path.exists():
+            try:
+                current = json.loads(path.read_text())
+            except (OSError, json.JSONDecodeError):
+                pass
+        current.update({"session_id": session_id, "updated_at": int(time.time() * 1000), **updates})
+        atomic_json(path, current)
+    return current
+
+
+@contextlib.contextmanager
+def dispatch_session_lock(session_id):
+    identifier = hashlib.sha256(session_id.encode()).hexdigest()[:24]
+    path = state_dir() / "locks" / f"dispatcher-session-{identifier}.lock"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("a+") as handle:
+        fcntl.flock(handle, fcntl.LOCK_EX)
+        yield
+
+
+def active_session_id():
+    instance = os.environ.get("HERDR_DISPATCHER_INSTANCE_ID")
+    if instance:
+        path = state_dir() / "dispatcher-instances" / f"{instance}.json"
+        try:
+            session_id = json.loads(path.read_text()).get("session_id")
+            if session_id:
+                return session_id
+        except (OSError, json.JSONDecodeError):
+            pass
+    return os.environ.get("HERDR_DISPATCHER_SESSION_ID")
+
+
+def dispatcher_environment(root, session_id=None):
     environment = os.environ.copy()
     config_home = Path(os.environ.get("HERDR_PLUGIN_STATE_DIR", Path.home() / ".local/state/herdr-dev-workflow")) / "dispatcher-config"
     config_home.mkdir(parents=True, exist_ok=True)
@@ -141,17 +228,35 @@ def dispatcher_environment(root):
     environment.pop("OPENCODE_CONFIG_DIR", None)
     environment["HERDR_DISPATCHER"] = "1"
     environment["HERDR_DISPATCHER_PROJECT_ROOT"] = root
+    environment["HERDR_DISPATCHER_INSTANCE_ID"] = uuid.uuid4().hex
+    if session_id:
+        environment["HERDR_DISPATCHER_SESSION_ID"] = session_id
+    else:
+        environment.pop("HERDR_DISPATCHER_SESSION_ID", None)
+    tui_config = normal_tui_config()
+    if tui_config:
+        environment["OPENCODE_TUI_CONFIG"] = tui_config
     environment["OPENCODE_CONFIG_CONTENT"] = json.dumps(
-        {"instructions": [dispatcher_instruction_path()]},
+        {
+            "instructions": [dispatcher_instruction_path()],
+            "plugin": [f"file://{dispatcher_tracker_path()}"],
+        },
         separators=(",", ":"),
     )
     return environment
 
 
-def launch_fresh_session(root, exec_fn=os.execvpe):
+def launch_session(root, session_id=None, exec_fn=os.execvpe):
     root = canonical(root)
-    log_event("dispatcher.session_launching", project_root=root, fresh=True)
-    exec_fn("opencode", ["opencode", root], dispatcher_environment(root))
+    arguments = ["opencode", root]
+    if session_id:
+        arguments.extend(("--session", session_id))
+    log_event("dispatcher.session_launching", project_root=root, fresh=not bool(session_id), session_id=session_id)
+    exec_fn("opencode", arguments, dispatcher_environment(root, session_id))
+
+
+def launch_fresh_session(root, exec_fn=os.execvpe):
+    launch_session(root, exec_fn=exec_fn)
 
 
 def chat_current():
@@ -168,6 +273,52 @@ def chat_picker():
     root = pick_project()
     if root:
         launch_fresh_session(root)
+    return 0
+
+
+def opencode_sessions(root):
+    result = run_command(["opencode", "session", "list", "--format", "json"], cwd=root)
+    try:
+        return json.loads(result.stdout)
+    except json.JSONDecodeError as error:
+        raise DispatchFailure(f"Invalid OpenCode session list JSON: {error}") from error
+
+
+def pick_discussion(root):
+    root = canonical(root)
+    tracked = {item.get("session_id"): item for item in load_discussions() if item.get("project_root") == root}
+    sessions = [item for item in opencode_sessions(root) if item.get("id") in tracked]
+    if not sessions:
+        raise DispatchFailure(f"No previous dispatcher chats found for {root}")
+    sessions.sort(key=lambda item: item.get("updated", 0), reverse=True)
+    rows = []
+    for session in sessions:
+        link = tracked[session["id"]].get("active_task") or {}
+        status = f" [{link.get('branch')}]" if link.get("branch") else ""
+        rows.append(f"{session.get('title') or 'Untitled'}{status}\t{session['id']}\n")
+    result = run_command(
+        ["fzf", "--prompt", "chat> ", "--height", "100%", "--reverse", "--with-nth", "1"],
+        check=False,
+        input_text="".join(rows),
+    )
+    if result.returncode in (1, 130):
+        return None
+    if result.returncode:
+        raise DispatchFailure(result.stderr.strip() or "Chat picker failed")
+    selected = result.stdout.rstrip("\n").rsplit("\t", 1)
+    if len(selected) != 2 or selected[1] not in tracked:
+        raise DispatchFailure("Chat picker returned an invalid OpenCode session")
+    return selected[1]
+
+
+def chat_history():
+    root = current_project_root()
+    if root is None:
+        root = pick_project()
+    if root:
+        session_id = pick_discussion(root)
+        if session_id:
+            launch_session(root, session_id)
     return 0
 
 
@@ -231,6 +382,50 @@ def socket_request(method, params):
     return response.get("result", {})
 
 
+def active_linked_task(session_id):
+    if not session_id:
+        return None
+    try:
+        discussion = next(item for item in load_discussions() if item.get("session_id") == session_id)
+    except StopIteration:
+        return None
+    task = discussion.get("active_task")
+    if not task or not task.get("agent") or not task.get("workspace_id"):
+        return None
+    result = herdr("agent", "get", task["agent"], check=False)
+    if result.returncode:
+        return None
+    try:
+        agent = json.loads(result.stdout).get("result", {}).get("agent", {})
+    except json.JSONDecodeError:
+        return None
+    if agent.get("workspace_id") != task["workspace_id"] or agent.get("interactive_ready") is not True:
+        return None
+    checkout = task.get("checkout_path")
+    cwd = agent.get("foreground_cwd") or agent.get("cwd")
+    if checkout:
+        if not cwd:
+            return None
+        checkout_path = Path(canonical(checkout))
+        cwd_path = Path(canonical(cwd))
+        if cwd_path != checkout_path and checkout_path not in cwd_path.parents:
+            return None
+    return task
+
+
+def finish_dispatch(workspace_id, original_workspace_id):
+    herdr("workspace", "focus", workspace_id)
+    try:
+        socket_request("popup.close", {})
+    except DispatchFailure as close_error:
+        if original_workspace_id:
+            try:
+                herdr("workspace", "focus", original_workspace_id)
+            except DispatchFailure as restore_error:
+                raise DispatchFailure(f"{close_error}\nAlso failed to restore workspace focus: {restore_error}") from close_error
+        raise
+
+
 def dispatch_task(slug, request):
     if os.environ.get("HERDR_DISPATCHER") != "1":
         raise DispatchFailure("dispatch is only available inside a dispatcher popup")
@@ -239,9 +434,18 @@ def dispatch_task(slug, request):
     request = request.strip()
     if not request:
         raise DispatchFailure("Dispatch request must not be empty")
+    original_workspace_id = plugin_context().get("workspace_id")
+    session_id = active_session_id()
+    if not session_id:
+        raise DispatchFailure("Dispatcher session tracking is not ready; retry the request in this popup")
+    with dispatch_session_lock(session_id):
+        return dispatch_task_locked(root, slug, request, session_id, original_workspace_id)
+
+
+def dispatch_task_locked(root, slug, request, session_id, original_workspace_id):
     branch = f"wheels/{slug}"
     checkout = str(Path(root) / ".worktrees" / slug)
-    original_workspace_id = plugin_context().get("workspace_id")
+    save_discussion(session_id, project_root=root)
     log_event(
         "dispatcher.dispatch_started",
         project_root=root,
@@ -251,6 +455,43 @@ def dispatch_task(slug, request):
         request=request,
     )
     try:
+        linked = active_linked_task(session_id)
+        if linked:
+            delivered_at = linked.get("last_delivered_at", 0)
+            if linked.get("last_request") == request and int(time.time() * 1000) - delivered_at < 60_000:
+                raise DispatchFailure("This exact request was already delivered in the last minute; do not resend it")
+            if linked.get("last_delivery_status") == "ui_failed" and linked.get("last_request") == request:
+                raise DispatchFailure(
+                    "This exact follow-up was already delivered, but popup focus/closure failed; do not resend it"
+                )
+            herdr("agent", "prompt", linked["agent"], request)
+            save_discussion(
+                session_id,
+                project_root=root,
+                active_task={
+                    **linked,
+                    "last_prompted_at": int(time.time() * 1000),
+                    "last_request": request,
+                    "last_delivery_status": "delivered",
+                    "last_delivered_at": int(time.time() * 1000),
+                },
+            )
+            try:
+                finish_dispatch(linked["workspace_id"], original_workspace_id)
+            except DispatchFailure:
+                save_discussion(
+                    session_id,
+                    project_root=root,
+                    active_task={**linked, "last_request": request, "last_delivery_status": "ui_failed"},
+                )
+                raise
+            log_event(
+                "dispatcher.followup_routed",
+                session_id=session_id,
+                workspace_id=linked["workspace_id"],
+                agent=linked["agent"],
+            )
+            return 0
         git(root, "fetch", "origin", "--prune")
         if git(root, "show-ref", "--verify", "--quiet", f"refs/heads/{branch}", check=False).returncode == 0:
             raise DispatchFailure(f"Local branch already exists: {branch}")
@@ -281,15 +522,37 @@ def dispatch_task(slug, request):
         name = agent_name(slug, root_pane)
         herdr("agent", "start", name, "--kind", "opencode", "--pane", root_pane, "--", checkout)
         herdr("agent", "prompt", name, request)
-        herdr("workspace", "focus", workspace_id)
+        if session_id:
+            save_discussion(
+                session_id,
+                project_root=root,
+                active_task={
+                    "branch": branch,
+                    "checkout_path": checkout,
+                    "workspace_id": workspace_id,
+                    "agent": name,
+                    "dispatched_at": int(time.time() * 1000),
+                    "last_request": request,
+                    "last_delivery_status": "delivered",
+                    "last_delivered_at": int(time.time() * 1000),
+                },
+            )
         try:
-            socket_request("popup.close", {})
-        except DispatchFailure as close_error:
-            if original_workspace_id:
-                try:
-                    herdr("workspace", "focus", original_workspace_id)
-                except DispatchFailure as restore_error:
-                    raise DispatchFailure(f"{close_error}\nAlso failed to restore workspace focus: {restore_error}") from close_error
+            finish_dispatch(workspace_id, original_workspace_id)
+        except DispatchFailure:
+            save_discussion(
+                session_id,
+                project_root=root,
+                active_task={
+                    "branch": branch,
+                    "checkout_path": checkout,
+                    "workspace_id": workspace_id,
+                    "agent": name,
+                    "dispatched_at": int(time.time() * 1000),
+                    "last_request": request,
+                    "last_delivery_status": "ui_failed",
+                },
+            )
             raise
     except (DispatchFailure, OSError) as error:
         log_event("dispatcher.dispatch_failed", project_root=root, slug=slug, error=str(error))
@@ -303,6 +566,7 @@ def parse_args():
     commands = parser.add_subparsers(dest="command", required=True)
     commands.add_parser("chat-current")
     commands.add_parser("chat-picker")
+    commands.add_parser("chat-history")
     dispatch = commands.add_parser("dispatch")
     dispatch.add_argument("--slug", required=True)
     dispatch.add_argument("--request", required=True)
@@ -316,6 +580,8 @@ def main():
             return chat_current()
         if args.command == "chat-picker":
             return chat_picker()
+        if args.command == "chat-history":
+            return chat_history()
         if args.command == "dispatch":
             return dispatch_task(args.slug, args.request)
     except DispatchFailure as error:

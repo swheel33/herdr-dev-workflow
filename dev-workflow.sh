@@ -12,7 +12,7 @@ usage() {
 
 doctor() {
   local command integration_line herdr_version plugin_root missing=0
-  local required=(git python3 opencode pnpm zsh nvim lazygit fzf)
+  local required=(git gh python3 opencode pnpm zsh nvim lazygit fzf)
 
   printf 'Wheels Dev Workflow dependency check\n\n'
   herdr_version="$("$HERDR_BIN" --version 2>/dev/null || printf 'version unknown')"
@@ -50,11 +50,25 @@ raise SystemExit(0 if match and tuple(map(int, match.groups())) >= (0, 8, 0) els
       missing=1
     fi
   done
+  if command -v gh >/dev/null 2>&1; then
+    if gh auth status >/dev/null 2>&1; then
+      printf '  ok       GitHub CLI authentication\n'
+    else
+      printf '  missing  GitHub CLI authentication; run `gh auth login`\n'
+      missing=1
+    fi
+  fi
   plugin_root="${HERDR_PLUGIN_ROOT:-$(cd -P "$(dirname "${BASH_SOURCE[0]}")" && pwd)}"
   if [[ -r "$plugin_root/instructions/dispatcher.md" ]]; then
     printf '  ok       dispatcher instruction %s\n' "$plugin_root/instructions/dispatcher.md"
   else
     printf '  missing  dispatcher instruction %s\n' "$plugin_root/instructions/dispatcher.md"
+    missing=1
+  fi
+  if [[ -r "$plugin_root/opencode/dispatcher-tracker.js" ]]; then
+    printf '  ok       dispatcher tracker %s\n' "$plugin_root/opencode/dispatcher-tracker.js"
+  else
+    printf '  missing  dispatcher tracker %s\n' "$plugin_root/opencode/dispatcher-tracker.js"
     missing=1
   fi
 
@@ -327,7 +341,6 @@ setup_layout_for_workspace() {
   else
     "$HERDR_BIN" pane run "$shell_pane" "cd -- $directory_quoted && clear" >/dev/null
   fi
-  python3 "$(dirname "${BASH_SOURCE[0]}")/lifecycle.py" metadata
   if [[ "$focus_workspace" == "1" ]]; then
     "$HERDR_BIN" workspace focus "$workspace_id" >/dev/null
   fi

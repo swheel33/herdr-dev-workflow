@@ -318,6 +318,109 @@ class LifecycleIntegrationTest(unittest.TestCase):
             thread.join()
         self.assertEqual(set(lifecycle.known_roots()), {lifecycle.canonical(self.repo), lifecycle.canonical(second)})
 
+    def test_primary_repository_resolves_linked_checkout(self):
+        checkout = self.add_worktree("wheels/adopt", push=False)
+        self.assertEqual(lifecycle.primary_repository(checkout), lifecycle.canonical(self.repo))
+
+    def test_adopt_current_workspaces_persists_roots_and_counts_worktrees(self):
+        checkout = self.add_worktree("wheels/adopt", push=False)
+        result = lifecycle.adopt_current_workspaces(
+            [{"worktree": {"repo_root": str(self.repo)}}],
+            [{"cwd": str(checkout)}],
+            announce=False,
+        )
+        self.assertEqual(result["repositories"], 1)
+        self.assertEqual(result["linked_worktrees"], 1)
+        self.assertEqual(lifecycle.known_roots(), [lifecycle.canonical(self.repo)])
+
+    def test_merged_pull_request_requires_matching_head_commit(self):
+        response = subprocess.CompletedProcess(
+            ["gh"],
+            0,
+            json.dumps([
+                {
+                    "number": 1,
+                    "url": "https://github.com/example/repo/pull/1",
+                    "mergedAt": "2026-08-10T00:00:00Z",
+                    "headRefName": "wheels/merged",
+                    "headRefOid": "old-head",
+                    "isCrossRepository": False,
+                },
+                {
+                    "number": 2,
+                    "url": "https://github.com/example/repo/pull/2",
+                    "mergedAt": "2026-08-10T01:00:00Z",
+                    "headRefName": "wheels/merged",
+                    "headRefOid": "current-head",
+                    "isCrossRepository": False,
+                },
+            ]),
+            "",
+        )
+        with mock.patch.object(lifecycle, "run", return_value=response) as run_mock:
+            pull_request = lifecycle.merged_pull_request(self.repo, "wheels/merged", "current-head")
+        self.assertEqual(pull_request["number"], 2)
+        self.assertEqual(run_mock.call_args.kwargs["cwd"], self.repo)
+
+    def test_hourly_scan_closes_clean_idle_merged_workspace(self):
+        checkout = self.add_worktree("wheels/merged", push=False)
+        lifecycle.remember_root(self.repo)
+        workspace = {
+            "workspace_id": "w-merged",
+            "agent_status": "idle",
+            "worktree": {
+                "repo_root": str(self.repo),
+                "checkout_path": str(checkout),
+                "is_linked_worktree": True,
+            },
+        }
+        pull_request = {
+            "number": 7,
+            "url": "https://github.com/example/repo/pull/7",
+        }
+        with mock.patch.object(lifecycle, "live_workspaces", return_value=[workspace]), \
+             mock.patch.object(lifecycle, "live_panes", return_value=[]), \
+             mock.patch.object(lifecycle, "running_session_count", return_value=1), \
+             mock.patch.object(lifecycle, "merged_pull_request", return_value=pull_request), \
+             mock.patch.object(lifecycle, "herdr") as herdr_mock:
+            result = lifecycle.scan_merged_pull_requests()
+        self.assertEqual(result, {"checked": 1, "pruned": 1, "blocked": 0, "failures": 0})
+        herdr_mock.assert_called_once_with("workspace", "close", "w-merged")
+
+    def test_hourly_scan_notifies_once_and_never_prunes_unsafe_merge(self):
+        checkout = self.add_worktree("wheels/unsafe", dirty=True, push=False)
+        lifecycle.remember_root(self.repo)
+        workspace = {
+            "workspace_id": "w-unsafe",
+            "agent_status": "working",
+            "focused": True,
+            "worktree": {
+                "repo_root": str(self.repo),
+                "checkout_path": str(checkout),
+                "is_linked_worktree": True,
+            },
+        }
+        pull_request = {
+            "number": 8,
+            "url": "https://github.com/example/repo/pull/8",
+        }
+        lifecycle.notify.reset_mock()
+        with mock.patch.object(lifecycle, "live_workspaces", return_value=[workspace]), \
+             mock.patch.object(lifecycle, "live_panes", return_value=[]), \
+             mock.patch.object(lifecycle, "running_session_count", return_value=2), \
+             mock.patch.object(lifecycle, "merged_pull_request", return_value=pull_request), \
+             mock.patch.object(lifecycle, "herdr") as herdr_mock:
+            first = lifecycle.scan_merged_pull_requests()
+            second = lifecycle.scan_merged_pull_requests()
+        self.assertEqual(first["blocked"], 1)
+        self.assertEqual(second["blocked"], 1)
+        lifecycle.notify.assert_called_once()
+        herdr_mock.assert_not_called()
+        block = next(iter(lifecycle.load_auto_prune_blocks().values()))
+        self.assertIn("multiple Herdr sessions are running", block["reasons"])
+        self.assertIn("workspace is focused", block["reasons"])
+        self.assertIn("checkout has uncommitted changes", block["reasons"])
+
     def test_event_path_mismatch_is_rejected(self):
         checkout = self.add_worktree("feature/mismatch")
         envelope = {
@@ -342,10 +445,9 @@ class LifecycleIntegrationTest(unittest.TestCase):
         calls = []
         with mock.patch.object(lifecycle, "retry_pending", side_effect=lambda: calls.append("retry") or True), \
              mock.patch.object(lifecycle, "reconcile", side_effect=lambda: calls.append("reconcile")), \
-             mock.patch.object(lifecycle, "apply_agent_view", side_effect=lambda: calls.append("view")), \
              mock.patch.object(lifecycle, "load_jobs", return_value=[]):
             self.assertEqual(lifecycle.startup(), 0)
-        self.assertEqual(calls, ["retry", "reconcile", "view"])
+        self.assertEqual(calls, ["retry", "reconcile"])
 
     def test_reconciliation_does_not_reopen_pending_checkout(self):
         checkout = self.add_worktree("feature/pending", push=False)
@@ -364,8 +466,7 @@ class LifecycleIntegrationTest(unittest.TestCase):
             output = worktree_output if args[:2] == ("worktree", "list") else workspace_output
             return subprocess.CompletedProcess(args, 0, output, "")
 
-        with mock.patch.object(lifecycle, "herdr", side_effect=fake_herdr) as herdr_mock, \
-             mock.patch.object(lifecycle, "report_agent_metadata"):
+        with mock.patch.object(lifecycle, "herdr", side_effect=fake_herdr) as herdr_mock:
             lifecycle.reconcile()
         self.assertFalse(any(call.args[:2] == ("worktree", "open") for call in herdr_mock.call_args_list))
         self.assertEqual(job["phase"], "validate")
