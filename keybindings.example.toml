@@ -35,6 +35,12 @@ command = "wheels.dev-workflow.chat-picker"
 description = "chat for another project"
 
 [[keys.command]]
+key = "prefix+shift+h"
+type = "plugin_action"
+command = "wheels.dev-workflow.chat-history"
+description = "previous project chats"
+
+[[keys.command]]
 key = "prefix+p"
 type = "plugin_action"
 command = "wheels.dev-workflow.retry-cleanup"
@@ -63,10 +69,7 @@ agent_panel_sort = "spaces"
 
 [ui.sidebar.agents]
 row_gap = 0
-rows = [
-  ["state_icon", { token = "workspace", bold = true }],
-  ["$repo", "$branch"],
-]
+rows = []
 
 [ui.sidebar.spaces]
 row_gap = 0

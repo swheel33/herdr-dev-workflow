@@ -77,16 +77,17 @@ def atomic_json(path, value):
     os.replace(temporary, path)
 
 
-def run(command, check=True):
-    log_event("command.started", command=command)
+def run(command, check=True, cwd=None):
+    log_event("command.started", command=command, cwd=cwd)
     try:
-        result = subprocess.run(command, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        result = subprocess.run(command, cwd=cwd, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
     except OSError as error:
         log_event("command.spawn_failed", command=command, error=str(error))
         raise
     log_event(
         "command.finished",
         command=command,
+        cwd=cwd,
         exit_code=result.returncode,
         stdout=result.stdout,
         stderr=result.stderr,
@@ -298,6 +299,52 @@ def known_roots():
         return []
 
 
+def primary_repository(path):
+    common = git(path, "rev-parse", "--path-format=absolute", "--git-common-dir", check=False)
+    if common.returncode:
+        return None
+    common_path = Path(canonical(common.stdout.strip()))
+    if common_path.name == ".git":
+        return canonical(common_path.parent)
+    bare = git(path, "rev-parse", "--is-bare-repository", check=False)
+    return canonical(common_path) if bare.returncode == 0 and bare.stdout.strip() == "true" else None
+
+
+def live_panes():
+    output = herdr("pane", "list").stdout
+    return response_result(output).get("panes", [])
+
+
+def adopt_current_workspaces(workspaces=None, panes=None, *, announce=True):
+    workspaces = live_workspaces() if workspaces is None else workspaces
+    panes = live_panes() if panes is None else panes
+    roots = set(known_roots())
+    for workspace in workspaces:
+        provenance = workspace.get("worktree") or {}
+        if provenance.get("repo_root"):
+            roots.add(canonical(provenance["repo_root"]))
+    for pane in panes:
+        cwd = pane.get("foreground_cwd") or pane.get("cwd")
+        if cwd:
+            root = primary_repository(cwd)
+            if root:
+                roots.add(root)
+    for root in roots:
+        remember_root(root)
+    linked = 0
+    for root in roots:
+        try:
+            primary = primary_record(root)
+            primary_path = canonical(primary["path"]) if primary else None
+            linked += sum(canonical(item["path"]) != primary_path for item in worktrees(root))
+        except (GitFailure, OSError):
+            continue
+    log_event("adoption.completed", repositories=len(roots), linked_worktrees=linked, roots=sorted(roots))
+    if announce:
+        notify("Workspaces adopted", f"Tracking {len(roots)} repositories and {linked} linked worktrees.")
+    return {"repositories": len(roots), "linked_worktrees": linked, "roots": sorted(roots)}
+
+
 def create_job(repo, checkout, branch, source, label="", event_key=""):
     repo = canonical(repo)
     checkout = canonical(checkout)
@@ -442,6 +489,15 @@ def close_reopened_workspace(job):
                 herdr("workspace", "close", workspace_id)
     except (RuntimeError, OSError, json.JSONDecodeError) as error:
         raise GitFailure([], message=f"Could not close a workspace reopened during cleanup: {error}") from error
+
+
+def running_session_count():
+    result = herdr("session", "list", "--json")
+    try:
+        sessions = json.loads(result.stdout).get("sessions", [])
+    except json.JSONDecodeError as error:
+        raise GitFailure([], message=f"Invalid Herdr session list JSON: {error}") from error
+    return sum(bool(session.get("running")) for session in sessions)
 
 
 def attempt_locked(job):
@@ -627,6 +683,199 @@ def retry_pending():
     return failures == 0
 
 
+def auto_prune_blocks_path():
+    return state_dir() / "auto-prune-blocks.json"
+
+
+def load_auto_prune_blocks():
+    path = auto_prune_blocks_path()
+    if not path.exists():
+        return {}
+    try:
+        return json.loads(path.read_text()).get("blocks", {})
+    except (OSError, json.JSONDecodeError):
+        return {}
+
+
+def auto_prune_key(repo, checkout, branch, head_oid):
+    value = "\0".join((canonical(repo), canonical(checkout), branch, head_oid))
+    return hashlib.sha256(value.encode()).hexdigest()[:24]
+
+
+def block_auto_prune(repo, checkout, branch, head_oid, pull_request, reasons):
+    path = auto_prune_blocks_path()
+    lock_path = state_dir() / "locks" / "auto-prune-blocks.lock"
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    key = auto_prune_key(repo, checkout, branch, head_oid)
+    with lock_path.open("a+") as handle:
+        fcntl.flock(handle, fcntl.LOCK_EX)
+        blocks = load_auto_prune_blocks()
+        if key in blocks:
+            return False
+        blocks[key] = {
+            "repo_root": canonical(repo),
+            "checkout_path": canonical(checkout),
+            "branch": branch,
+            "head_oid": head_oid,
+            "pull_request": pull_request,
+            "reasons": reasons,
+            "created_at": int(time.time()),
+        }
+        atomic_json(path, {"blocks": blocks})
+    return True
+
+
+def merged_pull_request(repo, branch, head_oid):
+    command = [
+        "gh", "pr", "list",
+        "--state", "merged",
+        "--head", branch,
+        "--limit", "20",
+        "--json", "number,url,mergedAt,headRefName,headRefOid,isCrossRepository",
+    ]
+    result = run(command, check=False, cwd=repo)
+    if result.returncode:
+        raise GitFailure(command, result, "Could not query merged pull requests")
+    try:
+        pull_requests = json.loads(result.stdout)
+    except json.JSONDecodeError as error:
+        raise GitFailure(command, result, f"Invalid GitHub pull request JSON: {error}") from error
+    return next(
+        (
+            pull_request for pull_request in pull_requests
+            if pull_request.get("mergedAt")
+            and pull_request.get("headRefName") == branch
+            and pull_request.get("headRefOid") == head_oid
+            and pull_request.get("isCrossRepository") is False
+        ),
+        None,
+    )
+
+
+def checkout_is_dirty(checkout):
+    result = git(checkout, "status", "--porcelain", "--untracked-files=all")
+    return bool(result.stdout.strip())
+
+
+def scan_merged_pull_requests():
+    workspaces = live_workspaces()
+    adoption = adopt_current_workspaces(workspaces, live_panes(), announce=False)
+    workspace_by_checkout = {
+        canonical(provenance["checkout_path"]): workspace
+        for workspace in workspaces
+        for provenance in [workspace.get("worktree") or {}]
+        if provenance.get("is_linked_worktree") and provenance.get("checkout_path")
+    }
+    blocks = load_auto_prune_blocks()
+    sessions = running_session_count()
+    checked = pruned = blocked = failures = 0
+    for repo in adoption["roots"]:
+        try:
+            primary = primary_record(repo)
+            primary_path = canonical(primary["path"]) if primary else None
+            records = worktrees(repo)
+        except (GitFailure, OSError) as error:
+            failures += 1
+            log_event("auto_prune.repository_failed", repo_root=repo, error=str(error))
+            continue
+        for record in records:
+            checkout = canonical(record["path"])
+            branch = record.get("branch", "")
+            if checkout == primary_path or not branch.startswith("wheels/"):
+                continue
+            checked += 1
+            head = git(repo, "rev-parse", f"refs/heads/{branch}", check=False)
+            if head.returncode:
+                continue
+            head_oid = head.stdout.strip()
+            key = auto_prune_key(repo, checkout, branch, head_oid)
+            if key in blocks:
+                blocked += 1
+                continue
+            try:
+                pull_request = merged_pull_request(repo, branch, head_oid)
+            except (GitFailure, OSError) as error:
+                failures += 1
+                log_event("auto_prune.github_failed", repo_root=repo, branch=branch, error=str(error))
+                continue
+            if not pull_request:
+                continue
+            workspace = workspace_by_checkout.get(checkout)
+            reasons = []
+            if sessions != 1:
+                reasons.append("multiple Herdr sessions are running")
+            if not workspace:
+                reasons.append("worktree is not open in this Herdr session")
+            elif workspace.get("focused"):
+                reasons.append("workspace is focused")
+            elif workspace.get("agent_status") not in {"idle", "done"}:
+                reasons.append(f"agent is {workspace.get('agent_status', 'unknown')}")
+            try:
+                if checkout_is_dirty(checkout):
+                    reasons.append("checkout has uncommitted changes")
+            except (GitFailure, OSError) as error:
+                reasons.append(f"checkout status failed: {error}")
+            if reasons:
+                blocked += 1
+                if block_auto_prune(repo, checkout, branch, head_oid, pull_request, reasons):
+                    notify(
+                        "Merged worktree needs manual cleanup",
+                        f"{branch}: {', '.join(reasons)}. Close it manually when ready.",
+                    )
+                log_event(
+                    "auto_prune.blocked",
+                    repo_root=repo,
+                    checkout_path=checkout,
+                    branch=branch,
+                    pull_request=pull_request,
+                    reasons=reasons,
+                )
+                continue
+            try:
+                herdr("workspace", "close", workspace["workspace_id"])
+            except (RuntimeError, OSError) as error:
+                failures += 1
+                log_event("auto_prune.workspace_close_failed", workspace_id=workspace["workspace_id"], error=str(error))
+                continue
+            pruned += 1
+            log_event(
+                "auto_prune.started",
+                repo_root=repo,
+                checkout_path=checkout,
+                branch=branch,
+                pull_request=pull_request,
+                via_workspace=True,
+            )
+    result = {"checked": checked, "pruned": pruned, "blocked": blocked, "failures": failures}
+    log_event("auto_prune.scan_finished", **result)
+    return result
+
+
+def watch_merged_pull_requests():
+    lock_path = state_dir() / "locks" / "auto-prune-watcher.lock"
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    with lock_path.open("a+") as handle:
+        log_event("auto_prune.watcher_waiting")
+        fcntl.flock(handle, fcntl.LOCK_EX)
+        try:
+            interval = max(60, int(os.environ.get("HERDR_AUTO_PRUNE_INTERVAL_SECONDS", "3600")))
+        except ValueError:
+            interval = 3600
+        log_event("auto_prune.watcher_started", interval_seconds=interval)
+        while True:
+            try:
+                scan_merged_pull_requests()
+            except (RuntimeError, GitFailure, OSError, json.JSONDecodeError) as error:
+                log_event("auto_prune.scan_failed", error=str(error))
+            deadline = time.monotonic() + interval
+            while time.monotonic() < deadline:
+                socket_path = os.environ.get("HERDR_SOCKET_PATH")
+                if socket_path and not Path(socket_path).exists():
+                    log_event("auto_prune.watcher_stopped", reason="Herdr socket disappeared")
+                    return 0
+                time.sleep(min(30, max(0, deadline - time.monotonic())))
+
+
 def show_failures():
     pending = load_jobs()
     print(f"Lifecycle log: {state_dir() / 'lifecycle.jsonl'}")
@@ -698,67 +947,17 @@ def socket_request(method, params):
     return response.get("result", {})
 
 
-def apply_agent_view():
-    socket_request(
-        "agent.view.set",
-        {
-            "source": SOURCE,
-            "label": "workspaces",
-            "sort": [
-                {"field": "workspace_order", "order": "asc"},
-                {"field": "tab_order", "order": "asc"},
-                {"field": "pane_order", "order": "asc"},
-            ],
-        },
-    )
-
-
 def live_workspaces():
     output = herdr("workspace", "list").stdout
     return response_result(output).get("workspaces", [])
 
 
-def report_agent_metadata(workspaces):
-    by_id = {workspace["workspace_id"]: workspace for workspace in workspaces}
-    agents = response_result(herdr("agent", "list").stdout).get("agents", [])
-    for agent in agents:
-        workspace = by_id.get(agent.get("workspace_id"), {})
-        provenance = workspace.get("worktree") or {}
-        repo = provenance.get("repo_name") or workspace.get("label", "")
-        branch = ""
-        checkout = provenance.get("checkout_path")
-        repo_root = provenance.get("repo_root")
-        if checkout and repo_root:
-            record = record_for_path(repo_root, checkout)
-            branch = (record or {}).get("branch", "")
-        elif agent.get("foreground_cwd") or agent.get("cwd"):
-            cwd = agent.get("foreground_cwd") or agent["cwd"]
-            discovered_root = git(cwd, "rev-parse", "--show-toplevel", check=False)
-            discovered_branch = git(cwd, "symbolic-ref", "--quiet", "--short", "HEAD", check=False)
-            if discovered_root.returncode == 0:
-                repo = Path(discovered_root.stdout.strip()).name
-            if discovered_branch.returncode == 0:
-                branch = discovered_branch.stdout.strip()
-        arguments = [
-            "pane", "report-metadata", agent["pane_id"], "--source", SOURCE,
-            "--token", f"repo={repo}",
-        ]
-        if branch:
-            arguments.extend(("--token", f"branch={branch}"))
-        else:
-            arguments.extend(("--clear-token", "branch"))
-        herdr(*arguments)
-
-
 def reconcile():
     log_event("reconciliation.started")
     workspaces = live_workspaces()
-    for workspace in workspaces:
-        provenance = workspace.get("worktree") or {}
-        if provenance.get("repo_root"):
-            remember_root(provenance["repo_root"])
+    adoption = adopt_current_workspaces(workspaces, live_panes(), announce=False)
     errors = []
-    for repo in known_roots():
+    for repo in adoption["roots"]:
         if not Path(repo).is_dir():
             continue
         try:
@@ -804,10 +1003,6 @@ def reconcile():
         except (RuntimeError, GitFailure, OSError, json.JSONDecodeError) as error:
             log_event("reconciliation.repository_failed", repo_root=repo, error=str(error))
             errors.append(f"{repo}: {error}")
-    try:
-        report_agent_metadata(live_workspaces())
-    except (RuntimeError, GitFailure, OSError, json.JSONDecodeError) as error:
-        errors.append(f"agent metadata: {error}")
     if errors:
         log_event("reconciliation.failed", errors=errors)
         raise RuntimeError("; ".join(errors))
@@ -819,7 +1014,6 @@ def startup():
     retry_pending()
     try:
         reconcile()
-        apply_agent_view()
     except (RuntimeError, GitFailure, OSError, json.JSONDecodeError) as error:
         log_event("startup.failed", error=str(error))
         notify("Workflow startup reconciliation failed", str(error))
@@ -838,10 +1032,11 @@ def parse_args():
     subparsers.add_parser("event")
     subparsers.add_parser("startup")
     subparsers.add_parser("retry")
+    subparsers.add_parser("adopt")
+    subparsers.add_parser("watch-merged")
     subparsers.add_parser("show")
     subparsers.add_parser("show-pane")
     subparsers.add_parser("show-log-pane")
-    subparsers.add_parser("metadata")
     enqueue_parser = subparsers.add_parser("enqueue")
     enqueue_parser.add_argument("repo")
     enqueue_parser.add_argument("checkout")
@@ -858,15 +1053,18 @@ def main():
         return startup()
     if args.command == "retry":
         return 0 if retry_pending() else 1
+    if args.command == "adopt":
+        result = adopt_current_workspaces()
+        print(json.dumps(result, sort_keys=True))
+        return 0
+    if args.command == "watch-merged":
+        return watch_merged_pull_requests()
     if args.command == "show":
         return show_failures()
     if args.command == "show-pane":
         return show_failures_pane()
     if args.command == "show-log-pane":
         return show_log_pane()
-    if args.command == "metadata":
-        report_agent_metadata(live_workspaces())
-        return 0
     if args.command == "enqueue":
         return 0 if enqueue(args.repo, args.checkout, args.branch, label=args.label) else 1
     return 2

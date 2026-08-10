@@ -7,6 +7,7 @@ Git worktrees, cleanup, and development tools.
 
 - stable Herdr 0.8.0 or newer
 - `git`
+- authenticated GitHub CLI (`gh auth login`)
 - `python3`
 - `opencode`
 - `fzf`
@@ -52,12 +53,18 @@ delegation. Every invocation starts a new conversation.
 - Linked worktree paths resolve back to their primary repository.
 - If the focused pane is not in a repository, the project picker opens.
 - **Chat for another project** always opens the picker.
+- **Previous project chats** lists dispatcher discussions tracked by OpenCode and resumes the selected session.
 - The picker combines known cleanup repositories with Git repositories under
   `~/Projects`, excludes `.worktrees` checkouts, and deduplicates primary roots.
 
 Discussion, questions, reviews, exploration, and planning stay in the popup.
 Requests requiring code changes are dispatched to a new `wheels/<slug>` branch
 at `<repo>/.worktrees/<slug>`.
+
+OpenCode remains the source of truth for discussion transcripts. The plugin
+stores only project and dispatched-task linkage. A resumed discussion routes
+implementation follow-ups to its linked agent while that agent is still live;
+after the workspace closes, its next code task creates a new worktree.
 
 A dispatched task receives this layout:
 
@@ -91,11 +98,23 @@ Each hook, startup, or manual retry makes one attempt. Already-missing resources
 count as completed phases, and successful jobs are removed. Do not recreate a
 pending job's branch or checkout path before retrying it.
 
+A singleton plugin process also checks GitHub immediately at startup and every
+hour. A `wheels/*` worktree is automatically closed and cleaned only when a
+merged pull request matches both its branch and exact head commit. Closed but
+unmerged pull requests and reused branch names are ignored. If multiple Herdr
+sessions are running, the workspace is focused, the agent is not idle/done, or
+the checkout is dirty, the plugin notifies once and leaves that worktree for
+manual cleanup. Set
+`HERDR_AUTO_PRUNE_INTERVAL_SECONDS` to change the interval; values below 60
+seconds are clamped.
+
 Available actions:
 
 - **Retry pending worktree cleanup**
 - **Show pending worktree cleanup failures**
 - **Show worktree cleanup log**
+- **Previous project chats**
+- **Adopt current workspaces**
 
 ## Startup Reconciliation
 
@@ -106,20 +125,33 @@ At startup the plugin:
 3. Leaves unresolved cleanup paths closed.
 4. Opens linked worktrees that do not already have a workspace.
 5. Applies the standard 70/30 OpenCode and shell layout to newly opened workspaces.
-6. Restores the stable Agent sidebar ordering and repository metadata.
+6. Starts the hourly merged-PR cleanup poller.
 
 Cleanup and reconciliation are serialized per repository.
 
+**Adopt current workspaces** resolves every live workspace and pane back to its
+primary Git repository and persists those roots in plugin state. Git worktree
+metadata remains the source of truth; the plugin does not copy checkouts into
+its state.
+
+To rebuild a named Herdr session from existing worktrees, adopt first, then stop
+and delete the session rather than closing its workspaces individually:
+
+```bash
+herdr plugin action invoke wheels.dev-workflow.adopt-workspaces
+herdr session stop <name>
+herdr session delete <name>
+herdr --session <name>
+```
+
+Closing the workspaces individually invokes permanent cleanup. A rebuilt
+session recreates fresh OpenCode and shell processes; it does not restore live
+terminal processes or scrollback.
+
 ## Sidebar
 
-The example configuration installs an unfiltered Agent view ordered by
-workspace, tab, and pane. Agent rows display:
-
-1. semantic status and the bold workspace/worktree label
-2. repository and branch
-
-Terminal titles are not used as workspace titles. Agent and Space rows use
-Herdr's supported packed `row_gap = 0` layout.
+The example keeps Herdr's default Space rows and leaves Agent rows empty. The
+plugin does not install a transient Agent view or report sidebar-only metadata.
 
 ## Logs
 
@@ -142,6 +174,7 @@ Suggested bindings from [`keybindings.example.toml`](keybindings.example.toml):
 
 - `prefix+space`: chat for current project
 - `prefix+shift+space`: chat for another project
+- `prefix+shift+h`: previous project chats
 - `prefix+l`: set up the standard layout here
 - `prefix+n`: create a personal worktree
 - `prefix+o`: open a worktree or `origin/*` branch
