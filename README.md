@@ -57,7 +57,7 @@ Available actions:
   A linked worktree resolves back to its primary repository. If the pane is not
   inside Git, the project picker opens.
 - **Chat for another project** opens the project picker.
-- **Chats** opens searchable history across known projects.
+- **Chats** opens searchable history for the focused pane's primary project.
 
 Project discovery combines repositories previously adopted by the plugin with
 Git repositories under `HERDR_PROJECTS_ROOT`, or `~/Projects` by default.
@@ -112,10 +112,11 @@ primary repository root. This remains usable after the implementation worktree
 and branch have been deleted, which is useful when a merged change needs a
 follow-up.
 
-The history popup displays `Loading chat history...` while OpenCode sessions are
-enumerated, then opens `fzf` with project, title, and update time. Native root
-sessions that have never dispatched remain independent rows. Sessions created
-before thread tracking was introduced cannot be paired retroactively.
+The history popup displays `Loading chat history...` while that project's
+OpenCode sessions are enumerated, then opens `fzf` with title and update time.
+Native root sessions that have never dispatched remain independent rows.
+Sessions created before thread tracking was introduced cannot be paired
+retroactively.
 
 OpenCode remains the source of truth for transcript content. The plugin stores
 only session relationships and dispatch metadata in

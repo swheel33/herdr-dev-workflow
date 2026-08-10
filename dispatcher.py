@@ -1,7 +1,6 @@
 #!/usr/bin/env python3
 
 import argparse
-from concurrent.futures import as_completed, ThreadPoolExecutor
 import contextlib
 from datetime import datetime
 import fcntl
@@ -51,7 +50,7 @@ AGENT_START_TIMEOUT_SECONDS = 30
 PROMPT_DELIVERY_TIMEOUT_MS = 30_000
 
 
-def run_command(command, *, check=True, input_text=None, cwd=None):
+def run_command(command, *, check=True, input_text=None, cwd=None, log_output=True):
     log_event("dispatcher.command_started", command=command, cwd=cwd)
     try:
         result = subprocess.run(
@@ -69,8 +68,8 @@ def run_command(command, *, check=True, input_text=None, cwd=None):
         "dispatcher.command_finished",
         command=command,
         exit_code=result.returncode,
-        stdout=result.stdout,
-        stderr=result.stderr,
+        stdout=result.stdout if log_output else None,
+        stderr=result.stderr if log_output else None,
     )
     if check and result.returncode:
         detail = result.stderr.strip() or result.stdout.strip() or "no error output"
@@ -391,17 +390,16 @@ def chat_picker():
 
 
 def opencode_sessions(root):
-    result = run_command(["opencode", "session", "list", "--format", "json", "--max-count", "200"], cwd=root)
+    result = run_command(
+        ["opencode", "session", "list", "--format", "json"],
+        cwd=root,
+        log_output=False,
+    )
     try:
         sessions = json.loads(result.stdout)
     except json.JSONDecodeError as error:
         raise DispatchFailure(f"Invalid OpenCode session list JSON: {error}") from error
     return sessions if isinstance(sessions, list) else []
-
-
-def checkout_root(path):
-    result = git(path, "rev-parse", "--path-format=absolute", "--show-toplevel", check=False)
-    return canonical(result.stdout.strip()) if result.returncode == 0 and result.stdout.strip() else None
 
 
 def dispatch_threads_path():
@@ -490,31 +488,21 @@ def record_dispatch_thread(root, thread_id, source_session_id, implementation_se
     )
 
 
-def general_chat_sessions():
+def project_chat_sessions(root):
+    root = canonical(root)
     sessions = {}
     all_sessions = {}
-    roots = discover_project_roots()
-    canonical_roots = {canonical(root) for root in roots}
-    with ThreadPoolExecutor(max_workers=len(roots) or 1) as executor:
-        futures = {executor.submit(opencode_sessions, root): root for root in roots}
-        for future in as_completed(futures):
-            root = futures[future]
-            try:
-                root_sessions = future.result()
-            except DispatchFailure as error:
-                log_event("dispatcher.chat_history_project_failed", project_root=root, error=str(error))
-                continue
-            for session in root_sessions:
-                session_id = session.get("id")
-                directory = session.get("directory")
-                if not session_id:
-                    continue
-                all_sessions.setdefault(session_id, session)
-                if directory and checkout_root(directory) == canonical(root):
-                    sessions.setdefault(session_id, {**session, "project_root": root})
+    for session in opencode_sessions(root):
+        session_id = session.get("id")
+        directory = session.get("directory")
+        if not session_id:
+            continue
+        all_sessions.setdefault(session_id, session)
+        if directory and canonical(directory) == root:
+            sessions.setdefault(session_id, {**session, "project_root": root})
     for thread in load_dispatch_threads():
-        root = canonical(thread.get("project_root", ""))
-        if root not in canonical_roots:
+        thread_root = thread.get("project_root")
+        if not thread_root or canonical(thread_root) != root:
             continue
         thread_sessions = set(thread.get("sessions", []))
         for session_id in thread_sessions:
@@ -531,8 +519,8 @@ def general_chat_sessions():
     return sorted(sessions.values(), key=lambda item: item.get("updated", 0), reverse=True)
 
 
-def pick_chat():
-    sessions = general_chat_sessions()
+def pick_chat(root):
+    sessions = project_chat_sessions(root)
     if not sessions:
         raise DispatchFailure("No previous project chats found")
     rows = []
@@ -543,10 +531,10 @@ def pick_chat():
         updated = session.get("updated", 0) / 1000
         timestamp = datetime.fromtimestamp(updated).strftime("%Y-%m-%d %H:%M") if updated else "unknown"
         rows.append(
-            f"{Path(session['project_root']).name}\t{session.get('title') or 'Untitled'}\t{timestamp}\t{session_id}\n"
+            f"{session.get('title') or 'Untitled'}\t{timestamp}\t{session_id}\n"
         )
     result = run_command(
-        ["fzf", "--prompt", "chat> ", "--reverse", "--with-nth", "1,2,3"],
+        ["fzf", "--prompt", "chat> ", "--reverse", "--with-nth", "1,2"],
         check=False,
         input_text="".join(rows),
     )
@@ -568,8 +556,11 @@ def pick_chat():
 
 
 def chat_history():
+    root = current_project_root()
+    if root is None:
+        raise DispatchFailure("Chat history requires a pane inside a Git project")
     print("Loading chat history...", flush=True)
-    selected = pick_chat()
+    selected = pick_chat(root)
     if selected:
         root, session_id, label, fork, thread_id = selected
         open_chat_tab(root, session_id, label, fork=fork, thread_id=thread_id)

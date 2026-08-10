@@ -134,18 +134,31 @@ class DispatcherTest(unittest.TestCase):
         self.assertIn("HERDR_CHAT_TAB_LABEL=New Chat", opened)
         self.assertFalse(any(call[:2] == ("worktree", "open") for call in calls))
 
-    def test_global_chat_history_excludes_worktree_sessions(self):
+    def test_project_chat_history_excludes_worktree_sessions(self):
         checkout = self.add_worktree("implementation")
         sessions = [
             {"id": "general", "title": "General", "updated": 2, "directory": str(self.repo)},
             {"id": "implementation", "title": "Implementation", "updated": 3, "directory": str(checkout)},
         ]
-        with mock.patch.object(dispatcher, "discover_project_roots", return_value=[str(self.repo)]), \
-             mock.patch.object(dispatcher, "opencode_sessions", return_value=sessions):
-            history = dispatcher.general_chat_sessions()
+        with mock.patch.object(dispatcher, "opencode_sessions", return_value=sessions) as sessions_mock, \
+             mock.patch.object(dispatcher, "discover_project_roots") as discovery_mock, \
+             mock.patch.object(dispatcher, "git") as git_mock:
+            history = dispatcher.project_chat_sessions(self.repo)
 
         self.assertEqual([item["id"] for item in history], ["general"])
-        self.assertEqual(history[0]["project_root"], str(self.repo))
+        self.assertEqual(history[0]["project_root"], lifecycle.canonical(self.repo))
+        sessions_mock.assert_called_once_with(lifecycle.canonical(self.repo))
+        discovery_mock.assert_not_called()
+        git_mock.assert_not_called()
+
+    def test_opencode_history_is_not_truncated_or_logged(self):
+        response = subprocess.CompletedProcess(["opencode"], 0, "[]", "")
+        with mock.patch.object(dispatcher, "run_command", return_value=response) as run_mock:
+            self.assertEqual(dispatcher.opencode_sessions(self.repo), [])
+
+        command_args = run_mock.call_args.args[0]
+        self.assertNotIn("--max-count", command_args)
+        self.assertFalse(run_mock.call_args.kwargs["log_output"])
 
     def test_history_collapses_dispatch_chain_to_latest_combined_session(self):
         checkout = self.add_worktree("combined-history")
@@ -164,9 +177,8 @@ class DispatcherTest(unittest.TestCase):
             {"id": "general", "title": "Unrelated chat", "updated": 3, "directory": str(self.repo)},
         ]
 
-        with mock.patch.object(dispatcher, "discover_project_roots", return_value=[str(self.repo)]), \
-             mock.patch.object(dispatcher, "opencode_sessions", return_value=sessions):
-            history = dispatcher.general_chat_sessions()
+        with mock.patch.object(dispatcher, "opencode_sessions", return_value=sessions):
+            history = dispatcher.project_chat_sessions(self.repo)
 
         self.assertEqual([item["id"] for item in history], ["ses-implementation", "general"])
         combined = history[0]
@@ -181,17 +193,24 @@ class DispatcherTest(unittest.TestCase):
             "updated": 1_786_396_551_406,
             "project_root": str(self.repo),
         }
-        selected = f"project\tVisible history row\t2026-08-10 17:29\tses-history\n"
+        selected = f"Visible history row\t2026-08-10 17:29\tses-history\n"
         response = subprocess.CompletedProcess(["fzf"], 0, selected, "")
 
-        with mock.patch.object(dispatcher, "general_chat_sessions", return_value=[session]), \
+        with mock.patch.object(dispatcher, "project_chat_sessions", return_value=[session]), \
              mock.patch.object(dispatcher, "run_command", return_value=response) as run_mock:
-            result = dispatcher.pick_chat()
+            result = dispatcher.pick_chat(self.repo)
 
         command_args = run_mock.call_args.args[0]
         self.assertNotIn("--height", command_args)
         self.assertIn("Visible history row", run_mock.call_args.kwargs["input_text"])
         self.assertEqual(result, (str(self.repo), "ses-history", "Visible history row", False, None))
+
+    def test_chat_history_uses_current_project(self):
+        with mock.patch.object(dispatcher, "current_project_root", return_value=str(self.repo)), \
+             mock.patch.object(dispatcher, "pick_chat", return_value=None) as picker_mock:
+            self.assertEqual(dispatcher.chat_history(), 0)
+
+        picker_mock.assert_called_once_with(str(self.repo))
 
     def test_resumed_chat_launches_native_session(self):
         captured = {}
