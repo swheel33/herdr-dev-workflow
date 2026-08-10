@@ -241,38 +241,45 @@ def primary_workspace(root):
         provenance = workspace.get("worktree") or {}
         checkout = provenance.get("checkout_path")
         if checkout and not provenance.get("is_linked_worktree") and canonical(checkout) == root:
-            return workspace["workspace_id"]
+            return workspace["workspace_id"], None
     listing = json_field(herdr("worktree", "list", "--cwd", root, "--json").stdout, "result")
     for tree in listing.get("worktrees", []):
         if tree.get("path") and canonical(tree["path"]) == root and tree.get("open_workspace_id"):
-            return tree["open_workspace_id"]
+            return tree["open_workspace_id"], None
     source = listing.get("source") or {}
     if source.get("source_checkout_path") and canonical(source["source_checkout_path"]) == root and source.get("source_workspace_id"):
-        return source["source_workspace_id"]
+        return source["source_workspace_id"], None
     opened = herdr(
         "worktree", "open", "--cwd", root, "--path", root,
         "--label", Path(root).name, "--no-focus", "--json",
     )
-    return json_field(opened.stdout, "result", "workspace", "workspace_id")
+    result = json_field(opened.stdout, "result")
+    workspace_id = result["workspace"]["workspace_id"]
+    bootstrap_pane_id = None if result["already_open"] else result["root_pane"]["pane_id"]
+    return workspace_id, bootstrap_pane_id
 
 
 def open_chat_tab(root, session_id=None, label=CHAT_TAB_LABEL):
     root = canonical(root)
-    workspace_id = primary_workspace(root)
+    workspace_id, bootstrap_pane_id = primary_workspace(root)
     command = [
         "plugin", "pane", "open",
         "--plugin", os.environ.get("HERDR_PLUGIN_ID", "wheels.dev-workflow"),
         "--entrypoint", "dispatcher-chat",
-        "--placement", "tab",
+        "--placement", "split" if bootstrap_pane_id else "tab",
         "--workspace", workspace_id,
         "--cwd", root,
         "--env", f"HERDR_DISPATCHER_PROJECT_ROOT={root}",
         "--env", f"HERDR_CHAT_TAB_LABEL={label}",
     ]
+    if bootstrap_pane_id:
+        command.extend(("--target-pane", bootstrap_pane_id))
     if session_id:
         command.extend(("--env", f"HERDR_DISPATCHER_SESSION_ID={session_id}"))
     command.append("--focus")
     herdr(*command)
+    if bootstrap_pane_id:
+        herdr("pane", "close", bootstrap_pane_id)
     log_event("dispatcher.chat_tab_opened", project_root=root, workspace_id=workspace_id, session_id=session_id)
     return workspace_id
 
