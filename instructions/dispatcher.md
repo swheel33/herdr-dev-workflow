@@ -11,8 +11,7 @@ This is a general chat tab for the primary repository in `HERDR_DISPATCHER_PROJE
 python3 "$HERDR_PLUGIN_ROOT/dispatcher.py" dispatch --slug "<slug>" --request "<complete user request>"
 ```
 
-- The command creates `wheels/<slug>` at `<repo>/.worktrees/<slug>`, prepares its workspace, starts and prompts its OpenCode agent, preserves the primary workspace with an ordinary shell tab when needed, focuses the implementation workspace, and closes only this chat tab.
+- The command creates `wheels/<slug>` at `<repo>/.worktrees/<slug>`, prepares its workspace without changing focus, and starts and prompts its OpenCode agent. This Project Chat remains open and active.
 - Do not reproduce the Herdr or Git steps manually.
-- If dispatch fails before the agent is prompted, quote the exact error and do not retry blindly. This tab remains open.
-- Once the agent is prompted, dispatch succeeded. A later cleanup warning is non-fatal: do not retry, even if this tab remains open.
-- After successful dispatch without a cleanup warning, do not issue more commands because this tab closes automatically.
+- If dispatch fails, quote the exact error and do not retry blindly. This tab remains open.
+- Once the agent is prompted, dispatch succeeded. Continue the Project Chat normally without switching to the implementation workspace unless the user chooses to do so.

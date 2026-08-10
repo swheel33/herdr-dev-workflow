@@ -110,18 +110,16 @@ A dispatched task receives this layout:
 The plugin fetches the selected repository and safely synchronizes its primary
 `main` checkout with `origin/main` before creating the linked worktree. It then
 splits the root pane, starts one named OpenCode agent, and submits the complete
-request without waiting. After the prompt succeeds, it inspects the
-source workspace. If the Project Chat is its only tab, the plugin first creates
-an unfocused ordinary shell tab there at the primary project root. It then
-focuses the implementation workspace and closes only the source Project Chat;
-existing primary-workspace tabs are otherwise unchanged.
+request without waiting. Worktree creation and pane splitting explicitly use
+non-focusing Herdr operations. The dispatcher does not focus the implementation
+workspace, close or replace the source tab, or otherwise switch the user's
+active tab or window. The existing functional Project Chat remains open in the
+primary workspace, including when it is that workspace's only tab.
 
-Worktree preparation and agent prompting form the dispatch success boundary.
-Failures before that boundary remain fatal: the exact error remains visible in
-the open chat and the incomplete workspace is not focused. Replacement-tab,
-focus, or source-chat cleanup failures after that boundary are non-fatal. The
-plugin leaves the chat open when necessary and records and displays a cleanup
-warning that explicitly says not to retry the already-created dispatch.
+Failures remain visible in the active Project Chat, and an incomplete
+implementation workspace is never focused. Once the agent prompt succeeds, the
+dispatch is complete; the user can continue chatting or switch to the
+implementation workspace when desired.
 
 Synchronization fetches `origin`, compares both tips, and runs only
 `git merge --ff-only origin/main` when local `main` is a clean ancestor. An

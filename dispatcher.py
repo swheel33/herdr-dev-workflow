@@ -20,7 +20,6 @@ from lifecycle import (
     GitFailure,
     known_roots,
     log_event,
-    notify,
     state_dir,
     synchronize_primary_main,
 )
@@ -491,76 +490,6 @@ def dispatch_lock(root):
         yield
 
 
-def dispatch_cleanup_warning(root, slug, stage, error):
-    detail = str(error)
-    message = f"Implementation dispatch succeeded, but {stage}: {detail}. Do not retry the dispatch."
-    log_event(
-        "dispatcher.dispatch_cleanup_warning",
-        project_root=root,
-        slug=slug,
-        stage=stage,
-        error=detail,
-    )
-    try:
-        notify("Dispatch cleanup incomplete", message)
-    except Exception as notify_error:
-        log_event("dispatcher.dispatch_cleanup_notification_failed", error=str(notify_error))
-    try:
-        print(message, file=sys.stderr)
-    except OSError:
-        pass
-
-
-def source_chat_can_close(root, chat_tab_id, chat_workspace_id):
-    if not chat_workspace_id:
-        raise DispatchFailure("source workspace metadata is missing; leaving the Project Chat open")
-    listed = herdr("tab", "list", "--workspace", chat_workspace_id)
-    tabs = json_field(listed.stdout, "result", "tabs")
-    if not isinstance(tabs, list):
-        raise DispatchFailure("source workspace tab metadata is invalid; leaving the Project Chat open")
-    if any(not isinstance(tab, dict) or not isinstance(tab.get("tab_id"), str) for tab in tabs):
-        raise DispatchFailure("source workspace tab metadata is invalid; leaving the Project Chat open")
-    tab_ids = [tab["tab_id"] for tab in tabs]
-    if chat_tab_id not in tab_ids:
-        return False
-    if len(tabs) == 1:
-        herdr(
-            "tab", "create",
-            "--workspace", chat_workspace_id,
-            "--cwd", root,
-            "--no-focus",
-        )
-    return True
-
-
-def finish_dispatch(root, slug, workspace_id, chat_tab_id, chat_workspace_id):
-    try:
-        can_close = source_chat_can_close(root, chat_tab_id, chat_workspace_id)
-    except (DispatchFailure, OSError) as error:
-        dispatch_cleanup_warning(root, slug, "could not preserve the source workspace", error)
-        can_close = False
-    try:
-        herdr("workspace", "focus", workspace_id)
-    except (DispatchFailure, OSError) as error:
-        dispatch_cleanup_warning(root, slug, "could not focus the implementation workspace", error)
-        return
-    if not can_close:
-        return
-    try:
-        herdr("tab", "close", chat_tab_id)
-    except (DispatchFailure, OSError) as close_error:
-        restore_error = None
-        if chat_workspace_id:
-            try:
-                herdr("workspace", "focus", chat_workspace_id)
-            except (DispatchFailure, OSError) as error:
-                restore_error = error
-        detail = close_error
-        if restore_error:
-            detail = f"{close_error}; also could not restore source workspace focus: {restore_error}"
-        dispatch_cleanup_warning(root, slug, "could not close the source Project Chat", detail)
-
-
 def dispatch_task(slug, request):
     if os.environ.get("HERDR_DISPATCHER") != "1":
         raise DispatchFailure("dispatch is only available inside a project chat tab")
@@ -569,16 +498,11 @@ def dispatch_task(slug, request):
     request = request.strip()
     if not request:
         raise DispatchFailure("Dispatch request must not be empty")
-    context = plugin_context()
-    chat_tab_id = os.environ.get("HERDR_TAB_ID") or context.get("tab_id")
-    chat_workspace_id = os.environ.get("HERDR_WORKSPACE_ID") or context.get("workspace_id")
-    if not chat_tab_id:
-        raise DispatchFailure("HERDR_TAB_ID is not set; cannot close the project chat tab")
     with dispatch_lock(root):
-        return dispatch_task_locked(root, slug, request, chat_tab_id, chat_workspace_id)
+        return dispatch_task_locked(root, slug, request)
 
 
-def dispatch_task_locked(root, slug, request, chat_tab_id, chat_workspace_id):
+def dispatch_task_locked(root, slug, request):
     branch = f"wheels/{slug}"
     checkout = str(Path(root) / ".worktrees" / slug)
     log_event(
@@ -628,10 +552,6 @@ def dispatch_task_locked(root, slug, request, chat_tab_id, chat_workspace_id):
     except (DispatchFailure, OSError) as error:
         log_event("dispatcher.dispatch_failed", project_root=root, slug=slug, error=str(error))
         raise
-    try:
-        finish_dispatch(root, slug, workspace_id, chat_tab_id, chat_workspace_id)
-    except Exception as error:
-        dispatch_cleanup_warning(root, slug, "could not finish source chat cleanup", error)
     log_event("dispatcher.dispatch_succeeded", workspace_id=workspace_id, agent=name)
     return 0
 
