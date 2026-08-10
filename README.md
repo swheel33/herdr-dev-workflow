@@ -1,15 +1,21 @@
 # Wheels Dev Workflow
 
-Portable Herdr plugin for personal git worktree workflows and development tools.
+Personal Herdr 0.8 workflow plugin for project chat, delegated OpenCode tasks,
+Git worktrees, cleanup, and development tools.
 
-The manifest remains at version `0.0.1` during development and is only versioned when an actual release is published.
+## Requirements
 
-Requires Herdr 0.7.5 or newer.
+- stable Herdr 0.8.0 or newer
+- `git`
+- `python3`
+- `opencode`
+- `fzf`
+- `pnpm`
+- `zsh`
+- `nvim`
+- `lazygit`
 
-## Install
-
-Install the workflow dependencies first. `fzf` powers the interactive worktree
-and branch menus and must be installed separately from the plugin:
+Install `fzf` separately:
 
 ```bash
 # macOS
@@ -19,132 +25,137 @@ brew install fzf
 sudo apt install fzf
 ```
 
-Install the plugin from GitHub:
+## Install
 
 ```bash
-herdr plugin install swheel33/herdr-dev-workflow --yes
-```
-
-Installed and linked plugins are global to the current user in Herdr 0.7.5. If
-the plugin was previously installed only in a named Herdr session, install or
-link it again after upgrading.
-
-When developing the plugin locally, link its checkout instead:
-
-```bash
-herdr plugin link /path/to/herdr-dev-workflow
-```
-
-Run the dependency check from Herdr's plugin action menu, or from the CLI:
-
-```bash
-herdr plugin action invoke wheels.dev-workflow.doctor
-```
-
-Install the OpenCode lifecycle integration and the official Herdr skill:
-
-```bash
-herdr integration install opencode
-npx skills add ogulcancelik/herdr --skill herdr -g -y
-```
-
-Restart OpenCode after installing or updating its integration, skills, or
-configuration.
-
-## Keybindings
-
-- `prefix+l`: set up the two-pane dev layout in the current workspace
-- `prefix+n`: create a new `wheels/<name>` worktree from a selected base branch
-- `prefix+o`: pick in a popup and open any existing worktree or `origin/*` branch
-- `prefix+a`: open all managed worktrees
-- `prefix+p`: automatically prune eligible managed and OpenCode worktrees plus standalone local branches
-- `prefix+shift+p`: select and confirm a managed worktree, then prune it in the background
-- `prefix+g`: open `lazygit` in a popup
-- `prefix+e`: open `nvim` in a temporary full overlay
-
-Keybindings live in Herdr's global `config.toml` and invoke portable plugin actions.
-The plugin itself contains no user-specific absolute paths.
-See [`keybindings.example.toml`](keybindings.example.toml) for the complete binding block.
-
-## Layout
-
-- top pane: a named `opencode` agent started through `herdr agent start`
-- bottom pane: shell, or `pnpm install` for newly created worktrees
-
-The agent name combines the workspace label and pane ID, so the agent can be
-addressed reliably with Herdr 0.7.5 commands such as `herdr agent get`,
-`herdr agent prompt`, and `herdr agent wait`.
-
-## OpenCode Feature Spaces
-
-The repository includes a concise global OpenCode policy at
-[`instructions/herdr-feature-workspaces.md`](instructions/herdr-feature-workspaces.md).
-Reference that file from OpenCode's global `instructions` configuration. The
-broader Herdr skill is not required for this workflow. Repository `AGENTS.md`
-files continue to provide project-specific guidance.
-
-Herdr 0.7.5 separates topology from agent startup. An agent creates a worktree
-workspace, reads the returned root pane ID, starts OpenCode there, and submits
-the implementation task:
-
-```bash
-herdr worktree create \
-  --cwd "$repo_root" \
-  --branch "wheels/$slug" \
-  --base "$base_ref" \
-  --path "$repo_root/.worktrees/$slug" \
-  --label "$slug" \
-  --no-focus \
-  --json
-
-herdr pane split "$root_pane_id" --direction down --ratio 0.70 --cwd "$worktree_path" --no-focus
-herdr agent start "$agent_name" --kind opencode --pane "$root_pane_id" -- "$worktree_path"
-herdr agent prompt "$agent_name" "$implementation_task"
-```
-
-Parse workspace and pane IDs from Herdr's JSON responses instead of deriving
-them. The official skill contains the complete safety and coordination rules.
-
-## Worktree Conventions
-
-- managed worktrees live under `<repo>/.worktrees`
-- new personal branches are named `wheels/<slug>`
-- new personal branches use `wheels/<slug>` locally and `.worktrees/<slug>` on disk
-- new personal branches prefer `develop` as their base, then fall back to the repository default
-- the base selector shows fetched `origin/*` branches plus deduplicated local-only branches
-- the open selector includes managed and external Git worktrees and reuses existing checkouts
-- origin branches keep the exact origin branch name locally and use a slugged worktree path
-- selecting `origin/alice/checkout-fix` opens local branch `alice/checkout-fix` at `.worktrees/alice-checkout-fix`
-- colliding slugged worktree paths fail explicitly instead of opening a different branch
-- `.env` files from `apps/*/*/.env` in the primary checkout are symlinked into new worktrees
-- automatic pruning removes clean managed and `$TMPDIR/opencode` worktrees plus unchecked-out local branches when no same-named `origin/*` branch exists
-- automatic pruning also clears stale Git worktree records whose checkout paths no longer exist
-- manual pruning closes its popup after confirmation and reports completion or failure through a Herdr notification
-
-## Dependencies
-
-Required commands: `git`, `python3`, `opencode`, `pnpm`, `zsh`, `nvim`, `lazygit`, and `fzf`.
-Herdr installs the plugin repository but does not install system dependencies.
-
-## New Machine Setup
-
-```bash
-herdr update
 herdr integration install opencode
 herdr plugin install swheel33/herdr-dev-workflow --yes
 herdr config check
 herdr plugin action invoke wheels.dev-workflow.doctor
 ```
 
-When a named Herdr session is active, set `HERDR_SESSION=<name>` for the Herdr
-commands. Add the keybindings from `keybindings.example.toml` to
-`~/.config/herdr/config.toml`, then run `herdr server reload-config` or restart
-Herdr. Register `instructions/herdr-feature-workspaces.md` in OpenCode's global
-configuration and restart OpenCode so it loads the integration and instruction.
+For local plugin development:
 
-Herdr forwards OSC 52 clipboard writes from terminal applications to the local
-clipboard. For Neovim, merge the relevant lines from
-[`examples/nvim/options.lua`](examples/nvim/options.lua) into the existing
-`lua/config/options.lua`; do not overwrite an existing options file. In
-particular, set `vim.g.clipboard = "osc52"` before
-`vim.opt.clipboard = "unnamedplus"` so yanks use the forwarded clipboard.
+```bash
+herdr plugin link /path/to/herdr-dev-workflow
+```
+
+Installed and linked plugins are available to all Herdr sessions for the
+current user.
+
+## Dispatcher
+
+The dispatcher opens a fresh OpenCode TUI for project discussion and task
+delegation. Every invocation starts a new conversation.
+
+- **Chat for current project** resolves the repository behind the focused pane.
+- Linked worktree paths resolve back to their primary repository.
+- If the focused pane is not in a repository, the project picker opens.
+- **Chat for another project** always opens the picker.
+- The picker combines known cleanup repositories with Git repositories under
+  `~/Projects`, excludes `.worktrees` checkouts, and deduplicates primary roots.
+
+Discussion, questions, reviews, exploration, and planning stay in the popup.
+Requests requiring code changes are dispatched to a new `wheels/<slug>` branch
+at `<repo>/.worktrees/<slug>`.
+
+A dispatched task receives this layout:
+
+- top 70%: the only OpenCode agent
+- bottom 30%: unused interactive shell
+
+The plugin fetches the selected repository, creates the linked worktree without
+focusing it, splits the root pane, starts one named OpenCode agent, and submits
+the complete request without waiting. It focuses the new workspace and closes
+the popup only after every dispatch step succeeds. On failure, the exact error
+remains visible in the open popup and the incomplete workspace is not focused.
+
+## Worktree Cleanup
+
+Closing any linked-worktree workspace is permanent cleanup, regardless of why
+it closed. Uncommitted changes are force-discarded.
+
+Cleanup runs these persisted, idempotent phases:
+
+1. Delete the configured upstream branch, or the same-named `origin` branch.
+2. Unlock and force-remove the linked checkout.
+3. Delete the local branch.
+4. Prune Git worktree metadata.
+
+Primary checkouts, their checked-out branches, `origin/HEAD`, `main`, and
+`master` are protected. Cleanup stops rather than guessing when event, path, or
+branch metadata does not match.
+
+Failures retain the job, failed phase, command, exit code, stdout, and stderr.
+Each hook, startup, or manual retry makes one attempt. Already-missing resources
+count as completed phases, and successful jobs are removed. Do not recreate a
+pending job's branch or checkout path before retrying it.
+
+Available actions:
+
+- **Retry pending worktree cleanup**
+- **Show pending worktree cleanup failures**
+- **Show worktree cleanup log**
+
+## Startup Reconciliation
+
+At startup the plugin:
+
+1. Attempts every pending cleanup job once.
+2. Discovers and maintains known primary repository roots.
+3. Leaves unresolved cleanup paths closed.
+4. Opens linked worktrees that do not already have a workspace.
+5. Applies the standard 70/30 OpenCode and shell layout to newly opened workspaces.
+6. Restores the stable Agent sidebar ordering and repository metadata.
+
+Cleanup and reconciliation are serialized per repository.
+
+## Sidebar
+
+The example configuration installs an unfiltered Agent view ordered by
+workspace, tab, and pane. Agent rows display:
+
+1. semantic status and the bold workspace/worktree label
+2. repository and branch
+
+Terminal titles are not used as workspace titles. Agent and Space rows use
+Herdr's supported packed `row_gap = 0` layout.
+
+## Logs
+
+Lifecycle activity is written as JSON Lines to:
+
+```text
+$HERDR_PLUGIN_STATE_DIR/lifecycle.jsonl
+```
+
+The log includes hook payloads, cleanup jobs, phase transitions, retries,
+reconciliation, notifications, and Git/Herdr commands with exit code, stdout,
+and stderr. At 5 MiB it rotates to `lifecycle.jsonl.1`; one rotated file is
+retained. Logging is best-effort and never blocks cleanup.
+
+Use **Show worktree cleanup log** to view the newest 1,000 entries in Herdr.
+
+## Keybindings
+
+Suggested bindings from [`keybindings.example.toml`](keybindings.example.toml):
+
+- `prefix+space`: chat for current project
+- `prefix+shift+space`: chat for another project
+- `prefix+l`: set up the standard layout here
+- `prefix+n`: create a personal worktree
+- `prefix+o`: open a worktree or `origin/*` branch
+- `prefix+a`: open all managed worktrees
+- `prefix+p`: retry pending cleanup jobs
+- `prefix+shift+p`: show pending cleanup failures
+- `prefix+g`: open lazygit
+- `prefix+e`: open Neovim
+
+Add the example entries to `~/.config/herdr/config.toml`, then run
+`herdr server reload-config` or restart Herdr.
+
+## Neovim Clipboard
+
+Herdr forwards OSC 52 clipboard writes. Merge the relevant settings from
+[`examples/nvim/options.lua`](examples/nvim/options.lua) into your existing
+Neovim options rather than replacing the file.

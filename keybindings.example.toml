@@ -23,16 +23,28 @@ command = "wheels.dev-workflow.open-all"
 description = "open all managed worktrees"
 
 [[keys.command]]
+key = "prefix+space"
+type = "plugin_action"
+command = "wheels.dev-workflow.chat-current"
+description = "chat for current project"
+
+[[keys.command]]
+key = "prefix+shift+space"
+type = "plugin_action"
+command = "wheels.dev-workflow.chat-picker"
+description = "chat for another project"
+
+[[keys.command]]
 key = "prefix+p"
 type = "plugin_action"
-command = "wheels.dev-workflow.prune"
-description = "auto-prune eligible managed worktrees"
+command = "wheels.dev-workflow.retry-cleanup"
+description = "retry pending worktree cleanup"
 
 [[keys.command]]
 key = "prefix+shift+p"
 type = "plugin_action"
-command = "wheels.dev-workflow.prune-manual"
-description = "manually prune a managed worktree"
+command = "wheels.dev-workflow.show-cleanup-failures"
+description = "show pending worktree cleanup failures"
 
 [[keys.command]]
 key = "prefix+g"
@@ -45,3 +57,16 @@ key = "prefix+e"
 type = "plugin_action"
 command = "wheels.dev-workflow.nvim"
 description = "nvim"
+
+[ui]
+agent_panel_sort = "spaces"
+
+[ui.sidebar.agents]
+row_gap = 0
+rows = [
+  ["state_icon", { token = "workspace", bold = true }],
+  ["$repo", "$branch"],
+]
+
+[ui.sidebar.spaces]
+row_gap = 0

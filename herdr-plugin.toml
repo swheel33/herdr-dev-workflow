@@ -1,7 +1,7 @@
 id = "wheels.dev-workflow"
 name = "Wheels Dev Workflow"
 version = "0.0.1"
-min_herdr_version = "0.7.5"
+min_herdr_version = "0.8.0"
 description = "Personal Herdr workflows for managed git worktrees and development tools."
 platforms = ["macos", "linux"]
 
@@ -30,16 +30,45 @@ contexts = ["workspace"]
 command = ["bash", "-lc", "exec \"$HERDR_PLUGIN_ROOT/dev-workflow.sh\" open-all"]
 
 [[actions]]
-id = "prune"
-title = "Auto-prune managed worktrees"
+id = "chat-current"
+title = "Chat for current project"
 contexts = ["workspace"]
-command = ["bash", "-lc", "exec \"$HERDR_PLUGIN_ROOT/dev-workflow.sh\" prune-auto"]
+command = ["bash", "-lc", "exec \"$HERDR_PLUGIN_ROOT/dev-workflow.sh\" open-pane dispatcher-current"]
 
 [[actions]]
-id = "prune-manual"
-title = "Manually prune a managed worktree"
+id = "chat-picker"
+title = "Chat for another project"
 contexts = ["workspace"]
-command = ["bash", "-lc", "exec \"$HERDR_PLUGIN_ROOT/dev-workflow.sh\" open-pane prune"]
+command = ["bash", "-lc", "exec \"$HERDR_PLUGIN_ROOT/dev-workflow.sh\" open-pane dispatcher-picker"]
+
+[[startup]]
+command = ["python3", "lifecycle.py", "startup"]
+
+[[events]]
+on = "workspace.closed"
+command = ["python3", "lifecycle.py", "event"]
+
+[[events]]
+on = "worktree.removed"
+command = ["python3", "lifecycle.py", "event"]
+
+[[actions]]
+id = "retry-cleanup"
+title = "Retry pending worktree cleanup"
+contexts = ["global", "workspace"]
+command = ["python3", "lifecycle.py", "retry"]
+
+[[actions]]
+id = "show-cleanup-failures"
+title = "Show pending worktree cleanup failures"
+contexts = ["workspace"]
+command = ["bash", "-lc", "exec \"$HERDR_PLUGIN_ROOT/dev-workflow.sh\" open-pane cleanup-failures"]
+
+[[actions]]
+id = "show-cleanup-log"
+title = "Show worktree cleanup log"
+contexts = ["workspace"]
+command = ["bash", "-lc", "exec \"$HERDR_PLUGIN_ROOT/dev-workflow.sh\" open-pane cleanup-log"]
 
 [[actions]]
 id = "lazygit"
@@ -76,12 +105,36 @@ height = "70%"
 command = ["bash", "-lc", "exec \"$HERDR_PLUGIN_ROOT/dev-workflow.sh\" open-pane-entry"]
 
 [[panes]]
-id = "prune"
-title = "Prune managed worktrees"
+id = "dispatcher-current"
+title = "Chat for current project"
 placement = "popup"
-width = "80%"
-height = "60%"
-command = ["bash", "-lc", "exec \"$HERDR_PLUGIN_ROOT/dev-workflow.sh\" prune-pane"]
+width = "95%"
+height = "90%"
+command = ["python3", "dispatcher.py", "chat-current"]
+
+[[panes]]
+id = "dispatcher-picker"
+title = "Chat for another project"
+placement = "popup"
+width = "95%"
+height = "90%"
+command = ["python3", "dispatcher.py", "chat-picker"]
+
+[[panes]]
+id = "cleanup-failures"
+title = "Pending worktree cleanup failures"
+placement = "popup"
+width = "90%"
+height = "70%"
+command = ["python3", "lifecycle.py", "show-pane"]
+
+[[panes]]
+id = "cleanup-log"
+title = "Worktree cleanup log"
+placement = "popup"
+width = "95%"
+height = "85%"
+command = ["python3", "lifecycle.py", "show-log-pane"]
 
 [[panes]]
 id = "lazygit"
