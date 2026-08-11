@@ -11,7 +11,8 @@ This is a general chat tab for the primary repository in `HERDR_DISPATCHER_PROJE
 python3 "$HERDR_PLUGIN_ROOT/dispatcher.py" dispatch --slug "<slug>" --request "<complete user request>"
 ```
 
-- The command creates `wheels/<slug>` at `<repo>/.worktrees/<slug>` without changing focus, forks this session into the implementation agent so it retains the full discussion context, confirms prompt delivery, records the combined history thread, and replaces this used chat with a fresh Project Chat home screen.
+- The command exports and sanitizes this discussion, creates `wheels/<slug>` at `<repo>/.worktrees/<slug>` without changing focus, and starts one fresh Build session with the complete handoff and prior discussion in its initial prompt. The Build agent is explicitly told to implement directly and never redispatch.
+- The dispatcher never forks this active Project Chat turn and never submits a second prompt. It confirms the fresh implementation session, links both sessions as one history thread, and replaces this used chat with a fresh Project Chat home screen.
 - Do not reproduce the Herdr or Git steps manually.
 - If dispatch fails before prompt delivery is confirmed, quote the exact error and do not retry blindly. This tab remains open.
 - Once Herdr confirms the prompt started an OpenCode session, dispatch succeeded. A later history or chat-reset warning is non-fatal and must not be retried.

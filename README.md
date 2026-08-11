@@ -75,13 +75,15 @@ a complete handoff. The dispatcher:
 3. Creates `wheels/<slug>` at `<repo>/.worktrees/<slug>` without changing focus.
 4. Splits the implementation workspace into a 70% OpenCode pane and a 30%
    interactive shell, also without changing focus.
-5. Starts OpenCode's Build agent as a fork of the source Project Chat session,
-   preserving the full planning and discussion context without retaining the
-   discussion-only Project Chat role.
-6. Waits for structured idle readiness, submits the request once, and succeeds
-   only after Herdr observes a new working OpenCode session transition.
-7. Records the source and implementation sessions as one logical history thread.
-8. Ensures one fresh, unfocused Project Chat exists in the primary workspace and
+5. Exports the source Project Chat and removes its active dispatcher tool-call
+   turn and executable dispatch commands.
+6. Starts one fresh OpenCode Build session with a structured initial prompt
+   containing the implementation task, execution rules, worktree path, and
+   sanitized prior discussion. The prompt explicitly forbids redispatch.
+7. Succeeds only after Herdr reports the fresh implementation session identity
+   in a structured working-state transition.
+8. Records the source and implementation sessions as one logical history thread.
+9. Ensures one fresh, unfocused Project Chat exists in the primary workspace and
    closes the used chat without creating a duplicate.
 
 The implementation workspace never steals focus. The dispatcher does not call
@@ -101,17 +103,20 @@ available local base branch.
 
 ### Combined History
 
-Dispatch uses OpenCode session forks rather than copying transcripts. The
-implementation session therefore includes the original Project Chat context,
-the dispatched request, implementation decisions, tool activity, and resulting
-change context.
+Dispatch copies a sanitized, human-readable Project Chat transcript into the
+fresh Build session's initial structured handoff. It does not fork the live
+Project Chat, so an in-progress dispatcher tool call cannot continue inside the
+implementation agent. The implementation session still contains the prior
+discussion, dispatched plan, implementation decisions, tool activity, and
+resulting change context.
 
 The **Chats** picker collapses the source and implementation sessions into one
-logical row and selects the latest session in that thread. Choosing a dispatched
-thread forks its combined context into a discussion-only Project Chat at the
-primary repository root. This remains usable after the implementation worktree
-and branch have been deleted, which is useful when a merged change needs a
-follow-up.
+logical row and selects the latest session in that thread. Because the Build
+session's initial handoff contains the earlier discussion, choosing a dispatched
+thread can still fork the complete record into a discussion-only Project Chat at
+the primary repository root. This remains usable after the implementation
+worktree and branch have been deleted, which is useful when a merged change
+needs a follow-up.
 
 The history popup displays `Loading chat history...` while that project's
 OpenCode sessions are enumerated, then opens `fzf` with title and update time.

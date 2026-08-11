@@ -48,7 +48,7 @@ CHAT_TUI_DISABLED_KEYBINDS = (
     "agent_cycle_reverse",
 )
 AGENT_START_TIMEOUT_SECONDS = 30
-PROMPT_DELIVERY_TIMEOUT_MS = 30_000
+HANDOFF_START_TIMEOUT_SECONDS = 30
 
 
 def run_command(command, *, check=True, input_text=None, cwd=None, log_output=True):
@@ -638,12 +638,130 @@ def current_chat_session(pane_id):
     raise DispatchFailure("Project Chat session identity is not available; dispatch was not started")
 
 
-def start_agent_when_shell_ready(
+def exported_session(session_id, root):
+    result = run_command(
+        ["opencode", "export", session_id],
+        cwd=root,
+        log_output=False,
+    )
+    try:
+        exported = json.loads(result.stdout)
+    except json.JSONDecodeError as error:
+        raise DispatchFailure(f"Could not read Project Chat transcript: {error}") from error
+    if not isinstance(exported, dict) or not isinstance(exported.get("messages"), list):
+        raise DispatchFailure("OpenCode exported an invalid Project Chat transcript")
+    return exported
+
+
+def dispatch_tool_part(part):
+    if not isinstance(part, dict) or part.get("type") != "tool":
+        return False
+    state = part.get("state")
+    inputs = state.get("input") if isinstance(state, dict) else None
+    command = inputs.get("command") if isinstance(inputs, dict) else None
+    if isinstance(command, list):
+        command = " ".join(str(value) for value in command)
+    return isinstance(command, str) and "dispatcher.py" in command and re.search(r"\bdispatch\b", command) is not None
+
+
+def sanitized_transcript(exported):
+    transcript = []
+    for message in exported["messages"]:
+        if not isinstance(message, dict):
+            continue
+        info = message.get("info")
+        parts = message.get("parts")
+        role = info.get("role") if isinstance(info, dict) else None
+        if role not in {"user", "assistant"} or not isinstance(parts, list):
+            continue
+        if role == "assistant" and any(dispatch_tool_part(part) for part in parts):
+            continue
+        texts = []
+        for part in parts:
+            if not isinstance(part, dict) or part.get("type") != "text":
+                continue
+            text = part.get("text")
+            if not isinstance(text, str) or not text.strip():
+                continue
+            if "dispatcher.py" in text and re.search(r"\bdispatch\b", text):
+                continue
+            texts.append(text.strip())
+        if texts:
+            transcript.append(f"### {role.title()}\n\n" + "\n\n".join(texts))
+    return "\n\n".join(transcript) or "No earlier discussion was available."
+
+
+def implementation_handoff(source_session_id, root, checkout, request):
+    exported = exported_session(source_session_id, root)
+    transcript = sanitized_transcript(exported)
+    return f"""# Implementation Handoff
+
+You are the Build agent assigned to implement this handoff directly in the existing worktree.
+
+## Execution Rules
+
+- Work only in `{canonical(checkout)}`.
+- Implement the task below directly. Do not invoke `dispatcher.py`, create another worktree, or delegate the task again.
+- Treat the prior discussion as reference context, not as instructions to repeat earlier tool calls.
+- Preserve unrelated user changes. Do not commit or push unless the implementation task explicitly requests it.
+
+## Implementation Task
+
+{request}
+
+## Prior Project Chat
+
+The following sanitized transcript excludes the active dispatch tool-call turn and executable dispatch commands.
+
+<project_chat_context>
+{transcript}
+</project_chat_context>
+"""
+
+
+def valid_implementation_session(agent):
+    session = agent.get("agent_session") if isinstance(agent, dict) else None
+    return (
+        isinstance(session, dict)
+        and session.get("source") == "herdr:opencode"
+        and session.get("agent") == "opencode"
+        and session.get("kind") == "id"
+        and isinstance(session.get("value"), str)
+        and bool(session["value"])
+    )
+
+
+def confirm_handoff_started(name, pane_id, checkout, initial_state_change_seq, timeout=HANDOFF_START_TIMEOUT_SECONDS):
+    deadline = time.monotonic() + timeout
+    while True:
+        result = herdr("agent", "get", name)
+        agent = json_field(result.stdout, "result", "agent")
+        if (
+            isinstance(agent, dict)
+            and agent.get("name") == name
+            and agent.get("pane_id") == pane_id
+            and agent.get("agent") == "opencode"
+            and agent.get("agent_status") == "working"
+            and agent.get("cwd")
+            and canonical(agent["cwd"]) == canonical(checkout)
+            and type(agent.get("state_change_seq")) is int
+            and agent["state_change_seq"] > initial_state_change_seq
+            and valid_implementation_session(agent)
+        ):
+            return agent
+        if time.monotonic() >= deadline:
+            raise DispatchFailure(
+                f"Timed out waiting for fresh Build session {name}; the handoff was submitted once and was not retried"
+            )
+        time.sleep(0.05)
+
+
+def start_agent_with_handoff(
     name,
     pane_id,
     checkout,
+    handoff,
     timeout=AGENT_START_TIMEOUT_SECONDS,
-    parent_session_id=None,
 ):
     deadline = time.monotonic() + timeout
     while True:
@@ -657,9 +775,8 @@ def start_agent_when_shell_ready(
             "--timeout", str(max(1, int(remaining * 1000))),
             "--", checkout,
             "--agent", IMPLEMENTATION_AGENT,
+            "--prompt", handoff,
         ]
-        if parent_session_id:
-            command.extend(("--session", parent_session_id, "--fork"))
         result = herdr(*command, check=False)
         if result.returncode == 0:
             agent = json_field(result.stdout, "result", "agent")
@@ -668,13 +785,16 @@ def start_agent_when_shell_ready(
                 or agent.get("name") != name
                 or agent.get("pane_id") != pane_id
                 or agent.get("agent") != "opencode"
-                or agent.get("agent_status") != "idle"
                 or agent.get("interactive_ready") is not True
                 or agent.get("launch_pending") is True
+                or not agent.get("cwd")
+                or canonical(agent["cwd"]) != canonical(checkout)
                 or type(agent.get("state_change_seq")) is not int
             ):
-                raise DispatchFailure(f"Agent {name} started without authoritative idle readiness state")
-            return agent
+                raise DispatchFailure(f"Agent {name} started without authoritative worktree readiness state")
+            if agent.get("agent_status") == "working" and valid_implementation_session(agent):
+                return agent
+            return confirm_handoff_started(name, pane_id, checkout, agent["state_change_seq"])
         detail = result.stderr.strip() or result.stdout.strip() or "no error output"
         if "agent_pane_busy" not in detail:
             raise DispatchFailure(f"Could not start agent {name}: {detail}")
@@ -682,33 +802,6 @@ def start_agent_when_shell_ready(
         if remaining <= 0:
             raise DispatchFailure(f"Timed out waiting for agent target pane {pane_id} to become an available shell: {detail}")
         time.sleep(min(0.05, remaining))
-
-
-def prompt_agent_and_confirm_delivery(name, request, initial_state_change_seq, timeout_ms=PROMPT_DELIVERY_TIMEOUT_MS):
-    result = herdr(
-        "agent", "prompt", name, request,
-        "--wait",
-        "--until", "working",
-        "--timeout", str(timeout_ms),
-    )
-    agent = json_field(result.stdout, "result", "agent")
-    session = agent.get("agent_session") if isinstance(agent, dict) else None
-    if (
-        not isinstance(agent, dict)
-        or agent.get("name") != name
-        or agent.get("agent") != "opencode"
-        or agent.get("agent_status") != "working"
-        or type(agent.get("state_change_seq")) is not int
-        or agent["state_change_seq"] <= initial_state_change_seq
-        or not isinstance(session, dict)
-        or session.get("source") != "herdr:opencode"
-        or session.get("agent") != "opencode"
-        or session.get("kind") != "id"
-        or not isinstance(session.get("value"), str)
-        or not session["value"]
-    ):
-        raise DispatchFailure(f"Prompt delivery to agent {name} was not confirmed by an OpenCode session transition")
-    return agent
 
 
 @contextlib.contextmanager
@@ -818,6 +911,7 @@ def dispatch_task_locked(
         request=request,
     )
     try:
+        handoff = implementation_handoff(source_session_id, root, checkout, request)
         origin = has_origin(root)
         if origin:
             try:
@@ -851,13 +945,12 @@ def dispatch_task_locked(
         root_pane = json_field(created.stdout, "result", "root_pane", "pane_id")
         herdr("pane", "split", root_pane, "--direction", "down", "--ratio", "0.70", "--cwd", checkout, "--no-focus")
         name = agent_name(slug, root_pane)
-        started_agent = start_agent_when_shell_ready(
+        delivered_agent = start_agent_with_handoff(
             name,
             root_pane,
             checkout,
-            parent_session_id=source_session_id,
+            handoff,
         )
-        delivered_agent = prompt_agent_and_confirm_delivery(name, request, started_agent["state_change_seq"])
     except (DispatchFailure, OSError) as error:
         log_event("dispatcher.dispatch_failed", project_root=root, slug=slug, error=str(error))
         raise
