@@ -319,7 +319,6 @@ function synchronizeDefaultBranch(repo) {
 import { readFileSync } from "node:fs";
 import { homedir as homedir3 } from "node:os";
 import { resolve as resolve4 } from "node:path";
-var EXPECTED_OPENCODE_VERSION = "0.0.0-next-17189";
 function servicePath() {
   return resolve4(process.env.XDG_STATE_HOME ?? resolve4(homedir3(), ".local/state"), "opencode/service.json");
 }
@@ -331,41 +330,69 @@ function readService() {
     return null;
   }
 }
-async function service() {
-  let info = readService();
-  if (info?.version && info.version !== EXPECTED_OPENCODE_VERSION) {
-    throw new WorkflowError(`OpenCode service version ${info.version} does not match required ${EXPECTED_OPENCODE_VERSION}`);
-  }
-  if (info) {
-    try {
-      await requestWithService(info, "GET", "/api/health", void 0, 5e3);
-      return info;
-    } catch {
-      info = null;
-    }
-  }
-  const binary = openCodeCli();
-  run([binary, "service", "start"]);
-  const deadline = Date.now() + 3e4;
-  while (!(info = readService()) && Date.now() < deadline) {
-    await new Promise((resolvePromise) => setTimeout(resolvePromise, 100));
-  }
-  if (!info) throw new WorkflowError("OpenCode 2 background service did not start");
-  if (info.version && info.version !== EXPECTED_OPENCODE_VERSION) {
-    throw new WorkflowError(`OpenCode service version ${info.version} does not match required ${EXPECTED_OPENCODE_VERSION}`);
-  }
-  await requestWithService(info, "GET", "/api/health", void 0, 5e3);
-  return info;
-}
-function openCodeCli(env = process.env) {
+function cliIdentity(env = process.env) {
   const binary = executable("opencode2", env);
   const result = run([binary, "--version"], { check: false, env });
   const version = result.stdout.match(/0\.0\.0-next-\d+/)?.[0];
-  if (result.exitCode !== 0 || version !== EXPECTED_OPENCODE_VERSION) {
+  if (result.exitCode !== 0 || !version) {
     const detail = result.stderr.trim() || result.stdout.trim() || `exit ${result.exitCode}`;
-    throw new WorkflowError(`OpenCode CLI must be ${EXPECTED_OPENCODE_VERSION}; ${detail}`);
+    throw new WorkflowError(`OpenCode 2 CLI is not executable: ${detail}`);
   }
-  return binary;
+  return { binary, version };
+}
+async function healthy(info) {
+  try {
+    await requestWithService(info, "GET", "/api/health", void 0, 5e3);
+    return true;
+  } catch {
+    return false;
+  }
+}
+async function service() {
+  const cli = cliIdentity();
+  let info = readService();
+  if (info?.version === cli.version && await healthy(info)) return info;
+  run([cli.binary, "service", info ? "restart" : "start"]);
+  const deadline = Date.now() + 3e4;
+  while (Date.now() < deadline) {
+    info = readService();
+    if (info?.version === cli.version && await healthy(info)) return info;
+    await new Promise((resolvePromise) => setTimeout(resolvePromise, 100));
+  }
+  const actual = info?.version ?? "missing";
+  throw new WorkflowError(`OpenCode 2 service did not become healthy on CLI version ${cli.version} (service: ${actual})`);
+}
+function openCodeCli(env = process.env) {
+  return cliIdentity(env).binary;
+}
+function openCodeVersion(env = process.env) {
+  return cliIdentity(env).version;
+}
+async function projectChatAvailable(directory) {
+  try {
+    const query = new URLSearchParams({ "location[directory]": directory });
+    const response = await request("GET", `/api/agent/project-chat?${query}`);
+    return response.data.id === "project-chat" && response.data.permissions?.some((permission) => permission.action === "dispatch_implementation") === true;
+  } catch {
+    return false;
+  }
+}
+async function waitForProjectChat(directory, timeout) {
+  const deadline = Date.now() + timeout;
+  do {
+    if (await projectChatAvailable(directory)) return true;
+    await new Promise((resolvePromise) => setTimeout(resolvePromise, 100));
+  } while (Date.now() < deadline);
+  return false;
+}
+async function ensureProjectChatCapability(directory = process.cwd()) {
+  if (await waitForProjectChat(directory, 2e3)) return;
+  const cli = cliIdentity();
+  run([cli.binary, "service", "restart"]);
+  await service();
+  if (!await waitForProjectChat(directory, 1e4)) {
+    throw new WorkflowError("OpenCode loaded without the project-chat agent or dispatch_implementation tool");
+  }
 }
 async function requestWithService(info, method, path, body, timeout = 3e4) {
   const headers = { "content-type": "application/json" };
@@ -383,8 +410,13 @@ async function requestWithService(info, method, path, body, timeout = 3e4) {
 async function request(method, path, body) {
   return await requestWithService(await service(), method, path, body);
 }
-async function createSession(directory, title = "New Chat") {
-  const response = await request("POST", "/api/session", { title, agent: "project-chat", location: { directory } });
+async function createSession(directory, title = "Project Chat") {
+  const response = await request("POST", "/api/session", {
+    title,
+    agent: "project-chat",
+    location: { directory }
+  });
+  await request("POST", `/api/session/${encodeURIComponent(response.data.id)}/agent`, { agent: "project-chat" });
   return response.data;
 }
 async function forkSession(sourceSessionId, sourceMessageId) {
@@ -393,14 +425,12 @@ async function forkSession(sourceSessionId, sourceMessageId) {
   });
   return response.data;
 }
-async function continueSession(sourceSessionId, directory) {
-  const response = await request("POST", `/api/session/${encodeURIComponent(sourceSessionId)}/fork`, {
-    boundary: { type: "through" }
-  });
-  const fork = response.data;
-  await request("POST", `/api/session/${encodeURIComponent(fork.id)}/move`, { directory });
-  await request("POST", `/api/session/${encodeURIComponent(fork.id)}/agent`, { agent: "project-chat" });
-  return fork;
+async function getSession(sessionId) {
+  const response = await request("GET", `/api/session/${encodeURIComponent(sessionId)}`);
+  return response.data;
+}
+async function renameSession(sessionId, title) {
+  await request("POST", `/api/session/${encodeURIComponent(sessionId)}/rename`, { title });
 }
 async function prepareImplementationSession(sessionId, directory) {
   await request("POST", `/api/session/${encodeURIComponent(sessionId)}/move`, { directory });
@@ -411,19 +441,8 @@ async function promptSession(sessionId, text, onAttempt) {
   onAttempt?.();
   await requestWithService(info, "POST", `/api/session/${encodeURIComponent(sessionId)}/prompt`, { text });
 }
-async function projectSessions(directory) {
-  const locationQuery = new URLSearchParams({ "location[directory]": directory });
-  const location = await request("GET", `/api/location?${locationQuery}`);
-  const sessions = [];
-  let cursor;
-  do {
-    const query = new URLSearchParams({ project: location.project.id, order: "desc", limit: "100" });
-    if (cursor) query.set("cursor", cursor);
-    const page = await request("GET", `/api/session?${query}`);
-    sessions.push(...page.data);
-    cursor = page.cursor.next;
-  } while (cursor);
-  return sessions;
+async function removeSession(sessionId) {
+  await request("DELETE", `/api/session/${encodeURIComponent(sessionId)}`);
 }
 
 // src/herdr.ts
@@ -462,10 +481,17 @@ var HerdrClient = class {
     const result = this.json(args);
     return Array.isArray(result.panes) ? result.panes.map(object) : [];
   }
+  tabs() {
+    const result = this.json(["tab", "list"]);
+    return Array.isArray(result.tabs) ? result.tabs.map(object) : [];
+  }
   runningSessionCount() {
     const result = this.json(["session", "list", "--json"]);
     const sessions = Array.isArray(result.sessions) ? result.sessions.map(object) : [];
     return sessions.filter((session) => session.running === true).length;
+  }
+  focusWorkspace(workspaceId) {
+    this.command(["workspace", "focus", workspaceId]);
   }
   openWorktree(repo, checkout, label) {
     const result = this.json([
@@ -499,7 +525,7 @@ var HerdrClient = class {
     this.command(["pane", "run", paneId, command]);
   }
   launchOpenCode(paneId, checkout, sessionId) {
-    this.runInPane(paneId, `exec ${shellQuote(openCodeCli())} ${shellQuote(checkout)} --session ${shellQuote(sessionId)}`);
+    this.runInPane(paneId, `exec ${shellQuote(openCodeCli())} ${shellQuote(checkout)} --session ${shellQuote(sessionId)} --agent build`);
   }
   runInstall(paneId, checkout) {
     this.runInPane(paneId, `cd -- ${shellQuote(checkout)} && pnpm install`);
@@ -512,9 +538,6 @@ var HerdrClient = class {
   }
   closeTab(tabId) {
     this.command(["tab", "close", tabId]);
-  }
-  renameTab(tabId, title) {
-    this.command(["tab", "rename", tabId, title.slice(0, 48)]);
   }
   openPluginPane(entrypoint, options) {
     const args = [
@@ -617,9 +640,9 @@ CREATE TABLE IF NOT EXISTS dispatches (
   updated_at INTEGER NOT NULL,
   PRIMARY KEY(source_session_id, source_message_id)
 );
-CREATE TABLE IF NOT EXISTS project_chats (
-  session_id TEXT PRIMARY KEY,
-  project_root TEXT NOT NULL,
+DROP TABLE IF EXISTS project_chats;
+CREATE TABLE IF NOT EXISTS project_hubs (
+  project_root TEXT PRIMARY KEY,
   pane_id TEXT NOT NULL,
   tab_id TEXT NOT NULL,
   workspace_id TEXT NOT NULL,
@@ -689,13 +712,12 @@ var StateStore = class {
   repositories() {
     return this.database.prepare("SELECT root FROM repositories ORDER BY root").all().map((row) => String(row.root));
   }
-  registerChat(context) {
+  registerHub(context) {
     this.database.prepare(`
-      INSERT OR REPLACE INTO project_chats(
-        session_id, project_root, pane_id, tab_id, workspace_id, herdr_bin, socket_path, created_at
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+      INSERT OR REPLACE INTO project_hubs(
+        project_root, pane_id, tab_id, workspace_id, herdr_bin, socket_path, created_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?)
     `).run(
-      context.sessionId,
       canonical(context.projectRoot),
       context.paneId,
       context.tabId,
@@ -705,11 +727,10 @@ var StateStore = class {
       Date.now()
     );
   }
-  chat(sessionId) {
-    const row = this.database.prepare("SELECT * FROM project_chats WHERE session_id = ?").get(sessionId);
+  hub(projectRoot) {
+    const row = this.database.prepare("SELECT * FROM project_hubs WHERE project_root = ?").get(canonical(projectRoot));
     if (!row) return null;
     return {
-      sessionId: String(row.session_id),
       projectRoot: String(row.project_root),
       paneId: String(row.pane_id),
       tabId: String(row.tab_id),
@@ -717,6 +738,19 @@ var StateStore = class {
       herdrBin: String(row.herdr_bin),
       socketPath: row.socket_path === null ? null : String(row.socket_path)
     };
+  }
+  async waitForHub(projectRoot, previousPaneId, timeout = 1e4) {
+    const deadline = Date.now() + timeout;
+    do {
+      const hub = this.hub(projectRoot);
+      if (hub && hub.paneId !== previousPaneId) return hub;
+      await new Promise((resolvePromise) => setTimeout(resolvePromise, 100));
+    } while (Date.now() < deadline);
+    throw new Error(`Project Chat hub did not start for ${canonical(projectRoot)}`);
+  }
+  deleteHub(projectRoot, paneId) {
+    const query = paneId ? "DELETE FROM project_hubs WHERE project_root = ? AND pane_id = ?" : "DELETE FROM project_hubs WHERE project_root = ?";
+    this.database.prepare(query).run(...paneId ? [canonical(projectRoot), paneId] : [canonical(projectRoot)]);
   }
   beginDispatch(input) {
     const result = this.database.prepare(`
@@ -2379,19 +2413,24 @@ function applyEdits(text, edits) {
 
 // src/chat.ts
 import { spawn as spawn2 } from "node:child_process";
-var CHAT_TITLE = "New Chat";
+var CHAT_TITLE = "Project Chat";
 function ensureCompanionInstalled(env = process.env) {
   const source = resolve6(pluginRoot(env), "dist/opencode-plugin.mjs");
   if (!existsSync4(source)) throw new WorkflowError(`OpenCode companion bundle is missing: ${source}`);
-  const configHome = resolve6(env.XDG_CONFIG_HOME ?? join(homedir4(), ".config"), "opencode", "plugins");
-  mkdirSync2(configHome, { recursive: true });
-  const legacyDestination = resolve6(configHome, "wheels-dev-workflow.mjs");
-  if (lstatMaybe(legacyDestination)) {
-    const stat = lstatSync(legacyDestination);
-    if (stat.isSymbolicLink() || readFileSync2(legacyDestination, "utf8").startsWith("// Managed by Wheels Dev Workflow")) {
-      unlinkSync(legacyDestination);
+  const configHome = resolve6(env.XDG_CONFIG_HOME ?? join(homedir4(), ".config"), "opencode");
+  const autoPluginDirectory = resolve6(configHome, "plugins");
+  mkdirSync2(autoPluginDirectory, { recursive: true });
+  const autoDestinations = [
+    resolve6(autoPluginDirectory, "wheels-dev-workflow.mjs"),
+    resolve6(autoPluginDirectory, "wheels-dev-workflow.js")
+  ];
+  for (const path of autoDestinations) {
+    if (!lstatMaybe(path)) continue;
+    const stat = lstatSync(path);
+    if (stat.isSymbolicLink() || readFileSync2(path, "utf8").startsWith("// Managed by Wheels Dev Workflow")) {
+      unlinkSync(path);
     } else {
-      throw new WorkflowError(`Refusing to replace unmanaged OpenCode plugin: ${legacyDestination}`);
+      throw new WorkflowError(`Refusing to replace unmanaged OpenCode plugin: ${path}`);
     }
   }
   const destination = resolve6(configHome, "wheels-dev-workflow.js");
@@ -2405,7 +2444,7 @@ function ensureCompanionInstalled(env = process.env) {
   }
   const sourceUrl = pathToFileURL(source).href;
   const herdrBin = executable(env.HERDR_BIN_PATH ?? "herdr", env);
-  writeFileSync(destination, `// Managed by Wheels Dev Workflow
+  const loader = `// Managed by Wheels Dev Workflow
 import { existsSync } from "node:fs"
 import { spawnSync } from "node:child_process"
 const source = ${JSON.stringify(source)}
@@ -2424,9 +2463,11 @@ function enabled() {
 let plugin = {}
 if (existsSync(source) && enabled()) plugin = (await import(sourceUrl)).default
 export default plugin
-`);
-  const configPath = resolve6(configHome, "..", "opencode.jsonc");
-  const config = existsSync4(configPath) ? readFileSync2(configPath, "utf8") : "{}\n";
+`;
+  if (!existsSync4(destination) || readFileSync2(destination, "utf8") !== loader) writeFileSync(destination, loader);
+  const configPath = resolve6(configHome, "opencode.jsonc");
+  let config = existsSync4(configPath) ? readFileSync2(configPath, "utf8") : "{}\n";
+  const originalConfig = config;
   const parseErrors = [];
   const parsed = parse2(config, parseErrors);
   if (parseErrors.length || !parsed || typeof parsed !== "object") {
@@ -2437,21 +2478,26 @@ export default plugin
   }
   const plugins = parsed.plugins ?? [];
   const loaderUrl = pathToFileURL(destination).href;
-  const legacyLoaderUrl = pathToFileURL(legacyDestination).href;
+  const legacyLoaderUrls = autoDestinations.map((path) => pathToFileURL(path).href);
   const entry = {
     package: loaderUrl,
     options: { pluginRoot: pluginRoot(env), stateDir: stateDirectory(env) }
   };
   const retained = plugins.filter((item) => {
-    if (item === loaderUrl || item === legacyLoaderUrl) return false;
-    return !(item && typeof item === "object" && "package" in item && [loaderUrl, legacyLoaderUrl].includes(String(item.package)));
+    if (item === loaderUrl || legacyLoaderUrls.includes(String(item))) return false;
+    return !(item && typeof item === "object" && "package" in item && [loaderUrl, ...legacyLoaderUrls].includes(String(item.package)));
   });
-  if (JSON.stringify(plugins) !== JSON.stringify([...retained, entry])) {
-    const edits = modify(config, ["plugins"], [...retained, entry], {
+  const updates = [
+    [["plugins"], [...retained, entry]],
+    [["default_agent"], "project-chat"]
+  ];
+  for (const [path, value] of updates) {
+    const edits = modify(config, path, value, {
       formattingOptions: { insertSpaces: true, tabSize: 2, eol: "\n" }
     });
-    writeFileSync(configPath, applyEdits(config, edits));
+    config = applyEdits(config, edits);
   }
+  if (config !== originalConfig) writeFileSync(configPath, config);
   return destination;
 }
 function lstatMaybe(path) {
@@ -2475,31 +2521,58 @@ function primaryWorkspace(root, herdr) {
   for (const workspace of herdr.workspaces()) {
     const provenance = workspace.worktree;
     if (provenance?.is_linked_worktree === false && provenance.checkout_path && canonical(String(provenance.checkout_path)) === root) {
-      return { workspaceId: String(workspace.workspace_id) };
+      const tabId = String(workspace.active_tab_id ?? "");
+      if (!tabId) throw new WorkflowError(`Primary workspace for ${root} has no active tab`);
+      return { workspaceId: String(workspace.workspace_id), replaceTabId: tabId };
     }
   }
   const opened = herdr.openWorktree(root, root, basename2(root));
-  return opened.alreadyOpen ? { workspaceId: opened.workspaceId } : { workspaceId: opened.workspaceId, bootstrapPaneId: opened.rootPaneId };
+  if (opened.alreadyOpen) {
+    const pane = herdr.panes(opened.workspaceId).find((candidate) => String(candidate.pane_id) === opened.rootPaneId);
+    const tabId = String(pane?.tab_id ?? "");
+    if (!tabId) throw new WorkflowError(`Primary workspace for ${root} has no root tab`);
+    return { workspaceId: opened.workspaceId, replaceTabId: tabId };
+  }
+  return { workspaceId: opened.workspaceId, bootstrapPaneId: opened.rootPaneId };
 }
-function openChat(root, options = {}) {
-  const herdr = new HerdrClient();
+async function openChat(root) {
   const canonicalRoot = canonical(root);
-  const workspace = primaryWorkspace(canonicalRoot, herdr);
-  herdr.openPluginPane("dispatcher-chat", {
-    cwd: canonicalRoot,
-    workspaceId: workspace.workspaceId,
-    placement: workspace.bootstrapPaneId ? "split" : "tab",
-    ...workspace.bootstrapPaneId ? { targetPane: workspace.bootstrapPaneId } : {},
-    focus: options.focus ?? true,
-    env: {
-      HERDR_PROJECT_ROOT: canonicalRoot,
-      HERDR_CHAT_TAB_LABEL: options.label ?? CHAT_TITLE,
-      ...options.sessionId ? { HERDR_CHAT_SESSION_ID: options.sessionId } : {}
+  const store = new StateStore();
+  const hub = store.hub(canonicalRoot);
+  if (hub) {
+    const hubHerdr = new HerdrClient(hub.herdrBin, hub.socketPath ?? void 0);
+    try {
+      if (hubHerdr.tabs().some((tab) => String(tab.tab_id) === hub.tabId)) {
+        hubHerdr.focusWorkspace(hub.workspaceId);
+        store.close();
+        return;
+      }
+    } catch {
     }
-  });
-  if (workspace.bootstrapPaneId) herdr.command(["pane", "close", workspace.bootstrapPaneId], false);
+    store.deleteHub(canonicalRoot);
+  }
+  try {
+    openCodeCli();
+    ensureCompanionInstalled();
+    await ensureProjectChatCapability(canonicalRoot);
+    const herdr = new HerdrClient();
+    const workspace = primaryWorkspace(canonicalRoot, herdr);
+    herdr.openPluginPane("dispatcher-chat", {
+      cwd: canonicalRoot,
+      workspaceId: workspace.workspaceId,
+      placement: workspace.bootstrapPaneId ? "split" : "tab",
+      ...workspace.bootstrapPaneId ? { targetPane: workspace.bootstrapPaneId } : {},
+      focus: true,
+      env: { HERDR_PROJECT_ROOT: canonicalRoot }
+    });
+    await store.waitForHub(canonicalRoot);
+    if (workspace.bootstrapPaneId) herdr.command(["pane", "close", workspace.bootstrapPaneId], false);
+    if (workspace.replaceTabId) herdr.closeTab(workspace.replaceTabId);
+  } finally {
+    store.close();
+  }
 }
-function chatCurrent() {
+async function chatCurrent() {
   const root = currentProjectRoot();
   if (!root) {
     const context = pluginContext();
@@ -2507,7 +2580,7 @@ function chatCurrent() {
     new HerdrClient().openPluginPane("dispatcher-picker", { cwd });
     return;
   }
-  openChat(root);
+  await openChat(root);
 }
 function discoverProjects(store = new StateStore(), projectsRoot = process.env.HERDR_PROJECTS_ROOT ?? resolve6(homedir4(), "Projects")) {
   const roots = new Set(store.repositories());
@@ -2533,52 +2606,37 @@ function fzf(rows, prompt2) {
   if (result.exitCode) throw new WorkflowError(result.stderr || "fzf failed");
   return result.stdout.trim();
 }
-function openChatPicker() {
+async function openChatPicker() {
   const projects = discoverProjects();
   if (!projects.length) throw new WorkflowError("No Git repositories found");
   const selection = fzf(projects.map((root) => `${basename2(root)}	${root}`).join("\n"), "project> ");
-  if (selection) openChat(selection.split("	").at(-1));
-}
-async function openChatHistory() {
-  const root = currentProjectRoot();
-  if (!root) throw new WorkflowError("Chat history requires a pane inside a Git project");
-  const sessions = await projectSessions(root);
-  if (!sessions.length) throw new WorkflowError("No previous project chats found");
-  const byId = new Map(sessions.map((session) => [session.id, session]));
-  const selection = fzf(sessions.map((session) => {
-    const date = new Date(session.time.updated).toLocaleString();
-    return `${session.title ?? "Untitled"}	${date}	${session.id}`;
-  }).join("\n"), "chat> ");
-  if (!selection) return;
-  const selected = byId.get(selection.split("	").at(-1));
-  if (!selected) throw new WorkflowError("Chat picker returned an invalid session");
-  const fork = await continueSession(selected.id, root);
-  openChat(root, { sessionId: fork.id, label: selected.title ?? CHAT_TITLE });
+  if (selection) await openChat(selection.split("	").at(-1));
 }
 async function runChatPane(env = process.env) {
   const root = canonical(env.HERDR_PROJECT_ROOT ?? "");
   if (primaryRepository(root) !== root) throw new WorkflowError(`Invalid Project Chat repository: ${root}`);
   const opencode = openCodeCli(env);
   ensureCompanionInstalled(env);
+  await ensureProjectChatCapability(root);
   const identity = currentHerdrIdentity(env);
-  const session = env.HERDR_CHAT_SESSION_ID ? { id: env.HERDR_CHAT_SESSION_ID } : await createSession(root, env.HERDR_CHAT_TAB_LABEL ?? CHAT_TITLE);
+  const session = await createSession(root, CHAT_TITLE);
   const store = new StateStore();
   store.rememberRepository(root);
-  store.registerChat({
-    sessionId: session.id,
+  store.registerHub({
     projectRoot: root,
     ...identity,
     herdrBin: env.HERDR_BIN_PATH ?? "herdr",
     socketPath: env.HERDR_SOCKET_PATH ?? null
   });
   const herdr = new HerdrClient();
-  herdr.renameTab(identity.tabId, env.HERDR_CHAT_TAB_LABEL ?? CHAT_TITLE);
-  const child = spawn2(opencode, [root, "--session", session.id], { stdio: "inherit", env });
+  const child = spawn2(opencode, [root, "--session", session.id, "--agent", "project-chat"], { stdio: "inherit", env });
   const exit = new Promise((resolvePromise, reject) => {
     child.once("error", (error) => reject(new WorkflowError(`Could not start opencode2: ${error.message}`)));
     child.once("close", (code) => resolvePromise(code ?? 1));
   });
   const exitCode = await exit;
+  store.deleteHub(root, identity.paneId);
+  store.close();
   if (exitCode !== 0) throw new WorkflowError(`opencode2 exited with status ${exitCode}`);
   return 0;
 }
@@ -2781,7 +2839,7 @@ function doctor() {
   const checks = [
     ["Node.js 24+", nodeMajor >= 24, true],
     ["herdr 0.8+", commandOk("herdr", "--version"), true],
-    [`opencode2 ${EXPECTED_OPENCODE_VERSION}`, openCodeOk(), true],
+    [`opencode2 preview (${openCodeLabel()})`, openCodeOk(), true],
     ["git", commandOk("git", "--version"), true],
     ["fzf", commandOk("fzf", "--version"), true],
     ["gh", commandOk("gh", "--version"), false],
@@ -2806,6 +2864,13 @@ function openCodeOk() {
     return true;
   } catch {
     return false;
+  }
+}
+function openCodeLabel() {
+  try {
+    return openCodeVersion();
+  } catch {
+    return "unavailable";
   }
 }
 
@@ -2946,28 +3011,31 @@ Request:
 ${request2}`;
 }
 async function dispatchImplementation(request2, store = new StateStore()) {
-  const chat = store.chat(request2.sourceSessionId);
-  if (!chat) throw new WorkflowError("This session is not a registered Herdr Project Chat");
+  const source = await getSession(request2.sourceSessionId);
+  const projectRoot = primaryRepository(source.location.directory);
+  if (!projectRoot) throw new WorkflowError("This OpenCode session is not inside a Git repository");
+  const hub = store.hub(projectRoot);
+  if (!hub) throw new WorkflowError("This repository does not have a registered Herdr Project Chat hub");
   const text = request2.request.trim();
   const target = request2.target.trim();
   if (!text || !target) throw new WorkflowError("Dispatch request and target must not be empty");
   if (!store.beginDispatch({
     sourceSessionId: request2.sourceSessionId,
     sourceMessageId: request2.sourceMessageId,
-    projectRoot: chat.projectRoot,
+    projectRoot,
     request: "",
     targetKind: request2.targetKind,
     targetValue: target
   })) {
     throw new WorkflowError("This dispatch turn has already been accepted; do not retry it");
   }
-  const herdr = new HerdrClient(chat.herdrBin, chat.socketPath ?? void 0);
+  const herdr = new HerdrClient(hub.herdrBin, hub.socketPath ?? void 0);
   let implementationSessionId;
   let prepared;
   let promptStarted = false;
   try {
     prepared = prepareTarget({
-      repoRoot: chat.projectRoot,
+      repoRoot: projectRoot,
       target: { kind: request2.targetKind, value: target },
       store,
       herdr
@@ -2984,6 +3052,7 @@ async function dispatchImplementation(request2, store = new StateStore()) {
       implementationSessionId: fork.id
     });
     await prepareImplementationSession(fork.id, prepared.checkoutPath);
+    await renameSession(fork.id, source.title?.trim() || prepared.branch);
     herdr.launchOpenCode(prepared.rootPaneId, prepared.checkoutPath, fork.id);
     await promptSession(fork.id, handoff(prepared.checkoutPath, text), () => {
       promptStarted = true;
@@ -3015,15 +3084,17 @@ async function dispatchImplementation(request2, store = new StateStore()) {
   }
   try {
     herdr.openPluginPane("dispatcher-chat", {
-      cwd: chat.projectRoot,
-      workspaceId: chat.workspaceId,
+      cwd: projectRoot,
+      workspaceId: hub.workspaceId,
       placement: "tab",
       focus: false,
-      env: { HERDR_PROJECT_ROOT: chat.projectRoot }
+      env: { HERDR_PROJECT_ROOT: projectRoot }
     });
-    herdr.closeTab(chat.tabId);
+    await store.waitForHub(projectRoot, hub.paneId);
+    herdr.closeTab(hub.tabId);
+    await removeSession(request2.sourceSessionId);
   } catch (error) {
-    herdr.notify("Dispatch cleanup incomplete", `Implementation started, but Project Chat reset failed: ${error}. Do not redispatch.`);
+    herdr.notify("Project Chat handoff incomplete", `Implementation started, but the dispatched Project Chat could not be replaced: ${error}`);
   }
   return `Implementation started in ${prepared.branch} at ${prepared.checkoutPath}. Do not dispatch this request again.`;
 }
@@ -3094,6 +3165,7 @@ async function main(args = process.argv.slice(2)) {
   const store = new StateStore();
   if (command === "startup") {
     ensureCompanionInstalled();
+    await ensureProjectChatCapability();
     return retryCleanup(store);
   }
   if (command === "event") return handleCleanupEvent(store);
@@ -3126,15 +3198,11 @@ ${cleanupReport(store)}`);
     return 0;
   }
   if (command === "chat-current") {
-    chatCurrent();
+    await chatCurrent();
     return 0;
   }
   if (command === "chat-picker") {
-    openChatPicker();
-    return 0;
-  }
-  if (command === "chat-history") {
-    await openChatHistory();
+    await openChatPicker();
     return 0;
   }
   if (command === "run-chat") return await runChatPane();

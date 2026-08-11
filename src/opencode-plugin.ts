@@ -1,6 +1,6 @@
 import { spawn } from "node:child_process"
 import { resolve } from "node:path"
-import { Plugin } from "@opencode-ai/plugin"
+import type { Plugin } from "@opencode-ai/plugin"
 
 const SYSTEM = `You are Project Chat for the current repository. Discuss requirements, inspect code, review, and plan without changing files or running shell commands.
 
@@ -25,7 +25,7 @@ function executeDispatch(options: { pluginRoot: string; stateDir: string }, inpu
   })
 }
 
-export default Plugin.define({
+const plugin: Plugin.Plugin = {
   id: "wheels.dev-workflow",
   setup: async (ctx) => {
     const raw = ctx.options as Record<string, unknown>
@@ -47,6 +47,7 @@ export default Plugin.define({
           { action: "dispatch_implementation", resource: "*", effect: "allow" },
         )
       })
+      agents.default("project-chat")
     })
     await ctx.tool.transform((tools) => {
       tools.add({
@@ -73,4 +74,6 @@ export default Plugin.define({
       })
     })
   },
-})
+}
+
+export default plugin

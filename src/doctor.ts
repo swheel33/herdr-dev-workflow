@@ -1,12 +1,12 @@
 import { executable, run } from "./process.js"
-import { EXPECTED_OPENCODE_VERSION, openCodeCli } from "./opencode.js"
+import { openCodeCli, openCodeVersion } from "./opencode.js"
 
 export function doctor(): number {
   const nodeMajor = Number(process.versions.node.split(".")[0])
   const checks: Array<[string, boolean, boolean]> = [
     ["Node.js 24+", nodeMajor >= 24, true],
     ["herdr 0.8+", commandOk("herdr", "--version"), true],
-    [`opencode2 ${EXPECTED_OPENCODE_VERSION}`, openCodeOk(), true],
+    [`opencode2 preview (${openCodeLabel()})`, openCodeOk(), true],
     ["git", commandOk("git", "--version"), true],
     ["fzf", commandOk("fzf", "--version"), true],
     ["gh", commandOk("gh", "--version"), false],
@@ -25,4 +25,8 @@ function commandOk(command: string, argument: string): boolean {
 
 function openCodeOk(): boolean {
   try { openCodeCli(); return true } catch { return false }
+}
+
+function openCodeLabel(): string {
+  try { return openCodeVersion() } catch { return "unavailable" }
 }

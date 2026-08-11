@@ -1,6 +1,7 @@
 import { WorkflowError } from "./errors.js"
+import { primaryRepository } from "./git.js"
 import { HerdrClient } from "./herdr.js"
-import { forkSession, prepareImplementationSession, promptSession } from "./opencode.js"
+import { forkSession, getSession, prepareImplementationSession, promptSession, removeSession, renameSession } from "./opencode.js"
 import { StateStore, type TargetKind } from "./state.js"
 import { prepareTarget } from "./worktrees.js"
 
@@ -22,15 +23,18 @@ ${request}`
 }
 
 export async function dispatchImplementation(request: DispatchRequest, store = new StateStore()): Promise<string> {
-  const chat = store.chat(request.sourceSessionId)
-  if (!chat) throw new WorkflowError("This session is not a registered Herdr Project Chat")
+  const source = await getSession(request.sourceSessionId)
+  const projectRoot = primaryRepository(source.location.directory)
+  if (!projectRoot) throw new WorkflowError("This OpenCode session is not inside a Git repository")
+  const hub = store.hub(projectRoot)
+  if (!hub) throw new WorkflowError("This repository does not have a registered Herdr Project Chat hub")
   const text = request.request.trim()
   const target = request.target.trim()
   if (!text || !target) throw new WorkflowError("Dispatch request and target must not be empty")
   if (!store.beginDispatch({
     sourceSessionId: request.sourceSessionId,
     sourceMessageId: request.sourceMessageId,
-    projectRoot: chat.projectRoot,
+    projectRoot,
     request: "",
     targetKind: request.targetKind,
     targetValue: target,
@@ -38,13 +42,13 @@ export async function dispatchImplementation(request: DispatchRequest, store = n
     throw new WorkflowError("This dispatch turn has already been accepted; do not retry it")
   }
 
-  const herdr = new HerdrClient(chat.herdrBin, chat.socketPath ?? undefined)
+  const herdr = new HerdrClient(hub.herdrBin, hub.socketPath ?? undefined)
   let implementationSessionId: string | undefined
   let prepared: ReturnType<typeof prepareTarget> | undefined
   let promptStarted = false
   try {
     prepared = prepareTarget({
-      repoRoot: chat.projectRoot,
+      repoRoot: projectRoot,
       target: { kind: request.targetKind, value: target },
       store,
       herdr,
@@ -61,6 +65,7 @@ export async function dispatchImplementation(request: DispatchRequest, store = n
       implementationSessionId: fork.id,
     })
     await prepareImplementationSession(fork.id, prepared.checkoutPath)
+    await renameSession(fork.id, source.title?.trim() || prepared.branch)
     herdr.launchOpenCode(prepared.rootPaneId, prepared.checkoutPath, fork.id)
     await promptSession(fork.id, handoff(prepared.checkoutPath, text), () => { promptStarted = true })
     try {
@@ -90,15 +95,17 @@ export async function dispatchImplementation(request: DispatchRequest, store = n
 
   try {
     herdr.openPluginPane("dispatcher-chat", {
-      cwd: chat.projectRoot,
-      workspaceId: chat.workspaceId,
+      cwd: projectRoot,
+      workspaceId: hub.workspaceId,
       placement: "tab",
       focus: false,
-      env: { HERDR_PROJECT_ROOT: chat.projectRoot },
+      env: { HERDR_PROJECT_ROOT: projectRoot },
     })
-    herdr.closeTab(chat.tabId)
+    await store.waitForHub(projectRoot, hub.paneId)
+    herdr.closeTab(hub.tabId)
+    await removeSession(request.sourceSessionId)
   } catch (error) {
-    herdr.notify("Dispatch cleanup incomplete", `Implementation started, but Project Chat reset failed: ${error}. Do not redispatch.`)
+    herdr.notify("Project Chat handoff incomplete", `Implementation started, but the dispatched Project Chat could not be replaced: ${error}`)
   }
   return `Implementation started in ${prepared!.branch} at ${prepared!.checkoutPath}. Do not dispatch this request again.`
 }

@@ -45,10 +45,19 @@ export class HerdrClient {
     return Array.isArray(result.panes) ? result.panes.map(object) : []
   }
 
+  tabs(): JsonObject[] {
+    const result = this.json(["tab", "list"])
+    return Array.isArray(result.tabs) ? result.tabs.map(object) : []
+  }
+
   runningSessionCount(): number {
     const result = this.json(["session", "list", "--json"])
     const sessions = Array.isArray(result.sessions) ? result.sessions.map(object) : []
     return sessions.filter((session) => session.running === true).length
+  }
+
+  focusWorkspace(workspaceId: string): void {
+    this.command(["workspace", "focus", workspaceId])
   }
 
   openWorktree(repo: string, checkout: string, label: string): { workspaceId: string; rootPaneId: string; alreadyOpen: boolean } {
@@ -77,7 +86,7 @@ export class HerdrClient {
   }
 
   launchOpenCode(paneId: string, checkout: string, sessionId: string): void {
-    this.runInPane(paneId, `exec ${shellQuote(openCodeCli())} ${shellQuote(checkout)} --session ${shellQuote(sessionId)}`)
+    this.runInPane(paneId, `exec ${shellQuote(openCodeCli())} ${shellQuote(checkout)} --session ${shellQuote(sessionId)} --agent build`)
   }
 
   runInstall(paneId: string, checkout: string): void {
@@ -93,10 +102,6 @@ export class HerdrClient {
 
   closeTab(tabId: string): void {
     this.command(["tab", "close", tabId])
-  }
-
-  renameTab(tabId: string, title: string): void {
-    this.command(["tab", "rename", tabId, title.slice(0, 48)])
   }
 
   openPluginPane(entrypoint: string, options: {

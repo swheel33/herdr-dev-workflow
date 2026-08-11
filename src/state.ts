@@ -7,8 +7,7 @@ export type CleanupPhase = "validate" | "remote" | "checkout" | "branch" | "prun
 export type DispatchStatus = "preparing" | "delivered" | "delivery_unknown"
 export type TargetKind = "new" | "branch" | "pr"
 
-export interface ChatContext {
-  sessionId: string
+export interface ProjectHub {
   projectRoot: string
   paneId: string
   tabId: string
@@ -95,9 +94,9 @@ CREATE TABLE IF NOT EXISTS dispatches (
   updated_at INTEGER NOT NULL,
   PRIMARY KEY(source_session_id, source_message_id)
 );
-CREATE TABLE IF NOT EXISTS project_chats (
-  session_id TEXT PRIMARY KEY,
-  project_root TEXT NOT NULL,
+DROP TABLE IF EXISTS project_chats;
+CREATE TABLE IF NOT EXISTS project_hubs (
+  project_root TEXT PRIMARY KEY,
   pane_id TEXT NOT NULL,
   tab_id TEXT NOT NULL,
   workspace_id TEXT NOT NULL,
@@ -174,13 +173,12 @@ export class StateStore {
     return this.database.prepare("SELECT root FROM repositories ORDER BY root").all().map((row) => String(row.root))
   }
 
-  registerChat(context: ChatContext): void {
+  registerHub(context: ProjectHub): void {
     this.database.prepare(`
-      INSERT OR REPLACE INTO project_chats(
-        session_id, project_root, pane_id, tab_id, workspace_id, herdr_bin, socket_path, created_at
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+      INSERT OR REPLACE INTO project_hubs(
+        project_root, pane_id, tab_id, workspace_id, herdr_bin, socket_path, created_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?)
     `).run(
-      context.sessionId,
       canonical(context.projectRoot),
       context.paneId,
       context.tabId,
@@ -191,11 +189,10 @@ export class StateStore {
     )
   }
 
-  chat(sessionId: string): ChatContext | null {
-    const row = this.database.prepare("SELECT * FROM project_chats WHERE session_id = ?").get(sessionId)
+  hub(projectRoot: string): ProjectHub | null {
+    const row = this.database.prepare("SELECT * FROM project_hubs WHERE project_root = ?").get(canonical(projectRoot))
     if (!row) return null
     return {
-      sessionId: String(row.session_id),
       projectRoot: String(row.project_root),
       paneId: String(row.pane_id),
       tabId: String(row.tab_id),
@@ -203,6 +200,23 @@ export class StateStore {
       herdrBin: String(row.herdr_bin),
       socketPath: row.socket_path === null ? null : String(row.socket_path),
     }
+  }
+
+  async waitForHub(projectRoot: string, previousPaneId?: string, timeout = 10_000): Promise<ProjectHub> {
+    const deadline = Date.now() + timeout
+    do {
+      const hub = this.hub(projectRoot)
+      if (hub && hub.paneId !== previousPaneId) return hub
+      await new Promise((resolvePromise) => setTimeout(resolvePromise, 100))
+    } while (Date.now() < deadline)
+    throw new Error(`Project Chat hub did not start for ${canonical(projectRoot)}`)
+  }
+
+  deleteHub(projectRoot: string, paneId?: string): void {
+    const query = paneId
+      ? "DELETE FROM project_hubs WHERE project_root = ? AND pane_id = ?"
+      : "DELETE FROM project_hubs WHERE project_root = ?"
+    this.database.prepare(query).run(...(paneId ? [canonical(projectRoot), paneId] : [canonical(projectRoot)]))
   }
 
   beginDispatch(input: {

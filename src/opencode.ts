@@ -15,8 +15,6 @@ export interface SessionInfo {
   time: { created: number; updated: number; archived?: number }
 }
 
-export const EXPECTED_OPENCODE_VERSION = "0.0.0-next-17189"
-
 interface ServiceInfo {
   url: string
   password?: string
@@ -36,42 +34,78 @@ function readService(): ServiceInfo | null {
   }
 }
 
-async function service(): Promise<ServiceInfo> {
-  let info = readService()
-  if (info?.version && info.version !== EXPECTED_OPENCODE_VERSION) {
-    throw new WorkflowError(`OpenCode service version ${info.version} does not match required ${EXPECTED_OPENCODE_VERSION}`)
-  }
-  if (info) {
-    try {
-      await requestWithService(info, "GET", "/api/health", undefined, 5_000)
-      return info
-    } catch {
-      info = null
-    }
-  }
-  const binary = openCodeCli()
-  run([binary, "service", "start"])
-  const deadline = Date.now() + 30_000
-  while (!(info = readService()) && Date.now() < deadline) {
-    await new Promise((resolvePromise) => setTimeout(resolvePromise, 100))
-  }
-  if (!info) throw new WorkflowError("OpenCode 2 background service did not start")
-  if (info.version && info.version !== EXPECTED_OPENCODE_VERSION) {
-    throw new WorkflowError(`OpenCode service version ${info.version} does not match required ${EXPECTED_OPENCODE_VERSION}`)
-  }
-  await requestWithService(info, "GET", "/api/health", undefined, 5_000)
-  return info
-}
-
-export function openCodeCli(env: NodeJS.ProcessEnv = process.env): string {
+function cliIdentity(env: NodeJS.ProcessEnv = process.env): { binary: string; version: string } {
   const binary = executable("opencode2", env)
   const result = run([binary, "--version"], { check: false, env })
   const version = result.stdout.match(/0\.0\.0-next-\d+/)?.[0]
-  if (result.exitCode !== 0 || version !== EXPECTED_OPENCODE_VERSION) {
+  if (result.exitCode !== 0 || !version) {
     const detail = result.stderr.trim() || result.stdout.trim() || `exit ${result.exitCode}`
-    throw new WorkflowError(`OpenCode CLI must be ${EXPECTED_OPENCODE_VERSION}; ${detail}`)
+    throw new WorkflowError(`OpenCode 2 CLI is not executable: ${detail}`)
   }
-  return binary
+  return { binary, version }
+}
+
+async function healthy(info: ServiceInfo): Promise<boolean> {
+  try {
+    await requestWithService(info, "GET", "/api/health", undefined, 5_000)
+    return true
+  } catch {
+    return false
+  }
+}
+
+async function service(): Promise<ServiceInfo> {
+  const cli = cliIdentity()
+  let info = readService()
+  if (info?.version === cli.version && await healthy(info)) return info
+
+  run([cli.binary, "service", info ? "restart" : "start"])
+  const deadline = Date.now() + 30_000
+  while (Date.now() < deadline) {
+    info = readService()
+    if (info?.version === cli.version && await healthy(info)) return info
+    await new Promise((resolvePromise) => setTimeout(resolvePromise, 100))
+  }
+  const actual = info?.version ?? "missing"
+  throw new WorkflowError(`OpenCode 2 service did not become healthy on CLI version ${cli.version} (service: ${actual})`)
+}
+
+export function openCodeCli(env: NodeJS.ProcessEnv = process.env): string {
+  return cliIdentity(env).binary
+}
+
+export function openCodeVersion(env: NodeJS.ProcessEnv = process.env): string {
+  return cliIdentity(env).version
+}
+
+async function projectChatAvailable(directory: string): Promise<boolean> {
+  try {
+    const query = new URLSearchParams({ "location[directory]": directory })
+    const response = await request<{ data: { id: string; permissions?: Array<{ action?: string }> } }>("GET", `/api/agent/project-chat?${query}`)
+    return response.data.id === "project-chat"
+      && response.data.permissions?.some((permission) => permission.action === "dispatch_implementation") === true
+  } catch {
+    return false
+  }
+}
+
+async function waitForProjectChat(directory: string, timeout: number): Promise<boolean> {
+  const deadline = Date.now() + timeout
+  do {
+    if (await projectChatAvailable(directory)) return true
+    await new Promise((resolvePromise) => setTimeout(resolvePromise, 100))
+  } while (Date.now() < deadline)
+  return false
+}
+
+export async function ensureProjectChatCapability(directory = process.cwd()): Promise<void> {
+  if (await waitForProjectChat(directory, 2_000)) return
+  const cli = cliIdentity()
+  run([cli.binary, "service", "restart"])
+  await service()
+  if (!await waitForProjectChat(directory, 10_000)) {
+    throw new WorkflowError("OpenCode loaded without the project-chat agent or dispatch_implementation tool")
+  }
 }
 
 async function requestWithService<T>(info: ServiceInfo, method: string, path: string, body?: unknown, timeout = 30_000): Promise<T> {
@@ -92,8 +126,13 @@ async function request<T>(method: string, path: string, body?: unknown): Promise
   return await requestWithService<T>(await service(), method, path, body)
 }
 
-export async function createSession(directory: string, title = "New Chat"): Promise<SessionInfo> {
-  const response = await request<{ data: SessionInfo }>("POST", "/api/session", { title, agent: "project-chat", location: { directory } })
+export async function createSession(directory: string, title = "Project Chat"): Promise<SessionInfo> {
+  const response = await request<{ data: SessionInfo }>("POST", "/api/session", {
+    title,
+    agent: "project-chat",
+    location: { directory },
+  })
+  await request("POST", `/api/session/${encodeURIComponent(response.data.id)}/agent`, { agent: "project-chat" })
   return response.data
 }
 
@@ -104,14 +143,13 @@ export async function forkSession(sourceSessionId: string, sourceMessageId: stri
   return response.data
 }
 
-export async function continueSession(sourceSessionId: string, directory: string): Promise<SessionInfo> {
-  const response = await request<{ data: SessionInfo }>("POST", `/api/session/${encodeURIComponent(sourceSessionId)}/fork`, {
-    boundary: { type: "through" },
-  })
-  const fork = response.data
-  await request("POST", `/api/session/${encodeURIComponent(fork.id)}/move`, { directory })
-  await request("POST", `/api/session/${encodeURIComponent(fork.id)}/agent`, { agent: "project-chat" })
-  return fork
+export async function getSession(sessionId: string): Promise<SessionInfo> {
+  const response = await request<{ data: SessionInfo }>("GET", `/api/session/${encodeURIComponent(sessionId)}`)
+  return response.data
+}
+
+export async function renameSession(sessionId: string, title: string): Promise<void> {
+  await request("POST", `/api/session/${encodeURIComponent(sessionId)}/rename`, { title })
 }
 
 export async function prepareImplementationSession(sessionId: string, directory: string): Promise<void> {
@@ -127,19 +165,4 @@ export async function promptSession(sessionId: string, text: string, onAttempt?:
 
 export async function removeSession(sessionId: string): Promise<void> {
   await request("DELETE", `/api/session/${encodeURIComponent(sessionId)}`)
-}
-
-export async function projectSessions(directory: string): Promise<SessionInfo[]> {
-  const locationQuery = new URLSearchParams({ "location[directory]": directory })
-  const location = await request<{ project: { id: string } }>("GET", `/api/location?${locationQuery}`)
-  const sessions: SessionInfo[] = []
-  let cursor: string | undefined
-  do {
-    const query = new URLSearchParams({ project: location.project.id, order: "desc", limit: "100" })
-    if (cursor) query.set("cursor", cursor)
-    const page = await request<{ data: SessionInfo[]; cursor: { next?: string } }>("GET", `/api/session?${query}`)
-    sessions.push(...page.data)
-    cursor = page.cursor.next
-  } while (cursor)
-  return sessions
 }

@@ -7,7 +7,7 @@ dispatch, disposable Git worktrees, and durable cleanup.
 
 - Herdr 0.8.0 or newer
 - Node.js 24 or newer
-- `git`, `opencode2` preview 17189, and `fzf`
+- `git`, the `opencode2` preview, and `fzf`
 - `pnpm` to bootstrap implementation worktrees
 - `gh` for GitHub project creation, pull-request targets, and merged-PR cleanup
 - `nvim` and `lazygit` for their optional actions
@@ -15,7 +15,8 @@ dispatch, disposable Git worktrees, and durable cleanup.
 Install the OpenCode 2 preview alongside OpenCode V1:
 
 ```bash
-pnpm add -g --allow-build=@opencode-ai/cli @opencode-ai/cli@0.0.0-next-17189
+pnpm add -g @opencode-ai/cli
+pnpm approve-builds -g
 ```
 
 ## Installation
@@ -37,7 +38,9 @@ herdr plugin link /path/to/herdr-dev-workflow --enabled
 The Herdr startup hook creates the private SQLite database and installs a small,
 managed OpenCode loader under `~/.config/opencode/plugins`. It adds that loader
 to the V2 `plugins` array while preserving JSONC formatting and existing plugin
-entries. There is no separate companion-plugin installation.
+entries. There is no separate companion-plugin installation. OpenCode preview
+updates remain enabled; the plugin restarts a stale background service when its
+version differs from the installed CLI.
 
 ## Project Chat
 
@@ -46,16 +49,17 @@ review. Its OpenCode agent denies edits, shell commands, and subagents while
 retaining normal read, search, web, MCP, model, credential, and provider
 configuration.
 
-Chat actions:
-
-- **Project Chat** resolves the focused checkout back to its primary repository.
-  Outside a Git checkout it opens the project picker under
-  `HERDR_PROJECTS_ROOT`, defaulting to `~/Projects`.
-- **History** searches the current project's native OpenCode session history and
-  forks the selected context into a new Project Chat.
+**Project Chat** resolves the focused checkout back to its primary repository.
+Outside a Git checkout it opens the project picker under `HERDR_PROJECTS_ROOT`,
+defaulting to `~/Projects`. The primary-checkout workspace itself is the
+persistent Project Chat hub: selecting the primary branch in Herdr opens the
+full OpenCode UI, and OpenCode's native tabs and session list own chat creation
+and history. Invoking the action again focuses that primary workspace. Linked
+branch workspaces retain the 70/30 OpenCode Build and shell layout.
 
 OpenCode remains authoritative for messages, attachments, compaction, session
-lineage, and history. The plugin never exports or copies transcripts.
+lineage, model selection, provider selection, and history. The plugin never
+exports or copies transcripts.
 
 ## Dispatch
 
@@ -77,14 +81,18 @@ a 30% shell. Matching `apps/*/.env` files are symlinked from the primary
 checkout, and `pnpm install` starts in the shell pane.
 
 The source session is forked with a native `before` boundary, moved to the
-target checkout, switched to Build, and prompted through the V2 HTTP API. The
-prompt request is the delivery boundary:
+target checkout, switched to Build, renamed to the conversation title, and
+prompted through the V2 HTTP API. After confirmed delivery, the hub receives a
+fresh Project Chat and the original session is deleted. The implementation fork
+therefore becomes the single native-history record containing the preceding
+conversation and complete handoff. The prompt request is the delivery boundary:
 
 - Before the prompt request begins, a failure is retryable. Any worktree,
   workspace, branch, or fork already created is deliberately preserved for
   inspection instead of being rolled back.
-- After the request begins, replacement-chat and bookkeeping failures are
-  warnings and never cause a second implementation prompt.
+- After confirmed delivery, replacement-chat, original-session deletion, and
+  bookkeeping failures are warnings and never cause a second implementation
+  prompt.
 - If the prompt request starts but its response is lost or times out, delivery is
   recorded as unknown and the implementation workspace is preserved. The same
   source turn remains non-retryable to prevent duplicate implementation.
@@ -153,7 +161,7 @@ $HERDR_PLUGIN_STATE_DIR/workflow.sqlite
 ```
 
 The database stores dispatch receipts, managed-target ownership, cleanup jobs,
-Project Chat pane mappings, auto-prune blocks, repository discovery, and bounded
+Project Chat hub mappings, auto-prune blocks, repository discovery, and bounded
 diagnostic messages. It does not store prompts, transcripts, or OpenCode
 history. SQLite failures stop destructive work rather than falling back to
 guessed state.

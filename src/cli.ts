@@ -1,12 +1,13 @@
 import { scanMerged, watchMerged } from "./auto-prune.js"
 import { readSync } from "node:fs"
-import { chatCurrent, ensureCompanionInstalled, openChatHistory, openChatPicker, runChatPane } from "./chat.js"
+import { chatCurrent, ensureCompanionInstalled, openChatPicker, runChatPane } from "./chat.js"
 import { cleanupReport, handleCleanupEvent, retryCleanup } from "./cleanup.js"
 import { doctor } from "./doctor.js"
 import { dispatchImplementation } from "./dispatch.js"
 import { WorkflowError } from "./errors.js"
 import { HerdrClient, pluginContext } from "./herdr.js"
 import { interactiveBlankProject } from "./projects.js"
+import { ensureProjectChatCapability } from "./opencode.js"
 import { StateStore } from "./state.js"
 
 async function main(args = process.argv.slice(2)): Promise<number> {
@@ -14,6 +15,7 @@ async function main(args = process.argv.slice(2)): Promise<number> {
   const store = new StateStore()
   if (command === "startup") {
     ensureCompanionInstalled()
+    await ensureProjectChatCapability()
     return retryCleanup(store)
   }
   if (command === "event") return handleCleanupEvent(store)
@@ -36,9 +38,8 @@ async function main(args = process.argv.slice(2)): Promise<number> {
   }
   if (command === "scan-merged") { console.log(JSON.stringify(scanMerged(store))); return 0 }
   if (command === "watch-merged") { await watchMerged(store); return 0 }
-  if (command === "chat-current") { chatCurrent(); return 0 }
-  if (command === "chat-picker") { openChatPicker(); return 0 }
-  if (command === "chat-history") { await openChatHistory(); return 0 }
+  if (command === "chat-current") { await chatCurrent(); return 0 }
+  if (command === "chat-picker") { await openChatPicker(); return 0 }
   if (command === "run-chat") return await runChatPane()
   if (command === "dispatch-tool") {
     const chunks: Buffer[] = []

@@ -18,12 +18,6 @@ contexts = ["workspace"]
 command = ["bash", "-lc", "exec node \"$HERDR_PLUGIN_ROOT/dist/cli.mjs\" chat-current"]
 
 [[actions]]
-id = "chat-history"
-title = "History"
-contexts = ["workspace"]
-command = ["bash", "-lc", "exec node \"$HERDR_PLUGIN_ROOT/dist/cli.mjs\" open-pane dispatcher-history"]
-
-[[actions]]
 id = "workflow-status"
 title = "Workflow Status"
 contexts = ["workspace"]
@@ -76,14 +70,6 @@ placement = "popup"
 width = "80%"
 height = "70%"
 command = ["bash", "-lc", "exec node \"$HERDR_PLUGIN_ROOT/dist/cli.mjs\" chat-picker"]
-
-[[panes]]
-id = "dispatcher-history"
-title = "History"
-placement = "popup"
-width = "90%"
-height = "75%"
-command = ["bash", "-lc", "exec node \"$HERDR_PLUGIN_ROOT/dist/cli.mjs\" chat-history"]
 
 [[panes]]
 id = "workflow-status"

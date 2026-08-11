@@ -11,12 +11,6 @@ command = "wheels.dev-workflow.chat-current"
 description = "project chat"
 
 [[keys.command]]
-key = "prefix+c"
-type = "plugin_action"
-command = "wheels.dev-workflow.chat-history"
-description = "history"
-
-[[keys.command]]
 key = "prefix+s"
 type = "plugin_action"
 command = "wheels.dev-workflow.workflow-status"
@@ -36,6 +30,7 @@ description = "nvim"
 
 [ui]
 agent_panel_sort = "spaces"
+hide_tab_bar_when_single_tab = true
 
 [ui.sidebar.agents]
 row_gap = 0
