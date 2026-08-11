@@ -1,5 +1,5 @@
 import { WorkflowError } from "./errors.js"
-import { openCodeCli } from "./opencode.js"
+import { openCodeCli, openCodeEnvironment } from "./opencode.js"
 import { run, shellQuote } from "./process.js"
 
 type JsonObject = Record<string, unknown>
@@ -86,7 +86,8 @@ export class HerdrClient {
   }
 
   launchOpenCode(paneId: string, checkout: string, sessionId: string): void {
-    this.runInPane(paneId, `exec ${shellQuote(openCodeCli())} ${shellQuote(checkout)} --session ${shellQuote(sessionId)} --agent build`)
+    const env = openCodeEnvironment()
+    this.runInPane(paneId, `exec env XDG_DATA_HOME=${shellQuote(env.XDG_DATA_HOME!)} XDG_STATE_HOME=${shellQuote(env.XDG_STATE_HOME!)} ${shellQuote(openCodeCli())} ${shellQuote(checkout)} --session ${shellQuote(sessionId)}`)
   }
 
   runInstall(paneId: string, checkout: string): void {
@@ -109,6 +110,7 @@ export class HerdrClient {
     workspaceId?: string
     placement?: "tab" | "split"
     targetPane?: string
+    direction?: "right" | "down"
     focus?: boolean
     env?: Record<string, string>
   }): JsonObject {
@@ -116,9 +118,10 @@ export class HerdrClient {
       "plugin", "pane", "open", "--plugin", process.env.HERDR_PLUGIN_ID ?? "wheels.dev-workflow",
       "--entrypoint", entrypoint, "--cwd", options.cwd,
     ]
-    if (options.workspaceId) args.push("--workspace", options.workspaceId)
+    if (options.workspaceId && !options.targetPane) args.push("--workspace", options.workspaceId)
     if (options.placement) args.push("--placement", options.placement)
     if (options.targetPane) args.push("--target-pane", options.targetPane)
+    if (options.direction) args.push("--direction", options.direction)
     for (const [key, value] of Object.entries(options.env ?? {})) args.push("--env", `${key}=${value}`)
     args.push(options.focus === false ? "--no-focus" : "--focus")
     return this.json(args)

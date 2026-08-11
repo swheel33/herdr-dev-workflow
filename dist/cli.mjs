@@ -319,20 +319,28 @@ function synchronizeDefaultBranch(repo) {
 import { readFileSync } from "node:fs";
 import { homedir as homedir3 } from "node:os";
 import { resolve as resolve4 } from "node:path";
-function servicePath() {
-  return resolve4(process.env.XDG_STATE_HOME ?? resolve4(homedir3(), ".local/state"), "opencode/service.json");
+function openCodeEnvironment(env = process.env) {
+  return {
+    ...env,
+    XDG_DATA_HOME: env.OPENCODE2_DATA_HOME ?? resolve4(homedir3(), ".local/share/opencode2"),
+    XDG_STATE_HOME: env.OPENCODE2_STATE_HOME ?? resolve4(homedir3(), ".local/state/opencode2")
+  };
 }
-function readService() {
+function servicePath(env = process.env) {
+  return resolve4(openCodeEnvironment(env).XDG_STATE_HOME, "opencode/service.json");
+}
+function readService(env = process.env) {
   try {
-    const parsed = JSON.parse(readFileSync(servicePath(), "utf8"));
+    const parsed = JSON.parse(readFileSync(servicePath(env), "utf8"));
     return parsed.url ? parsed : null;
   } catch {
     return null;
   }
 }
 function cliIdentity(env = process.env) {
+  const previewEnv = openCodeEnvironment(env);
   const binary = executable("opencode2", env);
-  const result = run([binary, "--version"], { check: false, env });
+  const result = run([binary, "--version"], { check: false, env: previewEnv });
   const version = result.stdout.match(/0\.0\.0-next-\d+/)?.[0];
   if (result.exitCode !== 0 || !version) {
     const detail = result.stderr.trim() || result.stdout.trim() || `exit ${result.exitCode}`;
@@ -348,14 +356,15 @@ async function healthy(info) {
     return false;
   }
 }
-async function service() {
-  const cli = cliIdentity();
-  let info = readService();
+async function service(env = process.env) {
+  const previewEnv = openCodeEnvironment(env);
+  const cli = cliIdentity(env);
+  let info = readService(env);
   if (info?.version === cli.version && await healthy(info)) return info;
-  run([cli.binary, "service", info ? "restart" : "start"]);
+  run([cli.binary, "service", info ? "restart" : "start"], { env: previewEnv });
   const deadline = Date.now() + 3e4;
   while (Date.now() < deadline) {
-    info = readService();
+    info = readService(env);
     if (info?.version === cli.version && await healthy(info)) return info;
     await new Promise((resolvePromise) => setTimeout(resolvePromise, 100));
   }
@@ -368,31 +377,39 @@ function openCodeCli(env = process.env) {
 function openCodeVersion(env = process.env) {
   return cliIdentity(env).version;
 }
-async function projectChatAvailable(directory) {
+async function projectChatAvailable(directory, env) {
   try {
     const query = new URLSearchParams({ "location[directory]": directory });
-    const response = await request("GET", `/api/agent/project-chat?${query}`);
+    const response = await request("GET", `/api/agent/project-chat?${query}`, void 0, env);
     return response.data.id === "project-chat" && response.data.permissions?.some((permission) => permission.action === "dispatch_implementation") === true;
   } catch {
     return false;
   }
 }
-async function waitForProjectChat(directory, timeout) {
+async function waitForProjectChat(directory, timeout, env) {
   const deadline = Date.now() + timeout;
   do {
-    if (await projectChatAvailable(directory)) return true;
+    if (await projectChatAvailable(directory, env)) return true;
     await new Promise((resolvePromise) => setTimeout(resolvePromise, 100));
   } while (Date.now() < deadline);
   return false;
 }
-async function ensureProjectChatCapability(directory = process.cwd()) {
-  if (await waitForProjectChat(directory, 2e3)) return;
-  const cli = cliIdentity();
-  run([cli.binary, "service", "restart"]);
-  await service();
-  if (!await waitForProjectChat(directory, 1e4)) {
+async function ensureProjectChatCapability(directory = process.cwd(), env = process.env) {
+  if (await waitForProjectChat(directory, 2e3, env)) return;
+  const cli = cliIdentity(env);
+  run([cli.binary, "service", "restart"], { env: openCodeEnvironment(env) });
+  await service(env);
+  if (!await waitForProjectChat(directory, 1e4, env)) {
     throw new WorkflowError("OpenCode loaded without the project-chat agent or dispatch_implementation tool");
   }
+}
+async function ensureOpenCodeReady(directory = process.cwd(), env = process.env) {
+  const cli = cliIdentity(env);
+  const help = run([cli.binary, "--help"], { check: false, env: openCodeEnvironment(env) });
+  if (help.exitCode !== 0 || !help.stdout.includes("--session")) {
+    throw new WorkflowError("OpenCode 2 full TUI does not expose the required --session option");
+  }
+  await ensureProjectChatCapability(directory, env);
 }
 async function requestWithService(info, method, path, body, timeout = 3e4) {
   const headers = { "content-type": "application/json" };
@@ -407,16 +424,16 @@ async function requestWithService(info, method, path, body, timeout = 3e4) {
   if (response.status === 204) return void 0;
   return await response.json();
 }
-async function request(method, path, body) {
-  return await requestWithService(await service(), method, path, body);
+async function request(method, path, body, env = process.env) {
+  return await requestWithService(await service(env), method, path, body);
 }
-async function createSession(directory, title = "Project Chat") {
+async function createSession(directory, title = "Project Chat", env = process.env) {
   const response = await request("POST", "/api/session", {
     title,
     agent: "project-chat",
     location: { directory }
-  });
-  await request("POST", `/api/session/${encodeURIComponent(response.data.id)}/agent`, { agent: "project-chat" });
+  }, env);
+  await request("POST", `/api/session/${encodeURIComponent(response.data.id)}/agent`, { agent: "project-chat" }, env);
   return response.data;
 }
 async function forkSession(sourceSessionId, sourceMessageId) {
@@ -425,8 +442,8 @@ async function forkSession(sourceSessionId, sourceMessageId) {
   });
   return response.data;
 }
-async function getSession(sessionId) {
-  const response = await request("GET", `/api/session/${encodeURIComponent(sessionId)}`);
+async function getSession(sessionId, env = process.env) {
+  const response = await request("GET", `/api/session/${encodeURIComponent(sessionId)}`, void 0, env);
   return response.data;
 }
 async function renameSession(sessionId, title) {
@@ -525,7 +542,8 @@ var HerdrClient = class {
     this.command(["pane", "run", paneId, command]);
   }
   launchOpenCode(paneId, checkout, sessionId) {
-    this.runInPane(paneId, `exec ${shellQuote(openCodeCli())} ${shellQuote(checkout)} --session ${shellQuote(sessionId)} --agent build`);
+    const env = openCodeEnvironment();
+    this.runInPane(paneId, `exec env XDG_DATA_HOME=${shellQuote(env.XDG_DATA_HOME)} XDG_STATE_HOME=${shellQuote(env.XDG_STATE_HOME)} ${shellQuote(openCodeCli())} ${shellQuote(checkout)} --session ${shellQuote(sessionId)}`);
   }
   runInstall(paneId, checkout) {
     this.runInPane(paneId, `cd -- ${shellQuote(checkout)} && pnpm install`);
@@ -551,9 +569,10 @@ var HerdrClient = class {
       "--cwd",
       options.cwd
     ];
-    if (options.workspaceId) args.push("--workspace", options.workspaceId);
+    if (options.workspaceId && !options.targetPane) args.push("--workspace", options.workspaceId);
     if (options.placement) args.push("--placement", options.placement);
     if (options.targetPane) args.push("--target-pane", options.targetPane);
+    if (options.direction) args.push("--direction", options.direction);
     for (const [key, value] of Object.entries(options.env ?? {})) args.push("--env", `${key}=${value}`);
     args.push(options.focus === false ? "--no-focus" : "--focus");
     return this.json(args);
@@ -2554,7 +2573,7 @@ async function openChat(root) {
   try {
     openCodeCli();
     ensureCompanionInstalled();
-    await ensureProjectChatCapability(canonicalRoot);
+    await ensureOpenCodeReady(canonicalRoot);
     const herdr = new HerdrClient();
     const workspace = primaryWorkspace(canonicalRoot, herdr);
     herdr.openPluginPane("dispatcher-chat", {
@@ -2562,6 +2581,7 @@ async function openChat(root) {
       workspaceId: workspace.workspaceId,
       placement: workspace.bootstrapPaneId ? "split" : "tab",
       ...workspace.bootstrapPaneId ? { targetPane: workspace.bootstrapPaneId } : {},
+      ...workspace.bootstrapPaneId ? { direction: "down" } : {},
       focus: true,
       env: { HERDR_PROJECT_ROOT: canonicalRoot }
     });
@@ -2617,28 +2637,49 @@ async function runChatPane(env = process.env) {
   if (primaryRepository(root) !== root) throw new WorkflowError(`Invalid Project Chat repository: ${root}`);
   const opencode = openCodeCli(env);
   ensureCompanionInstalled(env);
-  await ensureProjectChatCapability(root);
+  await ensureOpenCodeReady(root, env);
   const identity = currentHerdrIdentity(env);
-  const session = await createSession(root, CHAT_TITLE);
+  const session = await createSession(root, CHAT_TITLE, env);
   const store = new StateStore();
   store.rememberRepository(root);
-  store.registerHub({
-    projectRoot: root,
-    ...identity,
-    herdrBin: env.HERDR_BIN_PATH ?? "herdr",
-    socketPath: env.HERDR_SOCKET_PATH ?? null
-  });
-  const herdr = new HerdrClient();
-  const child = spawn2(opencode, [root, "--session", session.id, "--agent", "project-chat"], { stdio: "inherit", env });
+  const args = [root, "--session", session.id];
+  store.log("info", "project-chat.launch", JSON.stringify({ args, paneId: identity.paneId, tabId: identity.tabId }));
+  const child = spawn2(opencode, args, { stdio: "inherit", env: openCodeEnvironment(env) });
+  let exitCode = null;
+  let exitSignal = null;
   const exit = new Promise((resolvePromise, reject) => {
     child.once("error", (error) => reject(new WorkflowError(`Could not start opencode2: ${error.message}`)));
-    child.once("close", (code) => resolvePromise(code ?? 1));
+    child.once("close", (code, signal) => {
+      exitCode = code;
+      exitSignal = signal;
+      resolvePromise(code ?? 1);
+    });
   });
-  const exitCode = await exit;
-  store.deleteHub(root, identity.paneId);
-  store.close();
-  if (exitCode !== 0) throw new WorkflowError(`opencode2 exited with status ${exitCode}`);
-  return 0;
+  try {
+    await Promise.race([
+      exit.then((code2) => {
+        throw new WorkflowError(`opencode2 exited during startup with status ${code2}`);
+      }),
+      new Promise((resolvePromise) => setTimeout(resolvePromise, 1e3))
+    ]);
+    await getSession(session.id, env);
+    store.registerHub({
+      projectRoot: root,
+      ...identity,
+      herdrBin: env.HERDR_BIN_PATH ?? "herdr",
+      socketPath: env.HERDR_SOCKET_PATH ?? null
+    });
+    store.log("info", "project-chat.ready", JSON.stringify({ sessionId: session.id, paneId: identity.paneId, tabId: identity.tabId }));
+    const code = await exit;
+    if (code !== 0) throw new WorkflowError(`opencode2 exited with status ${code}${exitSignal ? ` (${exitSignal})` : ""}`);
+    return 0;
+  } catch (error) {
+    store.log("error", "project-chat.exit", JSON.stringify({ sessionId: session.id, paneId: identity.paneId, exitCode, exitSignal, error: String(error) }));
+    throw error;
+  } finally {
+    store.deleteHub(root, identity.paneId);
+    store.close();
+  }
 }
 
 // src/cleanup.ts
@@ -3165,7 +3206,7 @@ async function main(args = process.argv.slice(2)) {
   const store = new StateStore();
   if (command === "startup") {
     ensureCompanionInstalled();
-    await ensureProjectChatCapability();
+    await ensureOpenCodeReady();
     return retryCleanup(store);
   }
   if (command === "event") return handleCleanupEvent(store);

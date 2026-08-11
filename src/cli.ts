@@ -7,7 +7,7 @@ import { dispatchImplementation } from "./dispatch.js"
 import { WorkflowError } from "./errors.js"
 import { HerdrClient, pluginContext } from "./herdr.js"
 import { interactiveBlankProject } from "./projects.js"
-import { ensureProjectChatCapability } from "./opencode.js"
+import { ensureOpenCodeReady } from "./opencode.js"
 import { StateStore } from "./state.js"
 
 async function main(args = process.argv.slice(2)): Promise<number> {
@@ -15,7 +15,7 @@ async function main(args = process.argv.slice(2)): Promise<number> {
   const store = new StateStore()
   if (command === "startup") {
     ensureCompanionInstalled()
-    await ensureProjectChatCapability()
+    await ensureOpenCodeReady()
     return retryCleanup(store)
   }
   if (command === "event") return handleCleanupEvent(store)

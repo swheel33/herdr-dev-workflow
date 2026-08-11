@@ -40,7 +40,9 @@ managed OpenCode loader under `~/.config/opencode/plugins`. It adds that loader
 to the V2 `plugins` array while preserving JSONC formatting and existing plugin
 entries. There is no separate companion-plugin installation. OpenCode preview
 updates remain enabled; the plugin restarts a stale background service when its
-version differs from the installed CLI.
+version differs from the installed CLI. Preview runtime data and service state
+are isolated under `~/.local/share/opencode2` and `~/.local/state/opencode2` so
+the V2 schema cannot conflict with a stable OpenCode installation.
 
 ## Project Chat
 

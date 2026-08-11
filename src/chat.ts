@@ -8,7 +8,7 @@ import { WorkflowError } from "./errors.js"
 import { primaryRepository } from "./git.js"
 import { currentHerdrIdentity, HerdrClient, pluginContext } from "./herdr.js"
 import { canonical, pluginRoot, stateDirectory } from "./paths.js"
-import { createSession, ensureProjectChatCapability, openCodeCli } from "./opencode.js"
+import { createSession, ensureOpenCodeReady, getSession, openCodeCli, openCodeEnvironment } from "./opencode.js"
 import { executable, run } from "./process.js"
 import { StateStore } from "./state.js"
 
@@ -152,7 +152,7 @@ export async function openChat(root: string): Promise<void> {
   try {
     openCodeCli()
     ensureCompanionInstalled()
-    await ensureProjectChatCapability(canonicalRoot)
+    await ensureOpenCodeReady(canonicalRoot)
     const herdr = new HerdrClient()
     const workspace = primaryWorkspace(canonicalRoot, herdr)
     herdr.openPluginPane("dispatcher-chat", {
@@ -160,6 +160,7 @@ export async function openChat(root: string): Promise<void> {
       workspaceId: workspace.workspaceId,
       placement: workspace.bootstrapPaneId ? "split" : "tab",
       ...(workspace.bootstrapPaneId ? { targetPane: workspace.bootstrapPaneId } : {}),
+      ...(workspace.bootstrapPaneId ? { direction: "down" as const } : {}),
       focus: true,
       env: { HERDR_PROJECT_ROOT: canonicalRoot },
     })
@@ -220,26 +221,45 @@ export async function runChatPane(env: NodeJS.ProcessEnv = process.env): Promise
   if (primaryRepository(root) !== root) throw new WorkflowError(`Invalid Project Chat repository: ${root}`)
   const opencode = openCodeCli(env)
   ensureCompanionInstalled(env)
-  await ensureProjectChatCapability(root)
+  await ensureOpenCodeReady(root, env)
   const identity = currentHerdrIdentity(env)
-  const session = await createSession(root, CHAT_TITLE)
+  const session = await createSession(root, CHAT_TITLE, env)
   const store = new StateStore()
   store.rememberRepository(root)
-  store.registerHub({
-    projectRoot: root,
-    ...identity,
-    herdrBin: env.HERDR_BIN_PATH ?? "herdr",
-    socketPath: env.HERDR_SOCKET_PATH ?? null,
-  })
-  const herdr = new HerdrClient()
-  const child = spawn(opencode, [root, "--session", session.id, "--agent", "project-chat"], { stdio: "inherit", env })
+  const args = [root, "--session", session.id]
+  store.log("info", "project-chat.launch", JSON.stringify({ args, paneId: identity.paneId, tabId: identity.tabId }))
+  const child = spawn(opencode, args, { stdio: "inherit", env: openCodeEnvironment(env) })
+  let exitCode: number | null = null
+  let exitSignal: NodeJS.Signals | null = null
   const exit = new Promise<number>((resolvePromise, reject) => {
     child.once("error", (error) => reject(new WorkflowError(`Could not start opencode2: ${error.message}`)))
-    child.once("close", (code) => resolvePromise(code ?? 1))
+    child.once("close", (code, signal) => {
+      exitCode = code
+      exitSignal = signal
+      resolvePromise(code ?? 1)
+    })
   })
-  const exitCode = await exit
-  store.deleteHub(root, identity.paneId)
-  store.close()
-  if (exitCode !== 0) throw new WorkflowError(`opencode2 exited with status ${exitCode}`)
-  return 0
+  try {
+    await Promise.race([
+      exit.then((code) => { throw new WorkflowError(`opencode2 exited during startup with status ${code}`) }),
+      new Promise((resolvePromise) => setTimeout(resolvePromise, 1_000)),
+    ])
+    await getSession(session.id, env)
+    store.registerHub({
+      projectRoot: root,
+      ...identity,
+      herdrBin: env.HERDR_BIN_PATH ?? "herdr",
+      socketPath: env.HERDR_SOCKET_PATH ?? null,
+    })
+    store.log("info", "project-chat.ready", JSON.stringify({ sessionId: session.id, paneId: identity.paneId, tabId: identity.tabId }))
+    const code = await exit
+    if (code !== 0) throw new WorkflowError(`opencode2 exited with status ${code}${exitSignal ? ` (${exitSignal})` : ""}`)
+    return 0
+  } catch (error) {
+    store.log("error", "project-chat.exit", JSON.stringify({ sessionId: session.id, paneId: identity.paneId, exitCode, exitSignal, error: String(error) }))
+    throw error
+  } finally {
+    store.deleteHub(root, identity.paneId)
+    store.close()
+  }
 }
