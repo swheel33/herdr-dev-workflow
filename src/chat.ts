@@ -1,18 +1,15 @@
-import { existsSync, lstatSync, mkdirSync, readFileSync, readdirSync, unlinkSync, writeFileSync } from "node:fs"
+import { existsSync, lstatSync, mkdirSync, readFileSync, readdirSync, statSync, unlinkSync, writeFileSync } from "node:fs"
 import { homedir } from "node:os"
 import { basename, join, resolve } from "node:path"
 import { pathToFileURL } from "node:url"
-import { applyEdits, modify, parse, type ParseError } from "jsonc-parser"
 import { spawn } from "node:child_process"
 import { WorkflowError } from "./errors.js"
 import { primaryRepository } from "./git.js"
 import { currentHerdrIdentity, HerdrClient, pluginContext } from "./herdr.js"
 import { canonical, pluginRoot, stateDirectory } from "./paths.js"
-import { createSession, ensureOpenCodeReady, getSession, openCodeCli, openCodeEnvironment } from "./opencode.js"
+import { ensureOpenCodeReady, openCodeCli } from "./opencode.js"
 import { executable, run } from "./process.js"
 import { StateStore } from "./state.js"
-
-const CHAT_TITLE = "Project Chat"
 
 export function ensureCompanionInstalled(env: NodeJS.ProcessEnv = process.env): string {
   const source = resolve(pluginRoot(env), "dist/opencode-plugin.mjs")
@@ -20,11 +17,13 @@ export function ensureCompanionInstalled(env: NodeJS.ProcessEnv = process.env): 
   const configHome = resolve(env.XDG_CONFIG_HOME ?? join(homedir(), ".config"), "opencode")
   const autoPluginDirectory = resolve(configHome, "plugins")
   mkdirSync(autoPluginDirectory, { recursive: true })
-  const autoDestinations = [
+  const destination = resolve(autoPluginDirectory, "wheels-dev-workflow.js")
+  const obsoleteDestinations = [
     resolve(autoPluginDirectory, "wheels-dev-workflow.mjs"),
-    resolve(autoPluginDirectory, "wheels-dev-workflow.js"),
+    resolve(configHome, "wheels-dev-workflow.js"),
+    resolve(autoPluginDirectory, "tui/wheels-dev-workflow.js"),
   ]
-  for (const path of autoDestinations) {
+  for (const path of obsoleteDestinations) {
     if (!lstatMaybe(path)) continue
     const stat = lstatSync(path)
     if (stat.isSymbolicLink() || readFileSync(path, "utf8").startsWith("// Managed by Wheels Dev Workflow")) {
@@ -33,17 +32,15 @@ export function ensureCompanionInstalled(env: NodeJS.ProcessEnv = process.env): 
       throw new WorkflowError(`Refusing to replace unmanaged OpenCode plugin: ${path}`)
     }
   }
-  const destination = resolve(configHome, "wheels-dev-workflow.js")
   if (lstatMaybe(destination)) {
     const stat = lstatSync(destination)
-    if (stat.isSymbolicLink()) {
-      unlinkSync(destination)
-    } else if (!readFileSync(destination, "utf8").startsWith("// Managed by Wheels Dev Workflow")) {
+    if (stat.isSymbolicLink()) unlinkSync(destination)
+    else if (!readFileSync(destination, "utf8").startsWith("// Managed by Wheels Dev Workflow")) {
       throw new WorkflowError(`Refusing to replace unmanaged OpenCode plugin: ${destination}`)
     }
   }
-  const sourceUrl = pathToFileURL(source).href
   const herdrBin = executable(env.HERDR_BIN_PATH ?? "herdr", env)
+  const sourceUrl = `${pathToFileURL(source).href}?mtime=${statSync(source).mtimeMs}`
   const loader = `// Managed by Wheels Dev Workflow
 import { existsSync } from "node:fs"
 import { spawnSync } from "node:child_process"
@@ -60,44 +57,22 @@ function enabled() {
     return false
   }
 }
-let plugin = {}
-if (existsSync(source) && enabled()) plugin = (await import(sourceUrl)).default
+let plugin = { id: "wheels.dev-workflow.disabled", setup() {} }
+if (existsSync(source) && enabled()) {
+  const loaded = (await import(sourceUrl)).default
+  plugin = {
+    ...loaded,
+    setup(ctx) {
+      return loaded.setup({
+        ...ctx,
+        options: { ...ctx.options, pluginRoot: ${JSON.stringify(pluginRoot(env))}, stateDir: ${JSON.stringify(stateDirectory(env))} },
+      })
+    },
+  }
+}
 export default plugin
 `
   if (!existsSync(destination) || readFileSync(destination, "utf8") !== loader) writeFileSync(destination, loader)
-  const configPath = resolve(configHome, "opencode.jsonc")
-  let config = existsSync(configPath) ? readFileSync(configPath, "utf8") : "{}\n"
-  const originalConfig = config
-  const parseErrors: ParseError[] = []
-  const parsed = parse(config, parseErrors) as { plugins?: unknown; default_agent?: unknown } | undefined
-  if (parseErrors.length || !parsed || typeof parsed !== "object") {
-    throw new WorkflowError(`Refusing to modify invalid OpenCode config: ${configPath}`)
-  }
-  if (parsed.plugins !== undefined && !Array.isArray(parsed.plugins)) {
-    throw new WorkflowError(`OpenCode config plugins must be an array: ${configPath}`)
-  }
-  const plugins = parsed.plugins ?? []
-  const loaderUrl = pathToFileURL(destination).href
-  const legacyLoaderUrls = autoDestinations.map((path) => pathToFileURL(path).href)
-  const entry = {
-    package: loaderUrl,
-    options: { pluginRoot: pluginRoot(env), stateDir: stateDirectory(env) },
-  }
-  const retained = plugins.filter((item) => {
-    if (item === loaderUrl || legacyLoaderUrls.includes(String(item))) return false
-    return !(item && typeof item === "object" && "package" in item && [loaderUrl, ...legacyLoaderUrls].includes(String((item as { package?: unknown }).package)))
-  })
-  const updates: Array<[string[], unknown]> = [
-    [["plugins"], [...retained, entry]],
-    [["default_agent"], "project-chat"],
-  ]
-  for (const [path, value] of updates) {
-    const edits = modify(config, path, value, {
-      formattingOptions: { insertSpaces: true, tabSize: 2, eol: "\n" },
-    })
-    config = applyEdits(config, edits)
-  }
-  if (config !== originalConfig) writeFileSync(configPath, config)
   return destination
 }
 
@@ -151,8 +126,7 @@ export async function openChat(root: string): Promise<void> {
   }
   try {
     openCodeCli()
-    ensureCompanionInstalled()
-    await ensureOpenCodeReady(canonicalRoot)
+    await ensureOpenCodeReady()
     const herdr = new HerdrClient()
     const workspace = primaryWorkspace(canonicalRoot, herdr)
     herdr.openPluginPane("dispatcher-chat", {
@@ -221,14 +195,13 @@ export async function runChatPane(env: NodeJS.ProcessEnv = process.env): Promise
   if (primaryRepository(root) !== root) throw new WorkflowError(`Invalid Project Chat repository: ${root}`)
   const opencode = openCodeCli(env)
   ensureCompanionInstalled(env)
-  await ensureOpenCodeReady(root, env)
+  await ensureOpenCodeReady(env)
   const identity = currentHerdrIdentity(env)
-  const session = await createSession(root, CHAT_TITLE, env)
   const store = new StateStore()
   store.rememberRepository(root)
-  const args = [root, "--session", session.id]
+  const args = [root, "--standalone"]
   store.log("info", "project-chat.launch", JSON.stringify({ args, paneId: identity.paneId, tabId: identity.tabId }))
-  const child = spawn(opencode, args, { stdio: "inherit", env: openCodeEnvironment(env) })
+  const child = spawn(opencode, args, { stdio: "inherit", env: { ...env, HERDR_PROJECT_CHAT: "1" } })
   let exitCode: number | null = null
   let exitSignal: NodeJS.Signals | null = null
   const exit = new Promise<number>((resolvePromise, reject) => {
@@ -244,19 +217,18 @@ export async function runChatPane(env: NodeJS.ProcessEnv = process.env): Promise
       exit.then((code) => { throw new WorkflowError(`opencode2 exited during startup with status ${code}`) }),
       new Promise((resolvePromise) => setTimeout(resolvePromise, 1_000)),
     ])
-    await getSession(session.id, env)
     store.registerHub({
       projectRoot: root,
       ...identity,
       herdrBin: env.HERDR_BIN_PATH ?? "herdr",
       socketPath: env.HERDR_SOCKET_PATH ?? null,
     })
-    store.log("info", "project-chat.ready", JSON.stringify({ sessionId: session.id, paneId: identity.paneId, tabId: identity.tabId }))
+    store.log("info", "project-chat.ready", JSON.stringify({ paneId: identity.paneId, tabId: identity.tabId }))
     const code = await exit
     if (code !== 0) throw new WorkflowError(`opencode2 exited with status ${code}${exitSignal ? ` (${exitSignal})` : ""}`)
     return 0
   } catch (error) {
-    store.log("error", "project-chat.exit", JSON.stringify({ sessionId: session.id, paneId: identity.paneId, exitCode, exitSignal, error: String(error) }))
+    store.log("error", "project-chat.exit", JSON.stringify({ paneId: identity.paneId, exitCode, exitSignal, error: String(error) }))
     throw error
   } finally {
     store.deleteHub(root, identity.paneId)

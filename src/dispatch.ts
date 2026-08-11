@@ -1,7 +1,7 @@
 import { WorkflowError } from "./errors.js"
 import { primaryRepository } from "./git.js"
 import { HerdrClient } from "./herdr.js"
-import { forkSession, getSession, prepareImplementationSession, promptSession, removeSession, renameSession } from "./opencode.js"
+import { forkSession, getSession, prepareImplementationSession, promptSession, renameSession } from "./opencode.js"
 import { StateStore, type TargetKind } from "./state.js"
 import { prepareTarget } from "./worktrees.js"
 
@@ -93,19 +93,5 @@ export async function dispatchImplementation(request: DispatchRequest, store = n
     throw new WorkflowError(`Dispatch stopped before implementation prompting.${location} ${detail}`)
   }
 
-  try {
-    herdr.openPluginPane("dispatcher-chat", {
-      cwd: projectRoot,
-      workspaceId: hub.workspaceId,
-      placement: "tab",
-      focus: false,
-      env: { HERDR_PROJECT_ROOT: projectRoot },
-    })
-    await store.waitForHub(projectRoot, hub.paneId)
-    herdr.closeTab(hub.tabId)
-    await removeSession(request.sourceSessionId)
-  } catch (error) {
-    herdr.notify("Project Chat handoff incomplete", `Implementation started, but the dispatched Project Chat could not be replaced: ${error}`)
-  }
   return `Implementation started in ${prepared!.branch} at ${prepared!.checkoutPath}. Do not dispatch this request again.`
 }

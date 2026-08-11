@@ -7,14 +7,10 @@ settings:
 importers:
 
   .:
-    dependencies:
-      jsonc-parser:
-        specifier: ^3.3.1
-        version: 3.3.1
     devDependencies:
       '@opencode-ai/plugin':
         specifier: next
-        version: 0.0.0-next-17207
+        version: 0.0.0-next-17232
       '@types/node':
         specifier: ^24.0.0
         version: 24.13.3
@@ -38,8 +34,8 @@ packages:
   '@aws-crypto/util@5.2.0':
     resolution: {integrity: sha512-4RkU9EsI6ZpBve5fseQlGNUWKMa1RLPQ1dnjnQoe07ldfIzcsGb5hC5W0Dm7u423KWzawlrpbjXBrXCEv9zazQ==}
 
-  '@aws-sdk/types@3.974.2':
-    resolution: {integrity: sha512-3W6IUtSxFbH6X7Wb7DzGCV5QiFQsd0g8bOfntpmDxQlzBoKWUMBu/JPQR0DwkE+Hpnxd6db1tXbOwdeHddG6cA==}
+  '@aws-sdk/types@3.974.3':
+    resolution: {integrity: sha512-ECAqfpNsef+7MO8qtR0h9KcFIBAygaE7Cm6UOiQl+ft+uVap+1G7bNEjs4mdJE2OnA4m6k7i8peH8uGIAsOMGw==}
     engines: {node: '>=20.0.0'}
 
   '@esbuild/aix-ppc64@0.28.2':
@@ -232,21 +228,21 @@ packages:
     cpu: [x64]
     os: [win32]
 
-  '@opencode-ai/ai@0.0.0-next-17207':
-    resolution: {integrity: sha512-G81ETXja3Fe8naDjQtRjFgtyu/r2DGfuyq9WJe6bZt0LxeDqpOMkF3uSFLvrr+ABaPdULpvt0iUtpck7WsedXw==}
+  '@opencode-ai/ai@0.0.0-next-17232':
+    resolution: {integrity: sha512-mI99XwHT24fu1X/IWqyQTRttgVpROGa2F9NYkZYT0DKwJ34x5IoDn3az/vlJ0IR9P8APyHegeep1TWPAmg88sA==}
 
-  '@opencode-ai/client@0.0.0-next-17207':
-    resolution: {integrity: sha512-I1En/Zp+245d/pnB/zq2bPQQGJhvekynChk1Tjzuu0/eUOXvLLO4saLXtgr2MEtNjkAW7f7zTdCpxXQN28wUfQ==}
+  '@opencode-ai/client@0.0.0-next-17232':
+    resolution: {integrity: sha512-rl+ZSsRMPyLL8G0T+3l7KwHu1MohMFzJ+kDFyqVgLEmv0hRN1fBGHeYb04SAXNkiM75kBLO2hkZQTngLtntPsA==}
     peerDependencies:
       effect: 4.0.0-beta.101
     peerDependenciesMeta:
       effect:
         optional: true
 
-  '@opencode-ai/plugin@0.0.0-next-17207':
-    resolution: {integrity: sha512-rr3si+r/V81tV/bvTKZVhBjLJ33tMr11wDG1JYIxo+Ot4vhmUZrvtLtaOH9jti10oXOaIgHgVx0fVzTDGtkMfw==}
+  '@opencode-ai/plugin@0.0.0-next-17232':
+    resolution: {integrity: sha512-CIggyU3CaU/ZPQMWogMip4YTG0spJsLnrj2lleC+C+jk1GdPbeVMkts/JCY8UEB30yGoQU24JCWzQNo1whoCjA==}
     peerDependencies:
-      '@opencode-ai/theme': 0.0.0-next-17207
+      '@opencode-ai/theme': 0.0.0-next-17232
       '@opentui/core': 0.0.0-20260808-9ecf7c0a
       '@opentui/keymap': 0.0.0-20260808-9ecf7c0a
       '@opentui/solid': 0.0.0-20260808-9ecf7c0a
@@ -263,11 +259,11 @@ packages:
       solid-js:
         optional: true
 
-  '@opencode-ai/protocol@0.0.0-next-17207':
-    resolution: {integrity: sha512-n8aLnBqGhu8Uvr8xbR9Svudz+yyn73U+pqUHidtgBVSqKxFi13XVqdgRAh2m8wOEQUg4TTjEUo/dnJH88xbzaA==}
+  '@opencode-ai/protocol@0.0.0-next-17232':
+    resolution: {integrity: sha512-XhSouePojPl6SlEZEmOat2ea3jaEUHhzQCd0Km2LzAFv/gE3wnvytFLnIWElLx1jyg/lz1eQ7XQ9TueGqbgs0A==}
 
-  '@opencode-ai/schema@0.0.0-next-17207':
-    resolution: {integrity: sha512-bCpyScbe+6zSxnE2FS5x+6/QaetFYTJxkNn9BU2Nr+b/N4Pd7MBp1PeIhwKEkuujiM/vb9qeyZZTtDh4tXtzzw==}
+  '@opencode-ai/schema@0.0.0-next-17232':
+    resolution: {integrity: sha512-JsrMALC76BEqef8/I55XSqTqodN17A5oBdClBXCRiLCo9gmygSVazTX7Vnndk08un0OFBYaolSaNGCSomzqtyQ==}
 
   '@opencode-ai/sdk@1.18.5':
     resolution: {integrity: sha512-7KgMvP5/1oxbhHj6kYBtPSTEdFKYpUeEYOzBTKdzSaRpapUpFFdn6Hkus3rr0rljO0kukWZIgRd3DrVBwTULGA==}
@@ -276,8 +272,8 @@ packages:
     resolution: {integrity: sha512-+1VkjdD0QBLPodGrJUeqarH8VAIvQODIbwh9XpP5Syisf7YoQgsJKPNFoqqLQlu+VQ/tVSshMR6loPMn8U+dPg==}
     engines: {node: '>=14'}
 
-  '@smithy/core@3.31.1':
-    resolution: {integrity: sha512-CyogUINxvi7C7LDsh8Syo6hVJOT9ckz4rG8dRZfTJ8r91HkMY59PnNooaj7WcHyxEkxPfBAmbgztZU+xTo76lg==}
+  '@smithy/core@3.32.0':
+    resolution: {integrity: sha512-NAiCSC78fzbNIEWoheoF74Ob5ZorLijCHpMY26Fqvqg/+9LuyIqMfHDg2p8Yk1rqOyowtiL3y7WX0AW+teL6zw==}
     engines: {node: '>=18.0.0'}
 
   '@smithy/eventstream-codec@4.2.14':
@@ -288,20 +284,20 @@ packages:
     resolution: {integrity: sha512-GGP3O9QFD24uGeAXYUjwSTXARoqpZykHadOmA8G5vfJPK0/DC67qa//0qvqrJzL1xc8WQWX7/yc7fwudjPHPhA==}
     engines: {node: '>=14.0.0'}
 
-  '@smithy/types@4.16.1':
-    resolution: {integrity: sha512-0JFs3V2y2M9tKW5na/qxe69Zv+uxLMO7QBbhxF/FHu/Gp2NFZAAL9tWl9PU02xxo07pb3G9FTyjNc6D5uZrJIg==}
+  '@smithy/types@4.17.0':
+    resolution: {integrity: sha512-Aw4joiM0ZdErpo39lCj8phT2lxoiKZV+KZzBxnnQhWVtU2Is/WffQSL04uUWRcXUse9Ln8vXZK6V/FwqRVnQpg==}
     engines: {node: '>=18.0.0'}
 
   '@smithy/util-buffer-from@2.2.0':
     resolution: {integrity: sha512-IJdWBbTcMQ6DA0gdNhh/BwrLkDR+ADW5Kr1aZmd4k3DIF6ezMV4R2NIAmT08wQJ3yUK82thHWmC/TnK/wpMMIA==}
     engines: {node: '>=14.0.0'}
 
-  '@smithy/util-buffer-from@4.4.16':
-    resolution: {integrity: sha512-HxG8CH8HXUO6JqH+ftXCJm1XrISkcZNrOLGkMYiz90wT3FPBZZE/syDNYJ/iKQEi91gN2J/SnyEhHjcJPEVSFw==}
+  '@smithy/util-buffer-from@4.5.0':
+    resolution: {integrity: sha512-uNYy8mHjbmgGUv0oVjuBVSAZZ9zNtn5s0r02G/UkGQwhvcWfHhSA1X11iCUhb+VeJiV1ydJA0FdaQHWIDJ/IWA==}
     engines: {node: '>=18.0.0'}
 
-  '@smithy/util-hex-encoding@4.4.16':
-    resolution: {integrity: sha512-x9/taZ/r/nEL6SBfdV+M18VpJU16yzehn2q1XHNmXWEp3g5U4NBl2oMBVw7YKdmH2HiKQ/ZqDW5JjBDNzgLKrg==}
+  '@smithy/util-hex-encoding@4.5.0':
+    resolution: {integrity: sha512-AKsJey5FE7XBTz+9brPzBGrHNQQ/TqeppRluuu07g4BZu73ypQhab5qrKl8Q+CWI0EUvR0F+EUVfcKfzm6Dtww==}
     engines: {node: '>=18.0.0'}
 
   '@smithy/util-utf8@2.3.0':
@@ -483,9 +479,6 @@ packages:
   json-schema@0.4.0:
     resolution: {integrity: sha512-es94M3nTIfsEPisRafak+HDLfHXnKBhV3vU5eqPcS3flIWqcxJWgXHXiey3YrpaNsanY5ei1VoYEbOzijuq9BA==}
 
-  jsonc-parser@3.3.1:
-    resolution: {integrity: sha512-HUgH65KyejrUFPvHFPbqOY0rsFip3Bo5wb4ngvdi1EpCYWUQDC5V+Y7mZws+DLkr4M//zQJoanu1SP+87Dv1oQ==}
-
   jwa@2.0.1:
     resolution: {integrity: sha512-hRF04fqJIP8Abbkq5NKGN0Bbr3JxlQ+qhZufXVr0DvujKy93ZCbXZMHDL4EOtodSbCWxOqR8MS1tXA5hwqCXDg==}
 
@@ -634,18 +627,18 @@ snapshots:
   '@aws-crypto/crc32@5.2.0':
     dependencies:
       '@aws-crypto/util': 5.2.0
-      '@aws-sdk/types': 3.974.2
+      '@aws-sdk/types': 3.974.3
       tslib: 2.8.1
 
   '@aws-crypto/util@5.2.0':
     dependencies:
-      '@aws-sdk/types': 3.974.2
+      '@aws-sdk/types': 3.974.3
       '@smithy/util-utf8': 2.3.0
       tslib: 2.8.1
 
-  '@aws-sdk/types@3.974.2':
+  '@aws-sdk/types@3.974.3':
     dependencies:
-      '@smithy/types': 4.16.1
+      '@smithy/types': 4.17.0
       tslib: 2.8.1
 
   '@esbuild/aix-ppc64@0.28.2':
@@ -753,9 +746,9 @@ snapshots:
   '@msgpackr-extract/msgpackr-extract-win32-x64@3.0.4':
     optional: true
 
-  '@opencode-ai/ai@0.0.0-next-17207':
+  '@opencode-ai/ai@0.0.0-next-17232':
     dependencies:
-      '@opencode-ai/schema': 0.0.0-next-17207
+      '@opencode-ai/schema': 0.0.0-next-17232
       '@smithy/eventstream-codec': 4.2.14
       '@smithy/util-utf8': 4.2.2
       aws4fetch: 1.0.20
@@ -764,19 +757,19 @@ snapshots:
     transitivePeerDependencies:
       - supports-color
 
-  '@opencode-ai/client@0.0.0-next-17207(effect@4.0.0-beta.101)':
+  '@opencode-ai/client@0.0.0-next-17232(effect@4.0.0-beta.101)':
     dependencies:
-      '@opencode-ai/protocol': 0.0.0-next-17207
-      '@opencode-ai/schema': 0.0.0-next-17207
+      '@opencode-ai/protocol': 0.0.0-next-17232
+      '@opencode-ai/schema': 0.0.0-next-17232
     optionalDependencies:
       effect: 4.0.0-beta.101
 
-  '@opencode-ai/plugin@0.0.0-next-17207':
+  '@opencode-ai/plugin@0.0.0-next-17232':
     dependencies:
       '@ai-sdk/provider': 3.0.8
-      '@opencode-ai/ai': 0.0.0-next-17207
-      '@opencode-ai/client': 0.0.0-next-17207(effect@4.0.0-beta.101)
-      '@opencode-ai/schema': 0.0.0-next-17207
+      '@opencode-ai/ai': 0.0.0-next-17232
+      '@opencode-ai/client': 0.0.0-next-17232(effect@4.0.0-beta.101)
+      '@opencode-ai/schema': 0.0.0-next-17232
       '@opencode-ai/sdk': 1.18.5
       '@standard-schema/spec': 1.1.0
       effect: 4.0.0-beta.101
@@ -784,12 +777,12 @@ snapshots:
     transitivePeerDependencies:
       - supports-color
 
-  '@opencode-ai/protocol@0.0.0-next-17207':
+  '@opencode-ai/protocol@0.0.0-next-17232':
     dependencies:
-      '@opencode-ai/schema': 0.0.0-next-17207
+      '@opencode-ai/schema': 0.0.0-next-17232
       effect: 4.0.0-beta.101
 
-  '@opencode-ai/schema@0.0.0-next-17207':
+  '@opencode-ai/schema@0.0.0-next-17232':
     dependencies:
       '@standard-schema/spec': 1.1.0
       effect: 4.0.0-beta.101
@@ -801,23 +794,23 @@ snapshots:
   '@pkgjs/parseargs@0.11.0':
     optional: true
 
-  '@smithy/core@3.31.1':
+  '@smithy/core@3.32.0':
     dependencies:
-      '@smithy/types': 4.16.1
+      '@smithy/types': 4.17.0
       tslib: 2.8.1
 
   '@smithy/eventstream-codec@4.2.14':
     dependencies:
       '@aws-crypto/crc32': 5.2.0
-      '@smithy/types': 4.16.1
-      '@smithy/util-hex-encoding': 4.4.16
+      '@smithy/types': 4.17.0
+      '@smithy/util-hex-encoding': 4.5.0
       tslib: 2.8.1
 
   '@smithy/is-array-buffer@2.2.0':
     dependencies:
       tslib: 2.8.1
 
-  '@smithy/types@4.16.1':
+  '@smithy/types@4.17.0':
     dependencies:
       tslib: 2.8.1
 
@@ -826,14 +819,14 @@ snapshots:
       '@smithy/is-array-buffer': 2.2.0
       tslib: 2.8.1
 
-  '@smithy/util-buffer-from@4.4.16':
+  '@smithy/util-buffer-from@4.5.0':
     dependencies:
-      '@smithy/core': 3.31.1
+      '@smithy/core': 3.32.0
       tslib: 2.8.1
 
-  '@smithy/util-hex-encoding@4.4.16':
+  '@smithy/util-hex-encoding@4.5.0':
     dependencies:
-      '@smithy/core': 3.31.1
+      '@smithy/core': 3.32.0
       tslib: 2.8.1
 
   '@smithy/util-utf8@2.3.0':
@@ -843,7 +836,7 @@ snapshots:
 
   '@smithy/util-utf8@4.2.2':
     dependencies:
-      '@smithy/util-buffer-from': 4.4.16
+      '@smithy/util-buffer-from': 4.5.0
       tslib: 2.8.1
 
   '@standard-schema/spec@1.1.0': {}
@@ -1054,8 +1047,6 @@ snapshots:
       bignumber.js: 9.3.1
 
   json-schema@0.4.0: {}
-
-  jsonc-parser@3.3.1: {}
 
   jwa@2.0.1:
     dependencies:

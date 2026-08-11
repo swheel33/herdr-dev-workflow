@@ -1,5 +1,5 @@
 import { WorkflowError } from "./errors.js"
-import { openCodeCli, openCodeEnvironment } from "./opencode.js"
+import { openCodeCli } from "./opencode.js"
 import { run, shellQuote } from "./process.js"
 
 type JsonObject = Record<string, unknown>
@@ -86,8 +86,7 @@ export class HerdrClient {
   }
 
   launchOpenCode(paneId: string, checkout: string, sessionId: string): void {
-    const env = openCodeEnvironment()
-    this.runInPane(paneId, `exec env XDG_DATA_HOME=${shellQuote(env.XDG_DATA_HOME!)} XDG_STATE_HOME=${shellQuote(env.XDG_STATE_HOME!)} ${shellQuote(openCodeCli())} ${shellQuote(checkout)} --session ${shellQuote(sessionId)}`)
+    this.runInPane(paneId, `exec ${shellQuote(openCodeCli())} ${shellQuote(checkout)} --session ${shellQuote(sessionId)}`)
   }
 
   runInstall(paneId: string, checkout: string): void {

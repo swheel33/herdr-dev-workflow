@@ -28,6 +28,8 @@ function executeDispatch(options: { pluginRoot: string; stateDir: string }, inpu
 const plugin: Plugin.Plugin = {
   id: "wheels.dev-workflow",
   setup: async (ctx) => {
+    if (process.env.HERDR_PROJECT_CHAT !== "1") return
+
     const raw = ctx.options as Record<string, unknown>
     const options = {
       pluginRoot: typeof raw.pluginRoot === "string" ? raw.pluginRoot : "",
@@ -35,10 +37,14 @@ const plugin: Plugin.Plugin = {
     }
     if (!options.pluginRoot || !options.stateDir) throw new Error("Wheels pluginRoot and stateDir options are required")
     await ctx.agent.transform((agents) => {
+      for (const current of agents.list()) {
+        if (current.mode !== "subagent") agents.update(String(current.id), (agent) => { agent.hidden = true })
+      }
       agents.update("project-chat", (agent) => {
         agent.description = "Discussion-only project coordination and implementation dispatch"
         agent.system = SYSTEM
         agent.mode = "primary"
+        agent.hidden = false
         agent.color = "#D27E99"
         agent.permissions.push(
           { action: "edit", resource: "*", effect: "deny" },

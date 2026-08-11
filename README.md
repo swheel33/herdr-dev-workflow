@@ -15,8 +15,7 @@ dispatch, disposable Git worktrees, and durable cleanup.
 Install the OpenCode 2 preview alongside OpenCode V1:
 
 ```bash
-pnpm add -g @opencode-ai/cli
-pnpm approve-builds -g
+pnpm add -g --allow-build=@opencode-ai/cli @opencode-ai/cli@next
 ```
 
 ## Installation
@@ -35,14 +34,13 @@ pnpm build
 herdr plugin link /path/to/herdr-dev-workflow --enabled
 ```
 
-The Herdr startup hook creates the private SQLite database and installs a small,
-managed OpenCode loader under `~/.config/opencode/plugins`. It adds that loader
-to the V2 `plugins` array while preserving JSONC formatting and existing plugin
-entries. There is no separate companion-plugin installation. OpenCode preview
-updates remain enabled; the plugin restarts a stale background service when its
-version differs from the installed CLI. Preview runtime data and service state
-are isolated under `~/.local/share/opencode2` and `~/.local/state/opencode2` so
-the V2 schema cannot conflict with a stable OpenCode installation.
+The Herdr startup hook creates the private workflow SQLite database and installs
+a managed OpenCode server loader under `~/.config/opencode/plugins`. OpenCode
+discovers it natively, so no config entry or wrapper binary is required. V1
+remains available as `opencode`; V2 runs as `opencode2` with its standard shared
+database and background service. Preview updates remain enabled, and the
+workflow restarts a stale service when its version differs from the installed
+CLI.
 
 ## Project Chat
 
@@ -56,8 +54,13 @@ Outside a Git checkout it opens the project picker under `HERDR_PROJECTS_ROOT`,
 defaulting to `~/Projects`. The primary-checkout workspace itself is the
 persistent Project Chat hub: selecting the primary branch in Herdr opens the
 full OpenCode UI, and OpenCode's native tabs and session list own chat creation
-and history. Invoking the action again focuses that primary workspace. Linked
-branch workspaces retain the 70/30 OpenCode Build and shell layout.
+and history. Project Chat uses OpenCode's built-in standalone server lifecycle;
+the server companion exposes only the Project Chat primary agent in that host.
+It still shares OpenCode's standard database, credentials, MCP configuration,
+and conversation history. Invoking the action again focuses the primary
+workspace. Linked branch workspaces retain the 70/30 OpenCode Build and shell
+layout, while ordinary `opencode2` sessions remain unchanged and default to
+Build.
 
 OpenCode remains authoritative for messages, attachments, compaction, session
 lineage, model selection, provider selection, and history. The plugin never
@@ -84,17 +87,16 @@ checkout, and `pnpm install` starts in the shell pane.
 
 The source session is forked with a native `before` boundary, moved to the
 target checkout, switched to Build, renamed to the conversation title, and
-prompted through the V2 HTTP API. After confirmed delivery, the hub receives a
-fresh Project Chat and the original session is deleted. The implementation fork
-therefore becomes the single native-history record containing the preceding
-conversation and complete handoff. The prompt request is the delivery boundary:
+prompted through the V2 HTTP API. The source Project Chat conversation remains
+in native history after confirmed delivery. The implementation fork contains
+the preceding conversation and complete handoff, so that shared prefix appears
+in both records. The prompt request is the delivery boundary:
 
 - Before the prompt request begins, a failure is retryable. Any worktree,
   workspace, branch, or fork already created is deliberately preserved for
   inspection instead of being rolled back.
-- After confirmed delivery, replacement-chat, original-session deletion, and
-  bookkeeping failures are warnings and never cause a second implementation
-  prompt.
+- After confirmed delivery, bookkeeping failures are warnings and never cause a
+  second implementation prompt.
 - If the prompt request starts but its response is lost or times out, delivery is
   recorded as unknown and the implementation workspace is preserved. The same
   source turn remains non-retryable to prevent duplicate implementation.

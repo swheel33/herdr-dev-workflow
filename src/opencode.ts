@@ -21,16 +21,8 @@ interface ServiceInfo {
   version?: string
 }
 
-export function openCodeEnvironment(env: NodeJS.ProcessEnv = process.env): NodeJS.ProcessEnv {
-  return {
-    ...env,
-    XDG_DATA_HOME: env.OPENCODE2_DATA_HOME ?? resolve(homedir(), ".local/share/opencode2"),
-    XDG_STATE_HOME: env.OPENCODE2_STATE_HOME ?? resolve(homedir(), ".local/state/opencode2"),
-  }
-}
-
 function servicePath(env: NodeJS.ProcessEnv = process.env): string {
-  return resolve(openCodeEnvironment(env).XDG_STATE_HOME!, "opencode/service.json")
+  return resolve(env.XDG_STATE_HOME ?? resolve(homedir(), ".local/state"), "opencode/service.json")
 }
 
 function readService(env: NodeJS.ProcessEnv = process.env): ServiceInfo | null {
@@ -43,9 +35,8 @@ function readService(env: NodeJS.ProcessEnv = process.env): ServiceInfo | null {
 }
 
 function cliIdentity(env: NodeJS.ProcessEnv = process.env): { binary: string; version: string } {
-  const previewEnv = openCodeEnvironment(env)
   const binary = executable("opencode2", env)
-  const result = run([binary, "--version"], { check: false, env: previewEnv })
+  const result = run([binary, "--version"], { check: false, env })
   const version = result.stdout.match(/0\.0\.0-next-\d+/)?.[0]
   if (result.exitCode !== 0 || !version) {
     const detail = result.stderr.trim() || result.stdout.trim() || `exit ${result.exitCode}`
@@ -64,12 +55,11 @@ async function healthy(info: ServiceInfo): Promise<boolean> {
 }
 
 async function service(env: NodeJS.ProcessEnv = process.env): Promise<ServiceInfo> {
-  const previewEnv = openCodeEnvironment(env)
   const cli = cliIdentity(env)
   let info = readService(env)
   if (info?.version === cli.version && await healthy(info)) return info
 
-  run([cli.binary, "service", info ? "restart" : "start"], { env: previewEnv })
+  run([cli.binary, "service", info ? "restart" : "start"], { env })
   const deadline = Date.now() + 30_000
   while (Date.now() < deadline) {
     info = readService(env)
@@ -88,43 +78,13 @@ export function openCodeVersion(env: NodeJS.ProcessEnv = process.env): string {
   return cliIdentity(env).version
 }
 
-async function projectChatAvailable(directory: string, env: NodeJS.ProcessEnv): Promise<boolean> {
-  try {
-    const query = new URLSearchParams({ "location[directory]": directory })
-    const response = await request<{ data: { id: string; permissions?: Array<{ action?: string }> } }>("GET", `/api/agent/project-chat?${query}`, undefined, env)
-    return response.data.id === "project-chat"
-      && response.data.permissions?.some((permission) => permission.action === "dispatch_implementation") === true
-  } catch {
-    return false
-  }
-}
-
-async function waitForProjectChat(directory: string, timeout: number, env: NodeJS.ProcessEnv): Promise<boolean> {
-  const deadline = Date.now() + timeout
-  do {
-    if (await projectChatAvailable(directory, env)) return true
-    await new Promise((resolvePromise) => setTimeout(resolvePromise, 100))
-  } while (Date.now() < deadline)
-  return false
-}
-
-export async function ensureProjectChatCapability(directory = process.cwd(), env: NodeJS.ProcessEnv = process.env): Promise<void> {
-  if (await waitForProjectChat(directory, 2_000, env)) return
+export async function ensureOpenCodeReady(env: NodeJS.ProcessEnv = process.env): Promise<void> {
   const cli = cliIdentity(env)
-  run([cli.binary, "service", "restart"], { env: openCodeEnvironment(env) })
+  const help = run([cli.binary, "--help"], { check: false, env })
+  if (help.exitCode !== 0 || !help.stdout.includes("--session") || !help.stdout.includes("--standalone")) {
+    throw new WorkflowError("OpenCode 2 full TUI does not expose the required --session and --standalone options")
+  }
   await service(env)
-  if (!await waitForProjectChat(directory, 10_000, env)) {
-    throw new WorkflowError("OpenCode loaded without the project-chat agent or dispatch_implementation tool")
-  }
-}
-
-export async function ensureOpenCodeReady(directory = process.cwd(), env: NodeJS.ProcessEnv = process.env): Promise<void> {
-  const cli = cliIdentity(env)
-  const help = run([cli.binary, "--help"], { check: false, env: openCodeEnvironment(env) })
-  if (help.exitCode !== 0 || !help.stdout.includes("--session")) {
-    throw new WorkflowError("OpenCode 2 full TUI does not expose the required --session option")
-  }
-  await ensureProjectChatCapability(directory, env)
 }
 
 async function requestWithService<T>(info: ServiceInfo, method: string, path: string, body?: unknown, timeout = 30_000): Promise<T> {
@@ -143,16 +103,6 @@ async function requestWithService<T>(info: ServiceInfo, method: string, path: st
 
 async function request<T>(method: string, path: string, body?: unknown, env: NodeJS.ProcessEnv = process.env): Promise<T> {
   return await requestWithService<T>(await service(env), method, path, body)
-}
-
-export async function createSession(directory: string, title = "Project Chat", env: NodeJS.ProcessEnv = process.env): Promise<SessionInfo> {
-  const response = await request<{ data: SessionInfo }>("POST", "/api/session", {
-    title,
-    agent: "project-chat",
-    location: { directory },
-  }, env)
-  await request("POST", `/api/session/${encodeURIComponent(response.data.id)}/agent`, { agent: "project-chat" }, env)
-  return response.data
 }
 
 export async function forkSession(sourceSessionId: string, sourceMessageId: string): Promise<SessionInfo> {
@@ -180,8 +130,4 @@ export async function promptSession(sessionId: string, text: string, onAttempt?:
   const info = await service()
   onAttempt?.()
   await requestWithService(info, "POST", `/api/session/${encodeURIComponent(sessionId)}/prompt`, { text })
-}
-
-export async function removeSession(sessionId: string): Promise<void> {
-  await request("DELETE", `/api/session/${encodeURIComponent(sessionId)}`)
 }
