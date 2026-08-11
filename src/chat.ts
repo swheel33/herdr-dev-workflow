@@ -8,7 +8,7 @@ import { WorkflowError } from "./errors.js"
 import { primaryRepository } from "./git.js"
 import { currentHerdrIdentity, HerdrClient, pluginContext } from "./herdr.js"
 import { canonical, pluginRoot, stateDirectory } from "./paths.js"
-import { continueSession, createSession, projectSessions } from "./opencode.js"
+import { continueSession, createSession, openCodeCli, projectSessions } from "./opencode.js"
 import { executable, run } from "./process.js"
 import { StateStore } from "./state.js"
 
@@ -199,6 +199,7 @@ export async function openChatHistory(): Promise<void> {
 export async function runChatPane(env: NodeJS.ProcessEnv = process.env): Promise<number> {
   const root = canonical(env.HERDR_PROJECT_ROOT ?? "")
   if (primaryRepository(root) !== root) throw new WorkflowError(`Invalid Project Chat repository: ${root}`)
+  const opencode = openCodeCli(env)
   ensureCompanionInstalled(env)
   const identity = currentHerdrIdentity(env)
   const session = env.HERDR_CHAT_SESSION_ID
@@ -215,10 +216,12 @@ export async function runChatPane(env: NodeJS.ProcessEnv = process.env): Promise
   })
   const herdr = new HerdrClient()
   herdr.renameTab(identity.tabId, env.HERDR_CHAT_TAB_LABEL ?? CHAT_TITLE)
-  const child = spawn(executable("opencode2", env), [root, "--session", session.id], { stdio: "inherit", env })
+  const child = spawn(opencode, [root, "--session", session.id], { stdio: "inherit", env })
   const exit = new Promise<number>((resolvePromise, reject) => {
     child.once("error", (error) => reject(new WorkflowError(`Could not start opencode2: ${error.message}`)))
     child.once("close", (code) => resolvePromise(code ?? 1))
   })
-  return await exit
+  const exitCode = await exit
+  if (exitCode !== 0) throw new WorkflowError(`opencode2 exited with status ${exitCode}`)
+  return 0
 }

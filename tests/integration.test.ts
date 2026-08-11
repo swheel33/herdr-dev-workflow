@@ -5,6 +5,7 @@ import { pathToFileURL } from "node:url"
 import { parse } from "jsonc-parser"
 import { describe, expect, it } from "vitest"
 import { ensureCompanionInstalled } from "../src/chat.js"
+import { openCodeCli } from "../src/opencode.js"
 import { executable } from "../src/process.js"
 
 describe("runtime integration", () => {
@@ -14,6 +15,17 @@ describe("runtime integration", () => {
     writeFileSync(command, "#!/bin/sh\nexit 0\n")
     chmodSync(command, 0o755)
     expect(executable("path-only-command", { PATH: [root, "/usr/bin"].join(delimiter) })).toBe(command)
+  })
+
+  it("requires the pinned OpenCode preview before launching", () => {
+    const root = mkdtempSync(resolve(tmpdir(), "wheels-opencode-path-"))
+    const command = resolve(root, "opencode2")
+    writeFileSync(command, '#!/bin/sh\nprintf "opencode2 v0.0.0-next-17189\\n"\n')
+    chmodSync(command, 0o755)
+    const env = { PATH: root }
+    expect(openCodeCli(env)).toBe(command)
+    writeFileSync(command, '#!/bin/sh\nprintf "opencode2 v0.0.0-next-99999\\n"\n')
+    expect(() => openCodeCli(env)).toThrow("OpenCode CLI must be 0.0.0-next-17189")
   })
 
   it("removes the legacy loader entry while preserving JSONC plugins", async () => {

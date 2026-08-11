@@ -315,6 +315,117 @@ function synchronizeDefaultBranch(repo) {
   return tryGit(repo, "merge-base", "--is-ancestor", remoteRef, localRef).ok ? "ahead" : "diverged";
 }
 
+// src/opencode.ts
+import { readFileSync } from "node:fs";
+import { homedir as homedir3 } from "node:os";
+import { resolve as resolve4 } from "node:path";
+var EXPECTED_OPENCODE_VERSION = "0.0.0-next-17189";
+function servicePath() {
+  return resolve4(process.env.XDG_STATE_HOME ?? resolve4(homedir3(), ".local/state"), "opencode/service.json");
+}
+function readService() {
+  try {
+    const parsed = JSON.parse(readFileSync(servicePath(), "utf8"));
+    return parsed.url ? parsed : null;
+  } catch {
+    return null;
+  }
+}
+async function service() {
+  let info = readService();
+  if (info?.version && info.version !== EXPECTED_OPENCODE_VERSION) {
+    throw new WorkflowError(`OpenCode service version ${info.version} does not match required ${EXPECTED_OPENCODE_VERSION}`);
+  }
+  if (info) {
+    try {
+      await requestWithService(info, "GET", "/api/health", void 0, 5e3);
+      return info;
+    } catch {
+      info = null;
+    }
+  }
+  const binary = openCodeCli();
+  run([binary, "service", "start"]);
+  const deadline = Date.now() + 3e4;
+  while (!(info = readService()) && Date.now() < deadline) {
+    await new Promise((resolvePromise) => setTimeout(resolvePromise, 100));
+  }
+  if (!info) throw new WorkflowError("OpenCode 2 background service did not start");
+  if (info.version && info.version !== EXPECTED_OPENCODE_VERSION) {
+    throw new WorkflowError(`OpenCode service version ${info.version} does not match required ${EXPECTED_OPENCODE_VERSION}`);
+  }
+  await requestWithService(info, "GET", "/api/health", void 0, 5e3);
+  return info;
+}
+function openCodeCli(env = process.env) {
+  const binary = executable("opencode2", env);
+  const result = run([binary, "--version"], { check: false, env });
+  const version = result.stdout.match(/0\.0\.0-next-\d+/)?.[0];
+  if (result.exitCode !== 0 || version !== EXPECTED_OPENCODE_VERSION) {
+    const detail = result.stderr.trim() || result.stdout.trim() || `exit ${result.exitCode}`;
+    throw new WorkflowError(`OpenCode CLI must be ${EXPECTED_OPENCODE_VERSION}; ${detail}`);
+  }
+  return binary;
+}
+async function requestWithService(info, method, path, body, timeout = 3e4) {
+  const headers = { "content-type": "application/json" };
+  if (info.password) headers.authorization = `Basic ${Buffer.from(`opencode:${info.password}`).toString("base64")}`;
+  const response = await fetch(new URL(path, info.url), {
+    method,
+    headers,
+    ...body === void 0 ? {} : { body: JSON.stringify(body) },
+    signal: AbortSignal.timeout(timeout)
+  });
+  if (!response.ok) throw new WorkflowError(`OpenCode API ${method} ${path} failed (${response.status}): ${await response.text()}`);
+  if (response.status === 204) return void 0;
+  return await response.json();
+}
+async function request(method, path, body) {
+  return await requestWithService(await service(), method, path, body);
+}
+async function createSession(directory, title = "New Chat") {
+  const response = await request("POST", "/api/session", { title, agent: "project-chat", location: { directory } });
+  return response.data;
+}
+async function forkSession(sourceSessionId, sourceMessageId) {
+  const response = await request("POST", `/api/session/${encodeURIComponent(sourceSessionId)}/fork`, {
+    boundary: { type: "before", messageID: sourceMessageId }
+  });
+  return response.data;
+}
+async function continueSession(sourceSessionId, directory) {
+  const response = await request("POST", `/api/session/${encodeURIComponent(sourceSessionId)}/fork`, {
+    boundary: { type: "through" }
+  });
+  const fork = response.data;
+  await request("POST", `/api/session/${encodeURIComponent(fork.id)}/move`, { directory });
+  await request("POST", `/api/session/${encodeURIComponent(fork.id)}/agent`, { agent: "project-chat" });
+  return fork;
+}
+async function prepareImplementationSession(sessionId, directory) {
+  await request("POST", `/api/session/${encodeURIComponent(sessionId)}/move`, { directory });
+  await request("POST", `/api/session/${encodeURIComponent(sessionId)}/agent`, { agent: "build" });
+}
+async function promptSession(sessionId, text, onAttempt) {
+  const info = await service();
+  onAttempt?.();
+  await requestWithService(info, "POST", `/api/session/${encodeURIComponent(sessionId)}/prompt`, { text });
+}
+async function projectSessions(directory) {
+  const locationQuery = new URLSearchParams({ "location[directory]": directory });
+  const location = await request("GET", `/api/location?${locationQuery}`);
+  const sessions = [];
+  let cursor;
+  do {
+    const query = new URLSearchParams({ project: location.project.id, order: "desc", limit: "100" });
+    if (cursor) query.set("cursor", cursor);
+    const page = await request("GET", `/api/session?${query}`);
+    sessions.push(...page.data);
+    cursor = page.cursor.next;
+  } while (cursor);
+  return sessions;
+}
+
 // src/herdr.ts
 function object(value) {
   if (!value || typeof value !== "object" || Array.isArray(value)) throw new WorkflowError("Herdr returned invalid JSON");
@@ -388,7 +499,7 @@ var HerdrClient = class {
     this.command(["pane", "run", paneId, command]);
   }
   launchOpenCode(paneId, checkout, sessionId) {
-    this.runInPane(paneId, `exec ${shellQuote(executable("opencode2"))} ${shellQuote(checkout)} --session ${shellQuote(sessionId)}`);
+    this.runInPane(paneId, `exec ${shellQuote(openCodeCli())} ${shellQuote(checkout)} --session ${shellQuote(sessionId)}`);
   }
   runInstall(paneId, checkout) {
     this.runInPane(paneId, `cd -- ${shellQuote(checkout)} && pnpm install`);
@@ -443,7 +554,7 @@ function currentHerdrIdentity(env = process.env) {
 
 // src/state.ts
 import { mkdirSync } from "node:fs";
-import { dirname as dirname2, resolve as resolve4 } from "node:path";
+import { dirname as dirname2, resolve as resolve5 } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 var SCHEMA = `
 PRAGMA foreign_keys = ON;
@@ -540,7 +651,7 @@ CREATE TABLE IF NOT EXISTS locks (
 `;
 var StateStore = class {
   database;
-  constructor(path = resolve4(stateDirectory(), "workflow.sqlite")) {
+  constructor(path = resolve5(stateDirectory(), "workflow.sqlite")) {
     mkdirSync(dirname2(path), { recursive: true });
     this.database = new DatabaseSync(path);
     this.database.exec("PRAGMA busy_timeout = 5000");
@@ -2268,95 +2379,6 @@ function applyEdits(text, edits) {
 
 // src/chat.ts
 import { spawn as spawn2 } from "node:child_process";
-
-// src/opencode.ts
-import { readFileSync } from "node:fs";
-import { homedir as homedir3 } from "node:os";
-import { resolve as resolve5 } from "node:path";
-function servicePath() {
-  return resolve5(process.env.XDG_STATE_HOME ?? resolve5(homedir3(), ".local/state"), "opencode/service.json");
-}
-function readService() {
-  try {
-    const parsed = JSON.parse(readFileSync(servicePath(), "utf8"));
-    return parsed.url ? parsed : null;
-  } catch {
-    return null;
-  }
-}
-async function service() {
-  let info = readService();
-  if (!info) {
-    run([executable("opencode2"), "service", "start"]);
-    const deadline = Date.now() + 3e4;
-    while (!(info = readService()) && Date.now() < deadline) {
-      await new Promise((resolvePromise) => setTimeout(resolvePromise, 100));
-    }
-  }
-  if (!info) throw new WorkflowError("OpenCode 2 background service did not start");
-  await requestWithService(info, "GET", "/api/health", void 0, 5e3);
-  return info;
-}
-async function requestWithService(info, method, path, body, timeout = 3e4) {
-  const headers = { "content-type": "application/json" };
-  if (info.password) headers.authorization = `Basic ${Buffer.from(`opencode:${info.password}`).toString("base64")}`;
-  const response = await fetch(new URL(path, info.url), {
-    method,
-    headers,
-    ...body === void 0 ? {} : { body: JSON.stringify(body) },
-    signal: AbortSignal.timeout(timeout)
-  });
-  if (!response.ok) throw new WorkflowError(`OpenCode API ${method} ${path} failed (${response.status}): ${await response.text()}`);
-  if (response.status === 204) return void 0;
-  return await response.json();
-}
-async function request(method, path, body) {
-  return await requestWithService(await service(), method, path, body);
-}
-async function createSession(directory, title = "New Chat") {
-  const response = await request("POST", "/api/session", { title, agent: "project-chat", location: { directory } });
-  return response.data;
-}
-async function forkSession(sourceSessionId, sourceMessageId) {
-  const response = await request("POST", `/api/session/${encodeURIComponent(sourceSessionId)}/fork`, {
-    boundary: { type: "before", messageID: sourceMessageId }
-  });
-  return response.data;
-}
-async function continueSession(sourceSessionId, directory) {
-  const response = await request("POST", `/api/session/${encodeURIComponent(sourceSessionId)}/fork`, {
-    boundary: { type: "through" }
-  });
-  const fork = response.data;
-  await request("POST", `/api/session/${encodeURIComponent(fork.id)}/move`, { directory });
-  await request("POST", `/api/session/${encodeURIComponent(fork.id)}/agent`, { agent: "project-chat" });
-  return fork;
-}
-async function prepareImplementationSession(sessionId, directory) {
-  await request("POST", `/api/session/${encodeURIComponent(sessionId)}/move`, { directory });
-  await request("POST", `/api/session/${encodeURIComponent(sessionId)}/agent`, { agent: "build" });
-}
-async function promptSession(sessionId, text, onAttempt) {
-  const info = await service();
-  onAttempt?.();
-  await requestWithService(info, "POST", `/api/session/${encodeURIComponent(sessionId)}/prompt`, { text });
-}
-async function projectSessions(directory) {
-  const locationQuery = new URLSearchParams({ "location[directory]": directory });
-  const location = await request("GET", `/api/location?${locationQuery}`);
-  const sessions = [];
-  let cursor;
-  do {
-    const query = new URLSearchParams({ project: location.project.id, order: "desc", limit: "100" });
-    if (cursor) query.set("cursor", cursor);
-    const page = await request("GET", `/api/session?${query}`);
-    sessions.push(...page.data);
-    cursor = page.cursor.next;
-  } while (cursor);
-  return sessions;
-}
-
-// src/chat.ts
 var CHAT_TITLE = "New Chat";
 function ensureCompanionInstalled(env = process.env) {
   const source = resolve6(pluginRoot(env), "dist/opencode-plugin.mjs");
@@ -2536,6 +2558,7 @@ async function openChatHistory() {
 async function runChatPane(env = process.env) {
   const root = canonical(env.HERDR_PROJECT_ROOT ?? "");
   if (primaryRepository(root) !== root) throw new WorkflowError(`Invalid Project Chat repository: ${root}`);
+  const opencode = openCodeCli(env);
   ensureCompanionInstalled(env);
   const identity = currentHerdrIdentity(env);
   const session = env.HERDR_CHAT_SESSION_ID ? { id: env.HERDR_CHAT_SESSION_ID } : await createSession(root, env.HERDR_CHAT_TAB_LABEL ?? CHAT_TITLE);
@@ -2550,12 +2573,14 @@ async function runChatPane(env = process.env) {
   });
   const herdr = new HerdrClient();
   herdr.renameTab(identity.tabId, env.HERDR_CHAT_TAB_LABEL ?? CHAT_TITLE);
-  const child = spawn2(executable("opencode2", env), [root, "--session", session.id], { stdio: "inherit", env });
+  const child = spawn2(opencode, [root, "--session", session.id], { stdio: "inherit", env });
   const exit = new Promise((resolvePromise, reject) => {
     child.once("error", (error) => reject(new WorkflowError(`Could not start opencode2: ${error.message}`)));
     child.once("close", (code) => resolvePromise(code ?? 1));
   });
-  return await exit;
+  const exitCode = await exit;
+  if (exitCode !== 0) throw new WorkflowError(`opencode2 exited with status ${exitCode}`);
+  return 0;
 }
 
 // src/cleanup.ts
@@ -2756,7 +2781,7 @@ function doctor() {
   const checks = [
     ["Node.js 24+", nodeMajor >= 24, true],
     ["herdr 0.8+", commandOk("herdr", "--version"), true],
-    ["opencode2 preview 17189", opencodeCompatible(commandOutput("opencode2", "--version")), true],
+    [`opencode2 ${EXPECTED_OPENCODE_VERSION}`, openCodeOk(), true],
     ["git", commandOk("git", "--version"), true],
     ["fzf", commandOk("fzf", "--version"), true],
     ["gh", commandOk("gh", "--version"), false],
@@ -2775,17 +2800,13 @@ function commandOk(command, argument) {
     return false;
   }
 }
-function commandOutput(command, argument) {
+function openCodeOk() {
   try {
-    const result = run([executable(command), argument], { check: false });
-    return result.exitCode === 0 ? result.stdout.trim() : "";
+    openCodeCli();
+    return true;
   } catch {
-    return "";
+    return false;
   }
-}
-function opencodeCompatible(version) {
-  const build = version.match(/0\.0\.0-next-(\d+)/)?.[1];
-  return build === "17189";
 }
 
 // src/worktrees.ts

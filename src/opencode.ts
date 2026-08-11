@@ -15,9 +15,12 @@ export interface SessionInfo {
   time: { created: number; updated: number; archived?: number }
 }
 
+export const EXPECTED_OPENCODE_VERSION = "0.0.0-next-17189"
+
 interface ServiceInfo {
   url: string
   password?: string
+  version?: string
 }
 
 function servicePath(): string {
@@ -35,16 +38,40 @@ function readService(): ServiceInfo | null {
 
 async function service(): Promise<ServiceInfo> {
   let info = readService()
-  if (!info) {
-    run([executable("opencode2"), "service", "start"])
-    const deadline = Date.now() + 30_000
-    while (!(info = readService()) && Date.now() < deadline) {
-      await new Promise((resolvePromise) => setTimeout(resolvePromise, 100))
+  if (info?.version && info.version !== EXPECTED_OPENCODE_VERSION) {
+    throw new WorkflowError(`OpenCode service version ${info.version} does not match required ${EXPECTED_OPENCODE_VERSION}`)
+  }
+  if (info) {
+    try {
+      await requestWithService(info, "GET", "/api/health", undefined, 5_000)
+      return info
+    } catch {
+      info = null
     }
   }
+  const binary = openCodeCli()
+  run([binary, "service", "start"])
+  const deadline = Date.now() + 30_000
+  while (!(info = readService()) && Date.now() < deadline) {
+    await new Promise((resolvePromise) => setTimeout(resolvePromise, 100))
+  }
   if (!info) throw new WorkflowError("OpenCode 2 background service did not start")
+  if (info.version && info.version !== EXPECTED_OPENCODE_VERSION) {
+    throw new WorkflowError(`OpenCode service version ${info.version} does not match required ${EXPECTED_OPENCODE_VERSION}`)
+  }
   await requestWithService(info, "GET", "/api/health", undefined, 5_000)
   return info
+}
+
+export function openCodeCli(env: NodeJS.ProcessEnv = process.env): string {
+  const binary = executable("opencode2", env)
+  const result = run([binary, "--version"], { check: false, env })
+  const version = result.stdout.match(/0\.0\.0-next-\d+/)?.[0]
+  if (result.exitCode !== 0 || version !== EXPECTED_OPENCODE_VERSION) {
+    const detail = result.stderr.trim() || result.stdout.trim() || `exit ${result.exitCode}`
+    throw new WorkflowError(`OpenCode CLI must be ${EXPECTED_OPENCODE_VERSION}; ${detail}`)
+  }
+  return binary
 }
 
 async function requestWithService<T>(info: ServiceInfo, method: string, path: string, body?: unknown, timeout = 30_000): Promise<T> {

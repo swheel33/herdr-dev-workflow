@@ -39,7 +39,10 @@ describe("OpenCode fork boundary", () => {
     if (!address || typeof address === "string") throw new Error("Missing test server address")
     const stateHome = mkdtempSync(resolve(tmpdir(), "wheels-opencode-"))
     mkdirSync(resolve(stateHome, "opencode"))
-    writeFileSync(resolve(stateHome, "opencode/service.json"), JSON.stringify({ url: `http://127.0.0.1:${address.port}` }))
+    writeFileSync(resolve(stateHome, "opencode/service.json"), JSON.stringify({
+      url: `http://127.0.0.1:${address.port}`,
+      version: "0.0.0-next-17189",
+    }))
     process.env.XDG_STATE_HOME = stateHome
     try {
       const fork = await forkSession("source", "dispatch-message")
