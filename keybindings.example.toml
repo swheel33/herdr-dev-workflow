@@ -5,46 +5,22 @@ command = "wheels.dev-workflow.new-blank-project"
 description = "new blank project"
 
 [[keys.command]]
-key = "prefix+o"
-type = "plugin_action"
-command = "wheels.dev-workflow.open"
-description = "open worktree or origin branch"
-
-[[keys.command]]
-key = "prefix+a"
-type = "plugin_action"
-command = "wheels.dev-workflow.open-all"
-description = "open all managed worktrees"
-
-[[keys.command]]
 key = "prefix+space"
 type = "plugin_action"
 command = "wheels.dev-workflow.chat-current"
-description = "chat for current project"
-
-[[keys.command]]
-key = "prefix+shift+space"
-type = "plugin_action"
-command = "wheels.dev-workflow.chat-picker"
-description = "chat for another project"
+description = "project chat"
 
 [[keys.command]]
 key = "prefix+c"
 type = "plugin_action"
 command = "wheels.dev-workflow.chat-history"
-description = "chats"
+description = "history"
 
 [[keys.command]]
-key = "prefix+p"
+key = "prefix+s"
 type = "plugin_action"
-command = "wheels.dev-workflow.retry-cleanup"
-description = "retry pending worktree cleanup"
-
-[[keys.command]]
-key = "prefix+shift+p"
-type = "plugin_action"
-command = "wheels.dev-workflow.show-cleanup-failures"
-description = "show pending worktree cleanup failures"
+command = "wheels.dev-workflow.workflow-status"
+description = "workflow status"
 
 [[keys.command]]
 key = "prefix+g"

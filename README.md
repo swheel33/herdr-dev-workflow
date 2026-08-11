@@ -1,245 +1,171 @@
 # Wheels Dev Workflow
 
-Herdr workflow plugin for project-level chat, delegated OpenCode implementation,
-Git worktrees, project creation, and automatic cleanup.
+Herdr plugin for discussion-first project chat, OpenCode 2 implementation
+dispatch, disposable Git worktrees, and durable cleanup.
 
 ## Requirements
 
-- Herdr 0.8.0 or newer on the stable channel
-- `git`, `python3`, `opencode`, `fzf`, and `zsh`
-- `gh` for GitHub-backed project creation and merged-PR cleanup
-- `nvim`, `lazygit`, and `pnpm` for the optional development actions
+- Herdr 0.8.0 or newer
+- Node.js 24 or newer
+- `git`, `opencode2` preview 17189, and `fzf`
+- `pnpm` to bootstrap implementation worktrees
+- `gh` for GitHub project creation, pull-request targets, and merged-PR cleanup
+- `nvim` and `lazygit` for their optional actions
 
-Install `fzf` separately if it is not already available:
+Install the OpenCode 2 preview alongside OpenCode V1:
 
 ```bash
-# macOS
-brew install fzf
-
-# Debian or Ubuntu
-sudo apt install fzf
+pnpm add -g --allow-build=@opencode-ai/cli @opencode-ai/cli@0.0.0-next-17189
 ```
 
 ## Installation
 
 ```bash
-herdr integration install opencode
 herdr plugin install swheel33/herdr-dev-workflow --yes
 herdr config check
-herdr plugin action invoke wheels.dev-workflow.doctor
+herdr plugin action invoke wheels.dev-workflow.workflow-status
 ```
 
-For local plugin development:
+For local development:
 
 ```bash
-herdr plugin link /path/to/herdr-dev-workflow
+pnpm install
+pnpm build
+herdr plugin link /path/to/herdr-dev-workflow --enabled
 ```
 
-## Workflow Model
-
-Each repository has two kinds of Herdr workspace:
-
-- The primary repository workspace is the project home. It contains Project
-  Chat tabs for discussion, planning, review, and dispatch.
-- Linked-worktree workspaces contain implementation agents and shells. They are
-  disposable and map to branches under `wheels/*`.
-
-Project Chat is deliberately discussion-only. Its OpenCode agent inherits the
-normal user configuration, MCPs, plugins, credentials, and TUI settings, but it
-denies file edits in the primary checkout and disables Build, Plan, agent
-switching, and OpenCode session-management controls.
+The Herdr startup hook creates the private SQLite database and installs a small,
+managed OpenCode loader under `~/.config/opencode/plugins`. It adds that loader
+to the V2 `plugins` array while preserving JSONC formatting and existing plugin
+entries. There is no separate companion-plugin installation.
 
 ## Project Chat
 
-Available actions:
+Project Chat is the project home for discussion, planning, inspection, and
+review. Its OpenCode agent denies edits, shell commands, and subagents while
+retaining normal read, search, web, MCP, model, credential, and provider
+configuration.
 
-- **Chat for current project** resolves the repository behind the focused pane.
-  A linked worktree resolves back to its primary repository. If the pane is not
-  inside Git, the project picker opens.
-- **Chat for another project** opens the project picker.
-- **Chats** opens searchable history for the focused pane's primary project.
+Chat actions:
 
-Project discovery combines repositories previously adopted by the plugin with
-Git repositories under `HERDR_PROJECTS_ROOT`, or `~/Projects` by default.
-Managed `.worktrees` directories are excluded and linked checkouts are
-deduplicated back to their primary repository.
+- **Project Chat** resolves the focused checkout back to its primary repository.
+  Outside a Git checkout it opens the project picker under
+  `HERDR_PROJECTS_ROOT`, defaulting to `~/Projects`.
+- **History** searches the current project's native OpenCode session history and
+  forks the selected context into a new Project Chat.
 
-### Dispatch
+OpenCode remains authoritative for messages, attachments, compaction, session
+lineage, and history. The plugin never exports or copies transcripts.
 
-When a request needs code changes, Project Chat invokes the dispatcher once with
-a complete handoff. The dispatcher:
+## Dispatch
 
-1. Validates the source Project Chat, repository, and requested slug.
-2. Fetches `origin` and safely synchronizes a clean, fast-forwardable primary
-   `main` with `origin/main`.
-3. Creates `wheels/<slug>` at `<repo>/.worktrees/<slug>` without changing focus.
-4. Splits the implementation workspace into a 70% OpenCode pane and a 30%
-   interactive shell, also without changing focus.
-5. Exports the source Project Chat and removes its active dispatcher tool-call
-   turn and executable dispatch commands.
-6. Starts one fresh OpenCode Build session with a structured initial prompt
-   containing the implementation task, execution rules, worktree path, and
-   sanitized prior discussion. The prompt explicitly forbids redispatch.
-7. Succeeds only after Herdr reports the fresh implementation session identity
-   in a structured working-state transition.
-8. Records the source and implementation sessions as one logical history thread.
-9. Ensures one fresh, unfocused Project Chat exists in the primary workspace and
-   closes the used chat without creating a duplicate.
+When implementation is requested, Project Chat calls one typed
+`dispatch_implementation` tool. The tool receives the authoritative OpenCode
+session and message IDs, so it can fork immediately before the active dispatch
+turn without parsing commands or transcript text.
 
-The implementation workspace never steals focus. The dispatcher does not call
-`workspace focus` or `tab focus`. If the user moved elsewhere while dispatch was
-starting, the new workspace and replacement Project Chat remain in the
-background. If the used Project Chat is still active, closing it naturally
-reveals the fresh project home screen.
+Dispatch supports:
 
-Failures before confirmed prompt delivery leave the source Project Chat open
-with the exact error. After delivery, the implementation is already running;
-history persistence and chat replacement failures are reported as non-fatal
-cleanup warnings and must not be retried.
+- **New work**: create `wheels/<slug>` from the repository default branch at
+  `<repo>/.worktrees/<slug>`.
+- **Existing branch**: reuse its linked checkout or create a tracking worktree.
+- **Pull request**: resolve a same-repository PR number or URL to its exact head.
+  Cross-repository PRs are rejected before mutation.
 
-Primary synchronization never resets or force-updates local work. Dirty or
-diverged primary checkouts block dispatch. Repositories without `origin` use an
-available local base branch.
+The target workspace opens in the background with a 70% OpenCode Build pane and
+a 30% shell. Matching `apps/*/.env` files are symlinked from the primary
+checkout, and `pnpm install` starts in the shell pane.
 
-### Combined History
+The source session is forked with a native `before` boundary, moved to the
+target checkout, switched to Build, and prompted through the V2 HTTP API. The
+prompt request is the delivery boundary:
 
-Dispatch copies a sanitized, human-readable Project Chat transcript into the
-fresh Build session's initial structured handoff. It does not fork the live
-Project Chat, so an in-progress dispatcher tool call cannot continue inside the
-implementation agent. The implementation session still contains the prior
-discussion, dispatched plan, implementation decisions, tool activity, and
-resulting change context.
+- Before the prompt request begins, a failure is retryable. Any worktree,
+  workspace, branch, or fork already created is deliberately preserved for
+  inspection instead of being rolled back.
+- After the request begins, replacement-chat and bookkeeping failures are
+  warnings and never cause a second implementation prompt.
+- If the prompt request starts but its response is lost or times out, delivery is
+  recorded as unknown and the implementation workspace is preserved. The same
+  source turn remains non-retryable to prevent duplicate implementation.
 
-The **Chats** picker collapses the source and implementation sessions into one
-logical row and selects the latest session in that thread. Because the Build
-session's initial handoff contains the earlier discussion, choosing a dispatched
-thread can still fork the complete record into a discussion-only Project Chat at
-the primary repository root. This remains usable after the implementation
-worktree and branch have been deleted, which is useful when a merged change
-needs a follow-up.
+New dispatches safely fast-forward a clean primary default branch. Dirty or
+diverged primary checkouts block new-branch dispatch. Existing targets are never
+reset, rebased, or rewritten by dispatch.
 
-The history popup displays `Loading chat history...` while that project's
-OpenCode sessions are enumerated, then opens `fzf` with title and update time.
-Native root sessions that have never dispatched remain independent rows.
-Sessions created before thread tracking was introduced cannot be paired
-retroactively.
+## Cleanup
 
-OpenCode remains the source of truth for transcript content. The plugin stores
-only session relationships and dispatch metadata in
-`$HERDR_PLUGIN_STATE_DIR/dispatch-threads.json`.
+Closing a dispatched linked-worktree workspace permanently removes its checkout.
+Uncommitted worktree changes are force-discarded by design.
 
-## New Blank Project
+Branch deletion follows explicit SQLite ownership:
 
-Run **New blank project** from any Herdr session. The popup asks for a project
-name, parent directory, and optional GitHub visibility. The parent defaults to
-`HERDR_PROJECTS_ROOT` or `~/Projects`.
+- New work owns its local `wheels/*` branch and same-named remote branch, so both
+  may be deleted.
+- An existing local branch keeps both its local and remote branch.
+- An origin branch or PR owns only the local tracking branch created for its
+  worktree; cleanup deletes that local branch and preserves the remote.
+- Branch names and prefixes never prove ownership by themselves.
 
-The workflow creates no framework, package-manager files, README, `.gitignore`,
-source code, or dependencies. It only validates the destination, initializes
-Git on `main`, creates an empty `Initial commit`, registers the repository, and
-opens its primary workspace with Project Chat. An existing empty destination is
-allowed; non-empty directories, files, symbolic-link destinations, and path
-traversal are rejected.
+Cleanup persists and retries these phases:
 
-GitHub creation requires authenticated `gh`. If GitHub authentication, remote
-creation, or pushing fails, the initialized local repository is retained and
-opened with the exact error reported.
+1. Validate repository, checkout, branch, ownership, and protected-branch rules.
+2. Delete an owned remote branch when present.
+3. Unlock and force-remove the linked checkout.
+4. Delete the local branch when the plugin created it.
+5. Prune Git worktree metadata.
 
-## Worktree Cleanup
+The primary checkout, its branch, the repository default branch, `main`,
+`master`, and `HERDR_PROTECTED_BRANCHES` are never deleted. Duplicate Herdr
+events and concurrent cleanup processes are serialized through SQLite leases.
 
-Closing a linked-worktree workspace is permanent cleanup. Uncommitted worktree
-changes are force-discarded. Cleanup persists and retries these idempotent phases:
+**Workflow Status** retries pending jobs and displays anything still failing.
 
-1. Delete the configured upstream branch, or the same-named `origin` branch.
-2. Unlock and force-remove the linked checkout.
-3. Delete the local branch.
-4. Prune Git worktree metadata.
+## Automatic Pruning
 
-Primary checkouts, their checked-out branches, `origin/HEAD`, `main`, `master`,
-and branches listed in `HERDR_PROTECTED_BRANCHES` are protected. Cleanup stops
-rather than guessing when event, path, branch, or repository metadata conflicts.
+A singleton hourly watcher examines every dispatched linked worktree. New work,
+existing branches, and PR targets use the same pruning path. It closes a
+workspace when its exact head is integrated into the repository default branch
+or matches a same-repository merged pull request. A target with no implementation
+commits is not considered integrated unless its exact PR head was merged.
 
-A singleton poller fetches known repositories at startup and hourly. It closes a
-clean, idle `wheels/*` workspace when its exact head is integrated into
-`origin/main`, or when a merged pull request matches both branch and head commit.
-It will not auto-close while multiple Herdr sessions are running, the workspace
-is focused, the agent is active, or the checkout is dirty. Blocked worktrees are
-re-evaluated later without repeated notifications.
+Automatic closure is blocked while multiple Herdr sessions run, the workspace
+is focused, the agent is active, or the checkout is dirty. The first block is
+reported and later scans reconsider it. Set `HERDR_AUTO_PRUNE_INTERVAL_SECONDS`
+to change the interval; values below 60 seconds are clamped.
 
-Set `HERDR_AUTO_PRUNE_INTERVAL_SECONDS` to change the polling interval. Values
-below 60 seconds are clamped.
+Every blocked, attempted, completed, and failed automatic prune is recorded in
+SQLite. **Workflow Status** shows the 20 most recent prune and cleanup entries.
 
-Cleanup actions:
+## Blank Projects
 
-- **Retry pending worktree cleanup**
-- **Show pending worktree cleanup failures**
-- **Show worktree cleanup log**
-- **Adopt current workspaces**
+**New blank project** creates only a Git repository on `main` with an empty
+`Initial commit`, then opens Project Chat. The popup optionally creates and
+pushes a public or private GitHub repository. GitHub failure preserves the local
+repository.
 
-## Startup Reconciliation
+## State
 
-At startup the plugin retries pending cleanup, adopts known repositories, keeps
-pending cleanup paths closed, opens registered linked worktrees that lack a
-workspace, applies the standard 70/30 layout in parallel, and starts merged-PR
-polling. Git worktree metadata remains the source of truth for checkouts.
+All plugin state lives in:
 
-To rebuild a named Herdr session without treating each workspace close as
-permanent worktree cleanup:
-
-```bash
-herdr plugin action invoke wheels.dev-workflow.adopt-workspaces
-herdr session stop <name>
-herdr session delete <name>
-herdr --session <name>
+```text
+$HERDR_PLUGIN_STATE_DIR/workflow.sqlite
 ```
 
-The rebuilt session recreates OpenCode and shell processes; it does not restore
-live terminal processes or scrollback.
+The database stores dispatch receipts, managed-target ownership, cleanup jobs,
+Project Chat pane mappings, auto-prune blocks, repository discovery, and bounded
+diagnostic messages. It does not store prompts, transcripts, or OpenCode
+history. SQLite failures stop destructive work rather than falling back to
+guessed state.
 
 ## Other Actions
 
-- **New personal branch** creates a managed worktree.
-- **Open worktree or origin branch** opens an existing checkout or remote branch.
-- **Open all managed worktrees** restores every managed checkout.
-- **Open lazygit** and **Open Neovim** launch project tools.
-- **Check workflow dependencies** validates local requirements.
+- **Open lazygit**
+- **Open Neovim**
+- **Workflow Status** checks dependencies, retries cleanup, reports remaining
+  failures, and shows recent pruning activity.
 
-## Keybindings
-
-Suggested bindings from [`keybindings.example.toml`](keybindings.example.toml):
-
-- `prefix+space`: chat for current project
-- `prefix+shift+space`: chat for another project
-- `prefix+c`: search combined chat history
-- `prefix+n`: create a blank project
-- `prefix+o`: open a worktree or `origin/*` branch
-- `prefix+a`: open all managed worktrees
-- `prefix+p`: retry pending cleanup jobs
-- `prefix+shift+p`: show pending cleanup failures
-- `prefix+g`: open lazygit
-- `prefix+e`: open Neovim
-
-Add the example entries to `~/.config/herdr/config.toml`, then run
-`herdr server reload-config` or restart Herdr.
-
-## State And Logs
-
-Structured lifecycle events are written to:
-
-```text
-$HERDR_PLUGIN_STATE_DIR/lifecycle.jsonl
-```
-
-The log contains hook payloads, command results, dispatch transitions,
-notifications, reconciliation, and cleanup phases. It rotates at 5 MiB and
-retains one previous file. Logging is best-effort and never blocks cleanup.
-
-Pending cleanup jobs, repository discovery, merged-worktree safety blocks, and
-dispatch thread relationships live under `$HERDR_PLUGIN_STATE_DIR`. Use **Show
-worktree cleanup log** to view the newest 1,000 lifecycle entries in Herdr.
-
-## Neovim Clipboard
-
-Herdr forwards OSC 52 clipboard writes. Merge the relevant settings from
+Suggested shortcuts are in [`keybindings.example.toml`](keybindings.example.toml).
+Herdr forwards OSC 52 clipboard writes; merge the relevant settings from
 [`examples/nvim/options.lua`](examples/nvim/options.lua) into the existing
-Neovim configuration rather than replacing it.
+Neovim configuration.

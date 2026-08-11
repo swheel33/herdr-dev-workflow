@@ -1,107 +1,59 @@
 id = "wheels.dev-workflow"
 name = "Wheels Dev Workflow"
-version = "0.0.1"
+version = "0.1.0"
 min_herdr_version = "0.8.0"
-description = "Personal Herdr workflows for managed git worktrees and development tools."
+description = "Agent-driven project chat, implementation worktrees, and safe lifecycle cleanup."
 platforms = ["macos", "linux"]
 
 [[actions]]
 id = "new-blank-project"
 title = "New blank project"
 contexts = ["global"]
-command = ["bash", "-lc", "exec python3 \"$HERDR_PLUGIN_ROOT/blank_project.py\" open-pane"]
-
-[[actions]]
-id = "new-branch"
-title = "New personal branch"
-contexts = ["workspace"]
-command = ["bash", "-lc", "exec \"$HERDR_PLUGIN_ROOT/dev-workflow.sh\" open-pane new-branch"]
-
-[[actions]]
-id = "open"
-title = "Open worktree or origin branch"
-contexts = ["workspace"]
-command = ["bash", "-lc", "exec \"$HERDR_PLUGIN_ROOT/dev-workflow.sh\" open-pane open"]
-
-[[actions]]
-id = "open-all"
-title = "Open all managed worktrees"
-contexts = ["workspace"]
-command = ["bash", "-lc", "exec \"$HERDR_PLUGIN_ROOT/dev-workflow.sh\" open-all"]
-
-[[actions]]
-id = "adopt-workspaces"
-title = "Adopt current workspaces"
-contexts = ["global", "workspace"]
-command = ["bash", "-lc", "exec python3 \"$HERDR_PLUGIN_ROOT/lifecycle.py\" adopt"]
+command = ["bash", "-lc", "exec node \"$HERDR_PLUGIN_ROOT/dist/cli.mjs\" open-pane new-blank-project"]
 
 [[actions]]
 id = "chat-current"
-title = "Chat for current project"
+title = "Project Chat"
 contexts = ["workspace"]
-command = ["bash", "-lc", "exec python3 \"$HERDR_PLUGIN_ROOT/dispatcher.py\" chat-current"]
-
-[[actions]]
-id = "chat-picker"
-title = "Chat for another project"
-contexts = ["workspace"]
-command = ["bash", "-lc", "exec \"$HERDR_PLUGIN_ROOT/dev-workflow.sh\" open-pane dispatcher-picker"]
+command = ["bash", "-lc", "exec node \"$HERDR_PLUGIN_ROOT/dist/cli.mjs\" chat-current"]
 
 [[actions]]
 id = "chat-history"
-title = "Chats"
+title = "History"
 contexts = ["workspace"]
-command = ["bash", "-lc", "exec \"$HERDR_PLUGIN_ROOT/dev-workflow.sh\" open-pane dispatcher-history"]
-
-[[startup]]
-command = ["bash", "-lc", "exec python3 \"$HERDR_PLUGIN_ROOT/lifecycle.py\" startup"]
-
-[[startup]]
-command = ["bash", "-lc", "exec python3 \"$HERDR_PLUGIN_ROOT/lifecycle.py\" watch-merged"]
-
-[[events]]
-on = "workspace.closed"
-command = ["bash", "-lc", "exec python3 \"$HERDR_PLUGIN_ROOT/lifecycle.py\" event"]
-
-[[events]]
-on = "worktree.removed"
-command = ["bash", "-lc", "exec python3 \"$HERDR_PLUGIN_ROOT/lifecycle.py\" event"]
+command = ["bash", "-lc", "exec node \"$HERDR_PLUGIN_ROOT/dist/cli.mjs\" open-pane dispatcher-history"]
 
 [[actions]]
-id = "retry-cleanup"
-title = "Retry pending worktree cleanup"
-contexts = ["global", "workspace"]
-command = ["bash", "-lc", "exec python3 \"$HERDR_PLUGIN_ROOT/lifecycle.py\" retry"]
-
-[[actions]]
-id = "show-cleanup-failures"
-title = "Show pending worktree cleanup failures"
+id = "workflow-status"
+title = "Workflow Status"
 contexts = ["workspace"]
-command = ["bash", "-lc", "exec \"$HERDR_PLUGIN_ROOT/dev-workflow.sh\" open-pane cleanup-failures"]
-
-[[actions]]
-id = "show-cleanup-log"
-title = "Show worktree cleanup log"
-contexts = ["workspace"]
-command = ["bash", "-lc", "exec \"$HERDR_PLUGIN_ROOT/dev-workflow.sh\" open-pane cleanup-log"]
+command = ["bash", "-lc", "exec node \"$HERDR_PLUGIN_ROOT/dist/cli.mjs\" open-pane workflow-status"]
 
 [[actions]]
 id = "lazygit"
 title = "Open lazygit"
 contexts = ["workspace"]
-command = ["bash", "-lc", "exec \"$HERDR_PLUGIN_ROOT/dev-workflow.sh\" open-pane lazygit"]
+command = ["bash", "-lc", "exec node \"$HERDR_PLUGIN_ROOT/dist/cli.mjs\" open-pane lazygit"]
 
 [[actions]]
 id = "nvim"
 title = "Open Neovim"
 contexts = ["workspace"]
-command = ["bash", "-lc", "exec \"$HERDR_PLUGIN_ROOT/dev-workflow.sh\" open-pane nvim"]
+command = ["bash", "-lc", "exec node \"$HERDR_PLUGIN_ROOT/dist/cli.mjs\" open-pane nvim"]
 
-[[actions]]
-id = "doctor"
-title = "Check workflow dependencies"
-contexts = ["workspace"]
-command = ["bash", "-lc", "exec \"$HERDR_PLUGIN_ROOT/dev-workflow.sh\" open-pane doctor"]
+[[startup]]
+command = ["bash", "-lc", "exec node \"$HERDR_PLUGIN_ROOT/dist/cli.mjs\" startup"]
+
+[[startup]]
+command = ["bash", "-lc", "exec node \"$HERDR_PLUGIN_ROOT/dist/cli.mjs\" watch-merged"]
+
+[[events]]
+on = "workspace.closed"
+command = ["bash", "-lc", "exec node \"$HERDR_PLUGIN_ROOT/dist/cli.mjs\" event"]
+
+[[events]]
+on = "worktree.removed"
+command = ["bash", "-lc", "exec node \"$HERDR_PLUGIN_ROOT/dist/cli.mjs\" event"]
 
 [[panes]]
 id = "new-blank-project"
@@ -109,61 +61,37 @@ title = "New blank project"
 placement = "popup"
 width = "80%"
 height = 18
-command = ["bash", "-lc", "exec python3 \"$HERDR_PLUGIN_ROOT/blank_project.py\" interactive"]
-
-[[panes]]
-id = "new-branch"
-title = "New personal branch"
-placement = "popup"
-width = "80%"
-height = "60%"
-command = ["bash", "-lc", "exec \"$HERDR_PLUGIN_ROOT/dev-workflow.sh\" new-branch-pane"]
-
-[[panes]]
-id = "open"
-title = "Open worktree or origin branch"
-placement = "popup"
-width = "90%"
-height = "70%"
-command = ["bash", "-lc", "exec \"$HERDR_PLUGIN_ROOT/dev-workflow.sh\" open-pane-entry"]
+command = ["bash", "-lc", "exec node \"$HERDR_PLUGIN_ROOT/dist/cli.mjs\" blank-project"]
 
 [[panes]]
 id = "dispatcher-chat"
-title = "Project chat"
+title = "Project Chat"
 placement = "tab"
-command = ["bash", "-lc", "exec python3 \"$HERDR_PLUGIN_ROOT/dispatcher.py\" run-chat"]
+command = ["bash", "-lc", "exec node \"$HERDR_PLUGIN_ROOT/dist/cli.mjs\" run-chat"]
 
 [[panes]]
 id = "dispatcher-picker"
-title = "Chat for another project"
+title = "Select Project"
 placement = "popup"
 width = "80%"
 height = "70%"
-command = ["bash", "-lc", "exec python3 \"$HERDR_PLUGIN_ROOT/dispatcher.py\" chat-picker"]
+command = ["bash", "-lc", "exec node \"$HERDR_PLUGIN_ROOT/dist/cli.mjs\" chat-picker"]
 
 [[panes]]
 id = "dispatcher-history"
-title = "Chats"
+title = "History"
 placement = "popup"
 width = "90%"
 height = "75%"
-command = ["bash", "-lc", "exec python3 \"$HERDR_PLUGIN_ROOT/dispatcher.py\" chat-history"]
+command = ["bash", "-lc", "exec node \"$HERDR_PLUGIN_ROOT/dist/cli.mjs\" chat-history"]
 
 [[panes]]
-id = "cleanup-failures"
-title = "Pending worktree cleanup failures"
+id = "workflow-status"
+title = "Workflow Status"
 placement = "popup"
 width = "90%"
-height = "70%"
-command = ["bash", "-lc", "exec python3 \"$HERDR_PLUGIN_ROOT/lifecycle.py\" show-pane"]
-
-[[panes]]
-id = "cleanup-log"
-title = "Worktree cleanup log"
-placement = "popup"
-width = "95%"
-height = "85%"
-command = ["bash", "-lc", "exec python3 \"$HERDR_PLUGIN_ROOT/lifecycle.py\" show-log-pane"]
+height = "80%"
+command = ["bash", "-lc", "exec node \"$HERDR_PLUGIN_ROOT/dist/cli.mjs\" workflow-status"]
 
 [[panes]]
 id = "lazygit"
@@ -178,11 +106,3 @@ id = "nvim"
 title = "Neovim"
 placement = "overlay"
 command = ["nvim"]
-
-[[panes]]
-id = "doctor"
-title = "Workflow dependency check"
-placement = "popup"
-width = "80%"
-height = 20
-command = ["bash", "-lc", "exec \"$HERDR_PLUGIN_ROOT/dev-workflow.sh\" doctor"]

@@ -1,0 +1,104 @@
+import { WorkflowError } from "./errors.js"
+import { HerdrClient } from "./herdr.js"
+import { forkSession, prepareImplementationSession, promptSession } from "./opencode.js"
+import { StateStore, type TargetKind } from "./state.js"
+import { prepareTarget } from "./worktrees.js"
+
+export interface DispatchRequest {
+  request: string
+  targetKind: TargetKind
+  target: string
+  sourceSessionId: string
+  sourceMessageId: string
+}
+
+function handoff(checkout: string, request: string): string {
+  return `Implement the requested change directly in ${checkout}.
+
+Do not dispatch again or create another worktree. Preserve unrelated changes. Do not commit or push unless the request explicitly asks.
+
+Request:
+${request}`
+}
+
+export async function dispatchImplementation(request: DispatchRequest, store = new StateStore()): Promise<string> {
+  const chat = store.chat(request.sourceSessionId)
+  if (!chat) throw new WorkflowError("This session is not a registered Herdr Project Chat")
+  const text = request.request.trim()
+  const target = request.target.trim()
+  if (!text || !target) throw new WorkflowError("Dispatch request and target must not be empty")
+  if (!store.beginDispatch({
+    sourceSessionId: request.sourceSessionId,
+    sourceMessageId: request.sourceMessageId,
+    projectRoot: chat.projectRoot,
+    request: "",
+    targetKind: request.targetKind,
+    targetValue: target,
+  })) {
+    throw new WorkflowError("This dispatch turn has already been accepted; do not retry it")
+  }
+
+  const herdr = new HerdrClient(chat.herdrBin, chat.socketPath ?? undefined)
+  let implementationSessionId: string | undefined
+  let prepared: ReturnType<typeof prepareTarget> | undefined
+  let promptStarted = false
+  try {
+    prepared = prepareTarget({
+      repoRoot: chat.projectRoot,
+      target: { kind: request.targetKind, value: target },
+      store,
+      herdr,
+    })
+    store.updateDispatch(request.sourceSessionId, request.sourceMessageId, {
+      status: "preparing",
+      branch: prepared.branch,
+      checkoutPath: prepared.checkoutPath,
+    })
+    const fork = await forkSession(request.sourceSessionId, request.sourceMessageId)
+    implementationSessionId = fork.id
+    store.updateDispatch(request.sourceSessionId, request.sourceMessageId, {
+      status: "preparing",
+      implementationSessionId: fork.id,
+    })
+    await prepareImplementationSession(fork.id, prepared.checkoutPath)
+    herdr.launchOpenCode(prepared.rootPaneId, prepared.checkoutPath, fork.id)
+    await promptSession(fork.id, handoff(prepared.checkoutPath, text), () => { promptStarted = true })
+    try {
+      store.updateDispatch(request.sourceSessionId, request.sourceMessageId, {
+        status: "delivered",
+        implementationSessionId: fork.id,
+      })
+    } catch (error) {
+      herdr.notify("Dispatch bookkeeping incomplete", `Implementation started, but its receipt could not be updated: ${error}. Do not redispatch.`)
+    }
+  } catch (error) {
+    const detail = error instanceof Error ? error.message : String(error)
+    if (promptStarted) {
+      try {
+        store.updateDispatch(request.sourceSessionId, request.sourceMessageId, {
+          status: "delivery_unknown",
+          ...(implementationSessionId ? { implementationSessionId } : {}),
+          error: detail,
+        })
+      } catch { /* the durable receipt still prevents redispatch */ }
+      throw new WorkflowError(`OpenCode prompt delivery could not be confirmed. The implementation workspace was preserved; inspect it and do not redispatch. ${detail}`)
+    }
+    store.deleteDispatch(request.sourceSessionId, request.sourceMessageId)
+    const location = prepared ? ` Artifacts were preserved at ${prepared.checkoutPath} on ${prepared.branch}.` : " Any artifacts created before the failure were preserved."
+    throw new WorkflowError(`Dispatch stopped before implementation prompting.${location} ${detail}`)
+  }
+
+  try {
+    herdr.openPluginPane("dispatcher-chat", {
+      cwd: chat.projectRoot,
+      workspaceId: chat.workspaceId,
+      placement: "tab",
+      focus: false,
+      env: { HERDR_PROJECT_ROOT: chat.projectRoot },
+    })
+    herdr.closeTab(chat.tabId)
+  } catch (error) {
+    herdr.notify("Dispatch cleanup incomplete", `Implementation started, but Project Chat reset failed: ${error}. Do not redispatch.`)
+  }
+  return `Implementation started in ${prepared!.branch} at ${prepared!.checkoutPath}. Do not dispatch this request again.`
+}
