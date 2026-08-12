@@ -21,6 +21,30 @@ interface ServiceInfo {
   version?: string
 }
 
+export const PROJECT_CHAT_ENVIRONMENT = [
+  "HERDR_PROJECT_CHAT",
+  "HERDR_PROJECT_ROOT",
+] as const
+
+const HERDR_SESSION_ENVIRONMENT = [
+  "HERDR_ENV",
+  "HERDR_PANE_ID",
+  "HERDR_PLUGIN_CONTEXT_JSON",
+  "HERDR_PLUGIN_EVENT",
+  "HERDR_PLUGIN_EVENT_JSON",
+  "HERDR_PLUGIN_ID",
+  "HERDR_SOCKET_PATH",
+  "HERDR_TAB_ID",
+  "HERDR_WORKSPACE_ID",
+  ...PROJECT_CHAT_ENVIRONMENT,
+] as const
+
+export function sharedOpenCodeEnvironment(env: NodeJS.ProcessEnv = process.env): NodeJS.ProcessEnv {
+  const sanitized = { ...env }
+  for (const name of HERDR_SESSION_ENVIRONMENT) delete sanitized[name]
+  return sanitized
+}
+
 function servicePath(env: NodeJS.ProcessEnv = process.env): string {
   return resolve(env.XDG_STATE_HOME ?? resolve(homedir(), ".local/state"), "opencode/service.json")
 }
@@ -55,14 +79,15 @@ async function healthy(info: ServiceInfo): Promise<boolean> {
 }
 
 async function service(env: NodeJS.ProcessEnv = process.env): Promise<ServiceInfo> {
-  const cli = cliIdentity(env)
-  let info = readService(env)
+  const sharedEnv = sharedOpenCodeEnvironment(env)
+  const cli = cliIdentity(sharedEnv)
+  let info = readService(sharedEnv)
   if (info?.version === cli.version && await healthy(info)) return info
 
-  run([cli.binary, "service", info ? "restart" : "start"], { env })
+  run([cli.binary, "service", info ? "restart" : "start"], { env: sharedEnv })
   const deadline = Date.now() + 30_000
   while (Date.now() < deadline) {
-    info = readService(env)
+    info = readService(sharedEnv)
     if (info?.version === cli.version && await healthy(info)) return info
     await new Promise((resolvePromise) => setTimeout(resolvePromise, 100))
   }
@@ -78,12 +103,16 @@ export function openCodeVersion(env: NodeJS.ProcessEnv = process.env): string {
   return cliIdentity(env).version
 }
 
-export async function ensureOpenCodeReady(env: NodeJS.ProcessEnv = process.env): Promise<void> {
+export function ensureOpenCodeCompatible(env: NodeJS.ProcessEnv = process.env): void {
   const cli = cliIdentity(env)
   const help = run([cli.binary, "--help"], { check: false, env })
   if (help.exitCode !== 0 || !help.stdout.includes("--session") || !help.stdout.includes("--standalone")) {
     throw new WorkflowError("OpenCode 2 full TUI does not expose the required --session and --standalone options")
   }
+}
+
+export async function ensureOpenCodeReady(env: NodeJS.ProcessEnv = process.env): Promise<void> {
+  ensureOpenCodeCompatible(env)
   await service(env)
 }
 

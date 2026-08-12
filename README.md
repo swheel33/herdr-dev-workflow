@@ -55,6 +55,8 @@ persistent Project Chat hub: selecting the primary branch in Herdr opens the
 full OpenCode UI, and OpenCode's native tabs and session list own chat creation
 and history. Project Chat uses OpenCode's built-in standalone server lifecycle;
 the server companion exposes only the Project Chat primary agent in that host.
+Shared-service recovery and implementation launches explicitly discard Project
+Chat scope, so its agent configuration cannot leak into linked worktrees.
 It still shares OpenCode's standard database, credentials, MCP configuration,
 and conversation history. Invoking the action again focuses the primary
 workspace. Linked branch workspaces retain the 70/30 OpenCode Build and shell

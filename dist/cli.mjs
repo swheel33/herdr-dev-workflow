@@ -319,6 +319,27 @@ function synchronizeDefaultBranch(repo) {
 import { readFileSync } from "node:fs";
 import { homedir as homedir3 } from "node:os";
 import { resolve as resolve4 } from "node:path";
+var PROJECT_CHAT_ENVIRONMENT = [
+  "HERDR_PROJECT_CHAT",
+  "HERDR_PROJECT_ROOT"
+];
+var HERDR_SESSION_ENVIRONMENT = [
+  "HERDR_ENV",
+  "HERDR_PANE_ID",
+  "HERDR_PLUGIN_CONTEXT_JSON",
+  "HERDR_PLUGIN_EVENT",
+  "HERDR_PLUGIN_EVENT_JSON",
+  "HERDR_PLUGIN_ID",
+  "HERDR_SOCKET_PATH",
+  "HERDR_TAB_ID",
+  "HERDR_WORKSPACE_ID",
+  ...PROJECT_CHAT_ENVIRONMENT
+];
+function sharedOpenCodeEnvironment(env = process.env) {
+  const sanitized = { ...env };
+  for (const name of HERDR_SESSION_ENVIRONMENT) delete sanitized[name];
+  return sanitized;
+}
 function servicePath(env = process.env) {
   return resolve4(env.XDG_STATE_HOME ?? resolve4(homedir3(), ".local/state"), "opencode/service.json");
 }
@@ -349,13 +370,14 @@ async function healthy(info) {
   }
 }
 async function service(env = process.env) {
-  const cli = cliIdentity(env);
-  let info = readService(env);
+  const sharedEnv = sharedOpenCodeEnvironment(env);
+  const cli = cliIdentity(sharedEnv);
+  let info = readService(sharedEnv);
   if (info?.version === cli.version && await healthy(info)) return info;
-  run([cli.binary, "service", info ? "restart" : "start"], { env });
+  run([cli.binary, "service", info ? "restart" : "start"], { env: sharedEnv });
   const deadline = Date.now() + 3e4;
   while (Date.now() < deadline) {
-    info = readService(env);
+    info = readService(sharedEnv);
     if (info?.version === cli.version && await healthy(info)) return info;
     await new Promise((resolvePromise) => setTimeout(resolvePromise, 100));
   }
@@ -368,12 +390,15 @@ function openCodeCli(env = process.env) {
 function openCodeVersion(env = process.env) {
   return cliIdentity(env).version;
 }
-async function ensureOpenCodeReady(env = process.env) {
+function ensureOpenCodeCompatible(env = process.env) {
   const cli = cliIdentity(env);
   const help = run([cli.binary, "--help"], { check: false, env });
   if (help.exitCode !== 0 || !help.stdout.includes("--session") || !help.stdout.includes("--standalone")) {
     throw new WorkflowError("OpenCode 2 full TUI does not expose the required --session and --standalone options");
   }
+}
+async function ensureOpenCodeReady(env = process.env) {
+  ensureOpenCodeCompatible(env);
   await service(env);
 }
 async function requestWithService(info, method, path, body, timeout = 3e4) {
@@ -495,7 +520,8 @@ var HerdrClient = class {
     this.command(["pane", "run", paneId, command]);
   }
   launchOpenCode(paneId, checkout, sessionId) {
-    this.runInPane(paneId, `exec ${shellQuote(openCodeCli())} ${shellQuote(checkout)} --session ${shellQuote(sessionId)}`);
+    const unset = PROJECT_CHAT_ENVIRONMENT.map((name) => `-u ${name}`).join(" ");
+    this.runInPane(paneId, `exec env ${unset} ${shellQuote(openCodeCli())} ${shellQuote(checkout)} --session ${shellQuote(sessionId)}`);
   }
   runInstall(paneId, checkout) {
     this.runInPane(paneId, `cd -- ${shellQuote(checkout)} && pnpm install`);
@@ -1127,7 +1153,7 @@ async function openChat(root) {
   }
   try {
     openCodeCli();
-    await ensureOpenCodeReady();
+    ensureOpenCodeCompatible();
     const herdr = new HerdrClient();
     const workspace = primaryWorkspace(canonicalRoot, herdr);
     herdr.openPluginPane("dispatcher-chat", {
@@ -1191,7 +1217,7 @@ async function runChatPane(env = process.env) {
   if (primaryRepository(root) !== root) throw new WorkflowError(`Invalid Project Chat repository: ${root}`);
   const opencode = openCodeCli(env);
   ensureCompanionInstalled(env);
-  await ensureOpenCodeReady(env);
+  ensureOpenCodeCompatible(env);
   const identity = currentHerdrIdentity(env);
   const store = new StateStore();
   store.rememberRepository(root);

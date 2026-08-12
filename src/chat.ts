@@ -7,7 +7,7 @@ import { WorkflowError } from "./errors.js"
 import { primaryRepository } from "./git.js"
 import { currentHerdrIdentity, HerdrClient, pluginContext } from "./herdr.js"
 import { canonical, pluginRoot, stateDirectory } from "./paths.js"
-import { ensureOpenCodeReady, openCodeCli } from "./opencode.js"
+import { ensureOpenCodeCompatible, openCodeCli } from "./opencode.js"
 import { executable, run } from "./process.js"
 import { StateStore } from "./state.js"
 
@@ -126,7 +126,7 @@ export async function openChat(root: string): Promise<void> {
   }
   try {
     openCodeCli()
-    await ensureOpenCodeReady()
+    ensureOpenCodeCompatible()
     const herdr = new HerdrClient()
     const workspace = primaryWorkspace(canonicalRoot, herdr)
     herdr.openPluginPane("dispatcher-chat", {
@@ -195,7 +195,7 @@ export async function runChatPane(env: NodeJS.ProcessEnv = process.env): Promise
   if (primaryRepository(root) !== root) throw new WorkflowError(`Invalid Project Chat repository: ${root}`)
   const opencode = openCodeCli(env)
   ensureCompanionInstalled(env)
-  await ensureOpenCodeReady(env)
+  ensureOpenCodeCompatible(env)
   const identity = currentHerdrIdentity(env)
   const store = new StateStore()
   store.rememberRepository(root)
