@@ -45,9 +45,8 @@ CLI.
 ## Project Chat
 
 Project Chat is the project home for discussion, planning, inspection, and
-review. Its OpenCode agent denies edits, shell commands, and subagents while
-retaining normal read, search, web, MCP, model, credential, and provider
-configuration.
+review. Its OpenCode agent copies the built-in Plan agent's permissions and adds
+the workflow's typed implementation dispatcher.
 
 **Project Chat** resolves the focused checkout back to its primary repository.
 Outside a Git checkout it opens the project picker under `HERDR_PROJECTS_ROOT`,
