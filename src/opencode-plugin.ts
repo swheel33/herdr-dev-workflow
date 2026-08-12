@@ -2,7 +2,11 @@ import { spawn } from "node:child_process"
 import { resolve } from "node:path"
 import type { Plugin } from "@opencode-ai/plugin"
 
-const SYSTEM = `You are Project Chat for the current repository. Discuss requirements, inspect code, review, and plan without changing files or running shell commands.
+const SYSTEM = `You are Project Chat for the current repository. Discuss requirements, inspect code, review, and plan without changing project files or mutating local or remote project state. Use CLI commands and configured MCP tools when they provide relevant authenticated project context.
+
+When asked to review a GitHub pull request, use the authenticated GitHub CLI to retrieve the requested PR whenever possible. Inspect its metadata, diff, checks, reviews, general conversation comments, and inline review comments, using gh api when needed. Inline comments such as Greptile findings are not completely represented by gh pr view --comments alone.
+
+Always state the access basis for PR work accurately: "GitHub-fetched PR" only after successfully retrieving the requested PR through GitHub; "local refs only" when inspecting repository refs without retrieving the PR; or "unable to access requested PR" when neither source is available. Report authentication, authorization, network, repository, and partial-data limitations explicitly. Never imply that you reviewed a PR, its comments, or its current state when you did not retrieve that data.
 
 When the user asks to implement work, call dispatch_implementation exactly once. Use targetKind "new" with a short slug for new work, "branch" for an existing local or origin branch, or "pr" for a pull request number or URL. Include the complete implementation request. Do not reproduce Git or Herdr steps manually.`
 
@@ -37,19 +41,19 @@ const plugin: Plugin.Plugin = {
     }
     if (!options.pluginRoot || !options.stateDir) throw new Error("Wheels pluginRoot and stateDir options are required")
     await ctx.agent.transform((agents) => {
+      const planPermissions = agents.get("plan")?.permissions
+      if (!planPermissions) throw new Error("OpenCode plan agent is required for Project Chat")
       for (const current of agents.list()) {
         if (current.mode !== "subagent") agents.update(String(current.id), (agent) => { agent.hidden = true })
       }
       agents.update("project-chat", (agent) => {
-        agent.description = "Discussion-only project coordination and implementation dispatch"
+        agent.description = "Read-only project coordination, authenticated inspection, and implementation dispatch"
         agent.system = SYSTEM
         agent.mode = "primary"
         agent.hidden = false
         agent.color = "#D27E99"
+        agent.permissions = planPermissions.map((permission) => ({ ...permission }))
         agent.permissions.push(
-          { action: "edit", resource: "*", effect: "deny" },
-          { action: "shell", resource: "*", effect: "deny" },
-          { action: "subagent", resource: "*", effect: "deny" },
           { action: "dispatch_implementation", resource: "*", effect: "allow" },
         )
       })
