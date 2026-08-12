@@ -1,8 +1,9 @@
 import { WorkflowError } from "./errors.js"
 import { primaryRepository } from "./git.js"
-import { HerdrClient } from "./herdr.js"
+import { currentHerdrIdentity, HerdrClient } from "./herdr.js"
 import { forkSession, getSession, prepareImplementationSession, promptSession, renameSession } from "./opencode.js"
-import { StateStore, type TargetKind } from "./state.js"
+import { canonical } from "./paths.js"
+import { StateStore, type ProjectHub, type TargetKind } from "./state.js"
 import { prepareTarget } from "./worktrees.js"
 
 export interface DispatchRequest {
@@ -22,12 +23,45 @@ Request:
 ${request}`
 }
 
+function liveHub(hub: ProjectHub): boolean {
+  const herdr = new HerdrClient(hub.herdrBin, hub.socketPath ?? undefined)
+  try {
+    return herdr.tabs().some((tab) => String(tab.tab_id) === hub.tabId)
+      && herdr.panes(hub.workspaceId).some((pane) => String(pane.pane_id) === hub.paneId)
+  } catch {
+    return false
+  }
+}
+
+function resolveHub(projectRoot: string, store: StateStore, env: NodeJS.ProcessEnv = process.env): ProjectHub {
+  const registered = store.hub(projectRoot)
+  if (registered && liveHub(registered)) return registered
+
+  const environmentRoot = env.HERDR_PROJECT_ROOT
+  if (environmentRoot && canonical(environmentRoot) === projectRoot) {
+    try {
+      const recovered = {
+        projectRoot,
+        ...currentHerdrIdentity(env),
+        herdrBin: env.HERDR_BIN_PATH ?? "herdr",
+        socketPath: env.HERDR_SOCKET_PATH ?? null,
+      }
+      if (liveHub(recovered)) {
+        store.registerHub(recovered)
+        return recovered
+      }
+    } catch { /* report the missing hub below */ }
+  }
+
+  if (registered) store.deleteHub(projectRoot, registered.paneId)
+  throw new WorkflowError("This repository does not have a live Herdr Project Chat hub")
+}
+
 export async function dispatchImplementation(request: DispatchRequest, store = new StateStore()): Promise<string> {
   const source = await getSession(request.sourceSessionId)
   const projectRoot = primaryRepository(source.location.directory)
   if (!projectRoot) throw new WorkflowError("This OpenCode session is not inside a Git repository")
-  const hub = store.hub(projectRoot)
-  if (!hub) throw new WorkflowError("This repository does not have a registered Herdr Project Chat hub")
+  const hub = resolveHub(projectRoot, store)
   const text = request.request.trim()
   const target = request.target.trim()
   if (!text || !target) throw new WorkflowError("Dispatch request and target must not be empty")

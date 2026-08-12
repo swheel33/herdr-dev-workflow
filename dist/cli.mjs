@@ -1195,6 +1195,12 @@ async function runChatPane(env = process.env) {
   const identity = currentHerdrIdentity(env);
   const store = new StateStore();
   store.rememberRepository(root);
+  store.registerHub({
+    projectRoot: root,
+    ...identity,
+    herdrBin: env.HERDR_BIN_PATH ?? "herdr",
+    socketPath: env.HERDR_SOCKET_PATH ?? null
+  });
   const args = [root, "--standalone"];
   store.log("info", "project-chat.launch", JSON.stringify({ args, paneId: identity.paneId, tabId: identity.tabId }));
   const child = spawn2(opencode, args, { stdio: "inherit", env: { ...env, HERDR_PROJECT_CHAT: "1" } });
@@ -1209,18 +1215,6 @@ async function runChatPane(env = process.env) {
     });
   });
   try {
-    await Promise.race([
-      exit.then((code2) => {
-        throw new WorkflowError(`opencode2 exited during startup with status ${code2}`);
-      }),
-      new Promise((resolvePromise) => setTimeout(resolvePromise, 1e3))
-    ]);
-    store.registerHub({
-      projectRoot: root,
-      ...identity,
-      herdrBin: env.HERDR_BIN_PATH ?? "herdr",
-      socketPath: env.HERDR_SOCKET_PATH ?? null
-    });
     store.log("info", "project-chat.ready", JSON.stringify({ paneId: identity.paneId, tabId: identity.tabId }));
     const code = await exit;
     if (code !== 0) throw new WorkflowError(`opencode2 exited with status ${code}${exitSignal ? ` (${exitSignal})` : ""}`);
@@ -1606,12 +1600,41 @@ Do not dispatch again or create another worktree. Preserve unrelated changes. Do
 Request:
 ${request2}`;
 }
+function liveHub(hub) {
+  const herdr = new HerdrClient(hub.herdrBin, hub.socketPath ?? void 0);
+  try {
+    return herdr.tabs().some((tab) => String(tab.tab_id) === hub.tabId) && herdr.panes(hub.workspaceId).some((pane) => String(pane.pane_id) === hub.paneId);
+  } catch {
+    return false;
+  }
+}
+function resolveHub(projectRoot, store, env = process.env) {
+  const registered = store.hub(projectRoot);
+  if (registered && liveHub(registered)) return registered;
+  const environmentRoot = env.HERDR_PROJECT_ROOT;
+  if (environmentRoot && canonical(environmentRoot) === projectRoot) {
+    try {
+      const recovered = {
+        projectRoot,
+        ...currentHerdrIdentity(env),
+        herdrBin: env.HERDR_BIN_PATH ?? "herdr",
+        socketPath: env.HERDR_SOCKET_PATH ?? null
+      };
+      if (liveHub(recovered)) {
+        store.registerHub(recovered);
+        return recovered;
+      }
+    } catch {
+    }
+  }
+  if (registered) store.deleteHub(projectRoot, registered.paneId);
+  throw new WorkflowError("This repository does not have a live Herdr Project Chat hub");
+}
 async function dispatchImplementation(request2, store = new StateStore()) {
   const source = await getSession(request2.sourceSessionId);
   const projectRoot = primaryRepository(source.location.directory);
   if (!projectRoot) throw new WorkflowError("This OpenCode session is not inside a Git repository");
-  const hub = store.hub(projectRoot);
-  if (!hub) throw new WorkflowError("This repository does not have a registered Herdr Project Chat hub");
+  const hub = resolveHub(projectRoot, store);
   const text = request2.request.trim();
   const target = request2.target.trim();
   if (!text || !target) throw new WorkflowError("Dispatch request and target must not be empty");

@@ -199,6 +199,12 @@ export async function runChatPane(env: NodeJS.ProcessEnv = process.env): Promise
   const identity = currentHerdrIdentity(env)
   const store = new StateStore()
   store.rememberRepository(root)
+  store.registerHub({
+    projectRoot: root,
+    ...identity,
+    herdrBin: env.HERDR_BIN_PATH ?? "herdr",
+    socketPath: env.HERDR_SOCKET_PATH ?? null,
+  })
   const args = [root, "--standalone"]
   store.log("info", "project-chat.launch", JSON.stringify({ args, paneId: identity.paneId, tabId: identity.tabId }))
   const child = spawn(opencode, args, { stdio: "inherit", env: { ...env, HERDR_PROJECT_CHAT: "1" } })
@@ -213,16 +219,6 @@ export async function runChatPane(env: NodeJS.ProcessEnv = process.env): Promise
     })
   })
   try {
-    await Promise.race([
-      exit.then((code) => { throw new WorkflowError(`opencode2 exited during startup with status ${code}`) }),
-      new Promise((resolvePromise) => setTimeout(resolvePromise, 1_000)),
-    ])
-    store.registerHub({
-      projectRoot: root,
-      ...identity,
-      herdrBin: env.HERDR_BIN_PATH ?? "herdr",
-      socketPath: env.HERDR_SOCKET_PATH ?? null,
-    })
     store.log("info", "project-chat.ready", JSON.stringify({ paneId: identity.paneId, tabId: identity.tabId }))
     const code = await exit
     if (code !== 0) throw new WorkflowError(`opencode2 exited with status ${code}${exitSignal ? ` (${exitSignal})` : ""}`)

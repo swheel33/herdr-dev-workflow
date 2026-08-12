@@ -11,7 +11,7 @@ Always state the access basis for PR work accurately: "GitHub-fetched PR" only a
 When the user asks to implement work, call dispatch_implementation exactly once. Use targetKind "new" with a short slug for new work, "branch" for an existing local or origin branch, or "pr" for a pull request number or URL. Include the complete implementation request. Do not reproduce Git or Herdr steps manually.`
 
 function executeDispatch(options: { pluginRoot: string; stateDir: string }, input: unknown): Promise<string> {
-  return new Promise((resolvePromise, reject) => {
+  return new Promise((resolvePromise) => {
     const child = spawn("node", [resolve(options.pluginRoot, "dist/cli.mjs"), "dispatch-tool"], {
       env: { ...process.env, HERDR_PLUGIN_ROOT: options.pluginRoot, HERDR_PLUGIN_STATE_DIR: options.stateDir },
       stdio: ["pipe", "pipe", "pipe"],
@@ -20,10 +20,10 @@ function executeDispatch(options: { pluginRoot: string; stateDir: string }, inpu
     let stderr = ""
     child.stdout.setEncoding("utf8").on("data", (value: string) => { stdout += value })
     child.stderr.setEncoding("utf8").on("data", (value: string) => { stderr += value })
-    child.on("error", reject)
+    child.on("error", (error) => resolvePromise(`Dispatch failed: ${error.message}`))
     child.on("close", (code) => {
       if (code === 0) resolvePromise(stdout.trim())
-      else reject(new Error(stderr.trim() || stdout.trim() || `Dispatch process exited ${code}`))
+      else resolvePromise(`Dispatch failed: ${stderr.trim() || stdout.trim() || `Dispatch process exited ${code}`}`)
     })
     child.stdin.end(JSON.stringify(input))
   })
