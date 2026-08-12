@@ -162,9 +162,12 @@ export function prepareTarget(input: {
   linkEnvironmentFiles(repo, checkout)
   opened = input.herdr.openWorktree(repo, checkout, label)
   const panes = input.herdr.panes(opened.workspaceId)
-  const workspace = input.herdr.workspaces().find((item) => item.workspace_id === opened.workspaceId)
-  if (!workspace || !["idle", "done"].includes(String(workspace.agent_status ?? ""))) {
-    throw new WorkflowError(`Target workspace agent is not idle in ${branch}`)
+  const activePane = panes.find((pane) => ["working", "blocked"].includes(String(pane.agent_status ?? "unknown")))
+  if (activePane) {
+    const status = String(activePane.agent_status)
+    throw new WorkflowError(
+      `Dispatch target ${branch} is already in use by a ${status} agent in workspace ${opened.workspaceId}, pane ${String(activePane.pane_id)}. Finish or stop that agent before dispatching to this target.`,
+    )
   }
   const shellPaneId = panes.length > 1
     ? String(panes.find((pane) => String(pane.pane_id) !== opened.rootPaneId)?.pane_id ?? "")
