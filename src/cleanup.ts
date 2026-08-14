@@ -119,6 +119,7 @@ export function attemptCleanup(store: StateStore, initial: CleanupJob): boolean 
         store.transaction(() => {
           store.deleteCleanupJob(job.id)
           store.deleteManagedTarget(job.repoRoot, job.branch)
+          store.releaseDispatchTargets(job.repoRoot, job.branch)
           if (job.eventKey) store.markEventComplete(job.eventKey)
         })
         store.log("info", "cleanup.completed", JSON.stringify({

@@ -1,9 +1,10 @@
+import { createHash, randomUUID } from "node:crypto"
 import { WorkflowError } from "./errors.js"
 import { primaryRepository } from "./git.js"
 import { currentHerdrIdentity, HerdrClient } from "./herdr.js"
-import { forkSession, getSession, prepareImplementationSession, promptSession, renameSession } from "./opencode.js"
+import { findForkedSession, forkSession, getSession, prepareImplementationSession, promptSession, renameSession } from "./opencode.js"
 import { canonical } from "./paths.js"
-import { StateStore, type ProjectHub, type TargetKind } from "./state.js"
+import { dispatchTargetKey, StateStore, type DispatchRecord, type ProjectHub, type TargetKind } from "./state.js"
 import { prepareTarget } from "./worktrees.js"
 
 export interface DispatchRequest {
@@ -12,6 +13,15 @@ export interface DispatchRequest {
   target: string
   sourceSessionId: string
   sourceMessageId: string
+}
+
+export interface DispatchStart {
+  dispatch: DispatchRecord
+  run: boolean
+}
+
+function requestHash(request: string): string {
+  return createHash("sha256").update(request.trim()).digest("hex")
 }
 
 function handoff(checkout: string, request: string): string {
@@ -57,75 +67,127 @@ function resolveHub(projectRoot: string, store: StateStore, env: NodeJS.ProcessE
   throw new WorkflowError("This repository does not have a live Herdr Project Chat hub")
 }
 
-export async function dispatchImplementation(request: DispatchRequest, store = new StateStore()): Promise<string> {
+export function formatDispatch(dispatch: DispatchRecord): string {
+  const lines = [
+    `Dispatch ${dispatch.id} [${dispatch.status}]`,
+    `  target: ${dispatch.branch ?? dispatch.targetValue}`,
+    `  checkout: ${dispatch.checkoutPath ?? "pending"}`,
+    `  implementation session: ${dispatch.implementationSessionId ?? "pending"}`,
+  ]
+  if (dispatch.error) lines.push(`  error: ${dispatch.error}`)
+  if (dispatch.status === "preparing") lines.push("  recovery: preparation is running; inspect status instead of dispatching again")
+  if (dispatch.status === "delivery_unknown") lines.push("  recovery: prompt delivery may have succeeded; resume the implementation session and do not redispatch")
+  if (dispatch.status === "pre_prompt_failed") lines.push("  recovery: retrying this target resumes this durable dispatch and preserves its artifacts")
+  return lines.join("\n")
+}
+
+export function dispatchReport(store: StateStore, projectRoot?: string): string {
+  const dispatches = store.dispatches(projectRoot)
+  if (!dispatches.length) return "No implementation dispatches recorded."
+  return dispatches.map(formatDispatch).join("\n\n")
+}
+
+export async function startDispatch(request: DispatchRequest, store = new StateStore()): Promise<DispatchStart> {
   const source = await getSession(request.sourceSessionId)
   const projectRoot = primaryRepository(source.location.directory)
   if (!projectRoot) throw new WorkflowError("This OpenCode session is not inside a Git repository")
-  const hub = resolveHub(projectRoot, store)
   const text = request.request.trim()
   const target = request.target.trim()
   if (!text || !target) throw new WorkflowError("Dispatch request and target must not be empty")
-  if (!store.beginDispatch({
+
+  const result = store.beginDispatch({
+    id: `dispatch-${randomUUID()}`,
     sourceSessionId: request.sourceSessionId,
     sourceMessageId: request.sourceMessageId,
     projectRoot,
     request: "",
     targetKind: request.targetKind,
     targetValue: target,
-  })) {
-    throw new WorkflowError("This dispatch turn has already been accepted; do not retry it")
+    targetKey: dispatchTargetKey(request.targetKind, target),
+    requestHash: requestHash(text),
+  })
+  if (result.created) return { dispatch: result.dispatch, run: true }
+  const hash = requestHash(text)
+  if (result.dispatch.status === "preparing" && result.dispatch.requestHash === null) {
+    store.adoptDispatchRequest(result.dispatch.id, hash)
+    result.dispatch = store.dispatch(result.dispatch.id)!
   }
+  const sameRequest = result.dispatch.requestHash === hash
+  if (sameRequest && result.dispatch.status === "pre_prompt_failed" && store.resumeDispatch(result.dispatch.id, hash)) {
+    return { dispatch: store.dispatch(result.dispatch.id)!, run: true }
+  }
+  return { dispatch: result.dispatch, run: sameRequest && result.dispatch.status === "preparing" }
+}
 
-  const herdr = new HerdrClient(hub.herdrBin, hub.socketPath ?? undefined)
-  let implementationSessionId: string | undefined
-  let prepared: ReturnType<typeof prepareTarget> | undefined
+export async function runDispatch(dispatchId: string, request: string, store = new StateStore()): Promise<void> {
+  let dispatch = store.dispatch(dispatchId)
+  if (!dispatch) throw new WorkflowError(`Unknown dispatch: ${dispatchId}`)
+  if (dispatch.status !== "preparing") return
+  if (dispatch.requestHash !== requestHash(request)) return
+  if (!store.claimDispatchRun(dispatchId, process.pid)) return
+  dispatch = store.dispatch(dispatchId)!
+
+  let herdr: HerdrClient | undefined
   let promptStarted = false
   try {
-    prepared = prepareTarget({
-      repoRoot: projectRoot,
-      target: { kind: request.targetKind, value: target },
+    const hub = resolveHub(dispatch.projectRoot, store)
+    herdr = new HerdrClient(hub.herdrBin, hub.socketPath ?? undefined)
+    const prepared = prepareTarget({
+      repoRoot: dispatch.projectRoot,
+      target: { kind: dispatch.targetKind, value: dispatch.targetValue },
       store,
       herdr,
+      ...(dispatch.branch && dispatch.checkoutPath ? {
+        resume: { branch: dispatch.branch, checkoutPath: dispatch.checkoutPath },
+      } : {}),
+      onResolved: ({ branch, checkoutPath }) => {
+        store.updateDispatch(dispatchId, { status: "preparing", branch, checkoutPath })
+        dispatch = store.dispatch(dispatchId)!
+      },
+      onProvisioned: ({ branch, checkoutPath }) => {
+        store.updateDispatch(dispatchId, { status: "preparing", branch, checkoutPath })
+        dispatch = store.dispatch(dispatchId)!
+      },
     })
-    store.updateDispatch(request.sourceSessionId, request.sourceMessageId, {
-      status: "preparing",
-      branch: prepared.branch,
-      checkoutPath: prepared.checkoutPath,
+    if (!store.claimDispatchTarget(dispatchId, dispatch.projectRoot, `branch:${prepared.branch}`)) {
+      throw new WorkflowError(`Another dispatch already owns target branch ${prepared.branch}`)
+    }
+
+    const source = await getSession(dispatch.sourceSessionId)
+    let implementationSessionId = dispatch.implementationSessionId
+    if (!implementationSessionId) {
+      implementationSessionId = (await findForkedSession(dispatch.sourceSessionId, dispatch.sourceMessageId, dispatch.createdAt)
+        ?? await forkSession(dispatch.sourceSessionId, dispatch.sourceMessageId)).id
+      store.updateDispatch(dispatchId, { status: "preparing", implementationSessionId })
+    }
+    await prepareImplementationSession(implementationSessionId, prepared.checkoutPath)
+    await renameSession(implementationSessionId, source.title?.trim() || prepared.branch)
+    await promptSession(implementationSessionId, handoff(prepared.checkoutPath, request.trim()), () => {
+      store.updateDispatch(dispatchId, { status: "delivery_unknown", implementationSessionId })
+      promptStarted = true
     })
-    const fork = await forkSession(request.sourceSessionId, request.sourceMessageId)
-    implementationSessionId = fork.id
-    store.updateDispatch(request.sourceSessionId, request.sourceMessageId, {
-      status: "preparing",
-      implementationSessionId: fork.id,
-    })
-    await prepareImplementationSession(fork.id, prepared.checkoutPath)
-    await renameSession(fork.id, source.title?.trim() || prepared.branch)
-    herdr.launchOpenCode(prepared.rootPaneId, prepared.checkoutPath, fork.id)
-    await promptSession(fork.id, handoff(prepared.checkoutPath, text), () => { promptStarted = true })
+    store.updateDispatch(dispatchId, { status: "delivered", implementationSessionId })
     try {
-      store.updateDispatch(request.sourceSessionId, request.sourceMessageId, {
-        status: "delivered",
-        implementationSessionId: fork.id,
-      })
+      herdr.launchOpenCode(prepared.rootPaneId, prepared.checkoutPath, implementationSessionId)
     } catch (error) {
-      herdr.notify("Dispatch bookkeeping incomplete", `Implementation started, but its receipt could not be updated: ${error}. Do not redispatch.`)
+      herdr.notify("Implementation delivered without opening its pane", `${formatDispatch(store.dispatch(dispatchId)!)}\n${String(error)}`)
     }
   } catch (error) {
     const detail = error instanceof Error ? error.message : String(error)
-    if (promptStarted) {
-      try {
-        store.updateDispatch(request.sourceSessionId, request.sourceMessageId, {
-          status: "delivery_unknown",
-          ...(implementationSessionId ? { implementationSessionId } : {}),
-          error: detail,
-        })
-      } catch { /* the durable receipt still prevents redispatch */ }
-      throw new WorkflowError(`OpenCode prompt delivery could not be confirmed. The implementation workspace was preserved; inspect it and do not redispatch. ${detail}`)
-    }
-    store.deleteDispatch(request.sourceSessionId, request.sourceMessageId)
-    const location = prepared ? ` Artifacts were preserved at ${prepared.checkoutPath} on ${prepared.branch}.` : " Any artifacts created before the failure were preserved."
-    throw new WorkflowError(`Dispatch stopped before implementation prompting.${location} ${detail}`)
+    store.updateDispatch(dispatchId, {
+      status: promptStarted ? "delivery_unknown" : "pre_prompt_failed",
+      error: detail,
+    })
+    herdr?.notify(
+      promptStarted ? "Implementation delivery is unknown" : "Implementation dispatch paused before prompting",
+      formatDispatch(store.dispatch(dispatchId)!),
+    )
   }
+}
 
-  return `Implementation started in ${prepared!.branch} at ${prepared!.checkoutPath}. Do not dispatch this request again.`
+export async function dispatchStatus(sourceSessionId: string, store = new StateStore()): Promise<string> {
+  const source = await getSession(sourceSessionId)
+  const projectRoot = primaryRepository(source.location.directory)
+  if (!projectRoot) throw new WorkflowError("This OpenCode session is not inside a Git repository")
+  return dispatchReport(store, projectRoot)
 }

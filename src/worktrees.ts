@@ -17,6 +17,7 @@ import {
   slugify,
   synchronizeDefaultBranch,
   worktreeForBranch,
+  worktreeForPath,
 } from "./git.js"
 import { HerdrClient } from "./herdr.js"
 import { canonical } from "./paths.js"
@@ -106,13 +107,40 @@ export function prepareTarget(input: {
   target: DispatchTarget
   store: StateStore
   herdr: HerdrClient
+  resume?: { branch: string; checkoutPath: string }
+  onResolved?: (target: { branch: string; checkoutPath: string }) => void
+  onProvisioned?: (target: { branch: string; checkoutPath: string }) => void
 }): PreparedTarget {
   const repo = canonical(input.repoRoot)
   input.store.rememberRepository(repo)
   let branch = ""
   let checkout = ""
   let opened: ReturnType<HerdrClient["openWorktree"]>
-    if (input.target.kind === "new") {
+  if (input.resume) {
+    branch = input.resume.branch
+    checkout = canonical(input.resume.checkoutPath)
+    let tree = worktreeForPath(repo, checkout)
+    if (!tree && input.target.kind === "new" && !localBranchExists(repo, branch) && !remoteBranchExists(repo, branch)) {
+      const sync = synchronizeDefaultBranch(repo)
+      if (["dirty", "diverged"].includes(sync)) throw new WorkflowError(`Default branch synchronization blocked: ${sync}`)
+      createWorktree(repo, checkout, branch, defaultBaseRef(repo))
+      tree = worktreeForPath(repo, checkout)
+    }
+    if (!tree || tree.branch !== branch) {
+      throw new WorkflowError(`Cannot resume dispatch: ${checkout} is not the ${branch} worktree`)
+    }
+    if (input.target.kind === "new" && !input.store.managedTarget(repo, branch)) {
+      input.store.registerManagedTarget({
+        repoRoot: repo,
+        branch,
+        checkoutPath: checkout,
+        createdOid: branchHead(repo, branch),
+        ownsLocal: true,
+        ...(hasOrigin(repo) ? { remote: "origin", remoteUrl: remoteUrl(repo), remoteBranch: branch, ownsRemote: true } : {}),
+      })
+    }
+    input.onProvisioned?.({ branch, checkoutPath: checkout })
+  } else if (input.target.kind === "new") {
       const slug = slugify(input.target.value)
       branch = `wheels/${slug}`
       checkout = managedWorktreePath(repo, slug)
@@ -121,6 +149,7 @@ export function prepareTarget(input: {
       if (localBranchExists(repo, branch) || remoteBranchExists(repo, branch)) {
         throw new WorkflowError(`Branch already exists; dispatch it as an existing branch instead: ${branch}`)
       }
+      input.onResolved?.({ branch, checkoutPath: checkout })
       createWorktree(repo, checkout, branch, defaultBaseRef(repo))
       input.store.registerManagedTarget({
         repoRoot: repo,
@@ -130,6 +159,7 @@ export function prepareTarget(input: {
         ownsLocal: true,
         ...(hasOrigin(repo) ? { remote: "origin", remoteUrl: remoteUrl(repo), remoteBranch: branch, ownsRemote: true } : {}),
       })
+      input.onProvisioned?.({ branch, checkoutPath: checkout })
     } else {
       branch = input.target.kind === "pr" ? resolvePullRequest(repo, input.target.value) : input.target.value.trim().replace(/^origin\//, "")
       if (!branch) throw new WorkflowError("Existing branch target must not be empty")
@@ -156,6 +186,7 @@ export function prepareTarget(input: {
         ownsLocal,
         ...(hasOrigin(repo) ? { remote: "origin", remoteUrl: remoteUrl(repo), remoteBranch: branch } : {}),
       })
+      input.onProvisioned?.({ branch, checkoutPath: checkout })
     }
 
   const label = basename(checkout)

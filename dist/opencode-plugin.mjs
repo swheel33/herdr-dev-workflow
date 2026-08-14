@@ -9,10 +9,12 @@ When asked to review a GitHub pull request, use the authenticated GitHub CLI to 
 
 Always state the access basis for PR work accurately: "GitHub-fetched PR" only after successfully retrieving the requested PR through GitHub; "local refs only" when inspecting repository refs without retrieving the PR; or "unable to access requested PR" when neither source is available. Report authentication, authorization, network, repository, and partial-data limitations explicitly. Never imply that you reviewed a PR, its comments, or its current state when you did not retrieve that data.
 
-When the user asks to implement work, call dispatch_implementation exactly once. Use targetKind "new" with a short slug for new work, "branch" for an existing local or origin branch, or "pr" for a pull request number or URL. Include the complete implementation request. Do not reproduce Git or Herdr steps manually.`;
-function executeDispatch(options, input) {
+When the user asks to implement work, call dispatch_implementation exactly once. Use targetKind "new" with a short slug for new work, "branch" for an existing local or origin branch, or "pr" for a pull request number or URL. Include the complete implementation request. Do not reproduce Git or Herdr steps manually.
+
+Dispatch returns a durable dispatch ID immediately while preparation continues in the background. If a tool call is interrupted or its result is unclear, call implementation_dispatch_status. Never redispatch merely because a tool response was interrupted; status exposes the implementation session ID and recovery guidance.`;
+function executeCli(options, command, input) {
   return new Promise((resolvePromise) => {
-    const child = spawn("node", [resolve(options.pluginRoot, "dist/cli.mjs"), "dispatch-tool"], {
+    const child = spawn("node", [resolve(options.pluginRoot, "dist/cli.mjs"), command], {
       env: { ...process.env, HERDR_PLUGIN_ROOT: options.pluginRoot, HERDR_PLUGIN_STATE_DIR: options.stateDir },
       stdio: ["pipe", "pipe", "pipe"]
     });
@@ -24,10 +26,10 @@ function executeDispatch(options, input) {
     child.stderr.setEncoding("utf8").on("data", (value) => {
       stderr += value;
     });
-    child.on("error", (error) => resolvePromise(`Dispatch failed: ${error.message}`));
+    child.on("error", (error) => resolvePromise(`Workflow command was interrupted before returning a receipt: ${error.message}`));
     child.on("close", (code) => {
       if (code === 0) resolvePromise(stdout.trim());
-      else resolvePromise(`Dispatch failed: ${stderr.trim() || stdout.trim() || `Dispatch process exited ${code}`}`);
+      else resolvePromise(`Dispatch did not return a receipt. Inspect implementation_dispatch_status before retrying. ${stderr.trim() || stdout.trim() || `Process exited ${code}`}`);
     });
     child.stdin.end(JSON.stringify(input));
   });
@@ -58,7 +60,8 @@ var plugin = {
         agent.color = "#D27E99";
         agent.permissions = planPermissions.map((permission) => ({ ...permission }));
         agent.permissions.push(
-          { action: "dispatch_implementation", resource: "*", effect: "allow" }
+          { action: "dispatch_implementation", resource: "*", effect: "allow" },
+          { action: "implementation_dispatch_status", resource: "*", effect: "allow" }
         );
       });
       agents.default("project-chat");
@@ -66,7 +69,7 @@ var plugin = {
     await ctx.tool.transform((tools) => {
       tools.add({
         name: "dispatch_implementation",
-        description: "Dispatch an implementation agent into a new task worktree, existing branch, or pull request branch.",
+        description: "Start or recover a durable implementation dispatch. Returns its durable ID and current status without waiting for implementation preparation.",
         input: {
           type: "object",
           properties: {
@@ -79,10 +82,25 @@ var plugin = {
         },
         options: { codemode: false },
         execute: async (input, context) => ({
-          content: await executeDispatch(options, {
+          content: await executeCli(options, "dispatch-tool", {
             ...input,
             sourceSessionId: String(context.sessionID),
             sourceMessageId: String(context.messageID)
+          })
+        })
+      });
+      tools.add({
+        name: "implementation_dispatch_status",
+        description: "Read durable implementation dispatch status, recovery guidance, workspace paths, and implementation session IDs for this repository.",
+        input: {
+          type: "object",
+          properties: {},
+          additionalProperties: false
+        },
+        options: { codemode: false },
+        execute: async (_input, context) => ({
+          content: await executeCli(options, "dispatch-status-tool", {
+            sourceSessionId: String(context.sessionID)
           })
         })
       });
