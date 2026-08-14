@@ -1,9 +1,10 @@
 import { scanMerged, watchMerged } from "./auto-prune.js"
 import { readSync } from "node:fs"
+import { spawn } from "node:child_process"
 import { chatCurrent, ensureCompanionInstalled, openChatPicker, runChatPane } from "./chat.js"
 import { cleanupReport, handleCleanupEvent, retryCleanup } from "./cleanup.js"
 import { doctor } from "./doctor.js"
-import { dispatchImplementation } from "./dispatch.js"
+import { dispatchReport, dispatchStatus, formatDispatch, runDispatch, startDispatch } from "./dispatch.js"
 import { WorkflowError } from "./errors.js"
 import { HerdrClient, pluginContext } from "./herdr.js"
 import { interactiveBlankProject } from "./projects.js"
@@ -25,6 +26,7 @@ async function main(args = process.argv.slice(2)): Promise<number> {
     const dependencyStatus = doctor()
     const cleanupFailures = retryCleanup(store)
     console.log(`\nCleanup\n\n${cleanupReport(store)}`)
+    console.log(`\nImplementation dispatches\n\n${dispatchReport(store)}`)
     const activity = store.recentLogs(100)
       .filter((entry) => entry.kind.startsWith("auto-prune.") || entry.kind.startsWith("cleanup."))
       .slice(0, 20)
@@ -44,8 +46,49 @@ async function main(args = process.argv.slice(2)): Promise<number> {
   if (command === "dispatch-tool") {
     const chunks: Buffer[] = []
     for await (const chunk of process.stdin) chunks.push(Buffer.from(chunk))
-    const input = JSON.parse(Buffer.concat(chunks).toString("utf8")) as Parameters<typeof dispatchImplementation>[0]
-    console.log(await dispatchImplementation(input, store))
+    const input = JSON.parse(Buffer.concat(chunks).toString("utf8")) as Parameters<typeof startDispatch>[0]
+    const started = await startDispatch(input, store)
+    if (started.run) {
+      try {
+        const child = spawn(process.execPath, [process.argv[1]!, "dispatch-run", started.dispatch.id], {
+          detached: true,
+          env: process.env,
+          stdio: ["pipe", "ignore", "ignore"],
+        })
+        await new Promise<void>((resolve, reject) => {
+          child.once("spawn", resolve)
+          child.once("error", reject)
+        })
+        await new Promise<void>((resolve, reject) => {
+          child.stdin.once("error", reject)
+          child.stdin.end(JSON.stringify({ dispatchId: started.dispatch.id, request: input.request }), resolve)
+        })
+        child.unref()
+      } catch (error) {
+        store.failDispatchStart(
+          started.dispatch.id,
+          `Could not start the detached dispatch runner: ${error instanceof Error ? error.message : String(error)}`,
+        )
+        throw error
+      }
+    }
+    console.log(formatDispatch(started.dispatch))
+    return 0
+  }
+  if (command === "dispatch-run") {
+    const chunks: Buffer[] = []
+    for await (const chunk of process.stdin) chunks.push(Buffer.from(chunk))
+    const input = JSON.parse(Buffer.concat(chunks).toString("utf8")) as { dispatchId: string; request: string }
+    const dispatchId = args[1]
+    if (!dispatchId || dispatchId !== input.dispatchId) throw new WorkflowError("Dispatch runner receipt does not match its input")
+    await runDispatch(dispatchId, input.request, store)
+    return 0
+  }
+  if (command === "dispatch-status-tool") {
+    const chunks: Buffer[] = []
+    for await (const chunk of process.stdin) chunks.push(Buffer.from(chunk))
+    const input = JSON.parse(Buffer.concat(chunks).toString("utf8")) as { sourceSessionId: string }
+    console.log(await dispatchStatus(input.sourceSessionId, store))
     return 0
   }
   if (command === "blank-project") return interactiveBlankProject()

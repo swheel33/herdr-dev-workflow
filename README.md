@@ -93,14 +93,31 @@ in native history after confirmed delivery. The implementation fork contains
 the preceding conversation and complete handoff, so that shared prefix appears
 in both records. The prompt request is the delivery boundary:
 
-- Before the prompt request begins, a failure is retryable. Any worktree,
-  workspace, branch, or fork already created is deliberately preserved for
-  inspection instead of being rolled back.
+- The tool first creates an atomic target claim and returns a durable
+  `dispatch-<uuid>` receipt. A detached runner continues preparation, so losing
+  the tool transport does not cancel or misreport the underlying work.
+- Before the prompt request begins, a failure is recorded as
+  `pre_prompt_failed` and is resumable. Any worktree, workspace, branch, or fork
+  already created is deliberately preserved and reused instead of being rolled
+  back or duplicated.
 - After confirmed delivery, bookkeeping failures are warnings and never cause a
-  second implementation prompt.
+  second implementation prompt. The receipt status is `delivered`.
 - If the prompt request starts but its response is lost or times out, delivery is
-  recorded as unknown and the implementation workspace is preserved. The same
-  source turn remains non-retryable to prevent duplicate implementation.
+  durably changed to `delivery_unknown` before the request is sent. The
+  implementation workspace and session ID are preserved and no retry sends a
+  second implementation prompt.
+
+Target claims are repository-wide and normalized to the branch when known.
+Retries from another message or Project Chat therefore return or resume the
+same dispatch instead of creating another branch, worktree, session worker, or
+prompt. A claim is released only when normal worktree cleanup completes.
+
+Project Chat's read-only `implementation_dispatch_status` tool lists durable
+IDs, delivery states, checkout paths, errors, and implementation session IDs.
+Use it after an interrupted or ambiguous tool response rather than calling the
+dispatcher again. **Workflow Status** shows the same receipts for manual
+inspection. A `preparing` receipt may be queued or running; a stale detached
+runner can safely be reclaimed because runner acquisition is also atomic.
 
 New dispatches safely fast-forward a clean primary default branch. Dirty or
 diverged primary checkouts block new-branch dispatch. Existing targets are never
@@ -133,6 +150,7 @@ The primary checkout, its branch, the repository default branch, `main`,
 events and concurrent cleanup processes are serialized through SQLite leases.
 
 **Workflow Status** retries pending jobs and displays anything still failing.
+It also displays implementation dispatch receipts and recovery identifiers.
 
 ## Automatic Pruning
 
@@ -165,11 +183,11 @@ All plugin state lives in:
 $HERDR_PLUGIN_STATE_DIR/workflow.sqlite
 ```
 
-The database stores dispatch receipts, managed-target ownership, cleanup jobs,
-Project Chat hub mappings, auto-prune blocks, repository discovery, and bounded
-diagnostic messages. It does not store prompts, transcripts, or OpenCode
-history. SQLite failures stop destructive work rather than falling back to
-guessed state.
+The database stores dispatch receipts and target claims, managed-target
+ownership, cleanup jobs, Project Chat hub mappings, auto-prune blocks,
+repository discovery, and bounded diagnostic messages. It does not store
+prompts, transcripts, or OpenCode history. SQLite failures stop destructive
+work rather than falling back to guessed state.
 
 ## Other Actions
 

@@ -423,6 +423,10 @@ async function forkSession(sourceSessionId, sourceMessageId) {
   });
   return response.data;
 }
+async function findForkedSession(sourceSessionId, sourceMessageId, createdAfter) {
+  const response = await request("GET", "/api/session");
+  return response.data.filter((session) => session.fork?.sessionID === sourceSessionId && session.fork.boundary.type === "before" && session.fork.boundary.messageID === sourceMessageId && session.time.created >= createdAfter).sort((left, right) => right.time.created - left.time.created)[0] ?? null;
+}
 async function getSession(sessionId, env = process.env) {
   const response = await request("GET", `/api/session/${encodeURIComponent(sessionId)}`, void 0, env);
   return response.data;
@@ -574,8 +578,15 @@ function currentHerdrIdentity(env = process.env) {
 
 // src/state.ts
 import { mkdirSync } from "node:fs";
+import { spawnSync as spawnSync2 } from "node:child_process";
 import { dirname as dirname2, resolve as resolve5 } from "node:path";
 import { DatabaseSync } from "node:sqlite";
+function dispatchTargetKey(kind, value, branch) {
+  if (branch) return `branch:${branch}`;
+  if (kind === "new") return `branch:wheels/${slugify(value)}`;
+  if (kind === "branch") return `branch:${value.trim().replace(/^origin\//, "")}`;
+  return `pr:${value.trim().toLowerCase()}`;
+}
 var SCHEMA = `
 PRAGMA foreign_keys = ON;
 PRAGMA journal_mode = WAL;
@@ -622,20 +633,32 @@ CREATE TABLE IF NOT EXISTS event_completions (
   completed_at INTEGER NOT NULL
 );
 CREATE TABLE IF NOT EXISTS dispatches (
+  dispatch_id TEXT,
   source_session_id TEXT NOT NULL,
   source_message_id TEXT NOT NULL,
   project_root TEXT NOT NULL,
   request TEXT NOT NULL,
   target_kind TEXT NOT NULL,
   target_value TEXT NOT NULL,
+  target_key TEXT,
+  request_hash TEXT,
   branch TEXT,
   checkout_path TEXT,
   implementation_session_id TEXT,
   status TEXT NOT NULL,
   error TEXT,
+  runner_started_at INTEGER,
+  runner_pid INTEGER,
   created_at INTEGER NOT NULL,
   updated_at INTEGER NOT NULL,
   PRIMARY KEY(source_session_id, source_message_id)
+);
+CREATE TABLE IF NOT EXISTS dispatch_target_claims (
+  project_root TEXT NOT NULL,
+  target_key TEXT NOT NULL,
+  dispatch_id TEXT NOT NULL,
+  created_at INTEGER NOT NULL,
+  PRIMARY KEY(project_root, target_key)
 );
 DROP TABLE IF EXISTS project_chats;
 CREATE TABLE IF NOT EXISTS project_hubs (
@@ -680,11 +703,48 @@ var StateStore = class {
       ["managed_targets", "remote_url", "TEXT"],
       ["managed_targets", "owns_local", "INTEGER NOT NULL DEFAULT 1"],
       ["cleanup_jobs", "remote_url", "TEXT"],
-      ["cleanup_jobs", "delete_local", "INTEGER NOT NULL DEFAULT 0"]
+      ["cleanup_jobs", "delete_local", "INTEGER NOT NULL DEFAULT 0"],
+      ["dispatches", "dispatch_id", "TEXT"],
+      ["dispatches", "target_key", "TEXT"],
+      ["dispatches", "request_hash", "TEXT"],
+      ["dispatches", "runner_started_at", "INTEGER"],
+      ["dispatches", "runner_pid", "INTEGER"]
     ]) {
       const exists = this.database.prepare(`PRAGMA table_info(${table})`).all().some((row) => row.name === column);
       if (!exists) this.database.exec(`ALTER TABLE ${table} ADD COLUMN ${column} ${definition}`);
     }
+    this.database.exec(`
+      UPDATE dispatches SET dispatch_id = 'legacy-' || rowid WHERE dispatch_id IS NULL;
+      CREATE UNIQUE INDEX IF NOT EXISTS dispatches_dispatch_id ON dispatches(dispatch_id);
+    `);
+    this.transaction(() => {
+      for (const row of this.database.prepare("SELECT * FROM dispatches WHERE target_key IS NULL").all()) {
+        const key = dispatchTargetKey(
+          String(row.target_kind),
+          String(row.target_value),
+          row.branch === null ? null : String(row.branch)
+        );
+        this.database.prepare("UPDATE dispatches SET target_key = ? WHERE dispatch_id = ?").run(key, String(row.dispatch_id));
+        if (String(row.status) === "preparing" && row.implementation_session_id !== null) {
+          this.database.prepare(`
+            UPDATE dispatches SET status = 'delivery_unknown', error = ? WHERE dispatch_id = ?
+          `).run("Migrated from legacy preparing state after an implementation session was created; prompt delivery is unknown.", String(row.dispatch_id));
+        }
+        let shouldClaim = String(row.status) !== "delivered";
+        if (!shouldClaim && row.checkout_path !== null && row.branch !== null) {
+          try {
+            shouldClaim = worktreeForPath(String(row.project_root), String(row.checkout_path))?.branch === String(row.branch);
+          } catch {
+          }
+        }
+        if (shouldClaim) {
+          this.database.prepare(`
+            INSERT OR IGNORE INTO dispatch_target_claims(project_root, target_key, dispatch_id, created_at)
+            VALUES (?, ?, ?, ?)
+          `).run(String(row.project_root), key, String(row.dispatch_id), Number(row.created_at));
+        }
+      }
+    });
   }
   close() {
     this.database.close();
@@ -749,42 +809,144 @@ var StateStore = class {
     const query = paneId ? "DELETE FROM project_hubs WHERE project_root = ? AND pane_id = ?" : "DELETE FROM project_hubs WHERE project_root = ?";
     this.database.prepare(query).run(...paneId ? [canonical(projectRoot), paneId] : [canonical(projectRoot)]);
   }
-  beginDispatch(input) {
-    const result = this.database.prepare(`
-      INSERT OR IGNORE INTO dispatches(
-        source_session_id, source_message_id, project_root, request, target_kind, target_value,
-        status, created_at, updated_at
-      ) VALUES (?, ?, ?, ?, ?, ?, 'preparing', ?, ?)
-    `).run(
-      input.sourceSessionId,
-      input.sourceMessageId,
-      canonical(input.projectRoot),
-      input.request,
-      input.targetKind,
-      input.targetValue,
-      Date.now(),
-      Date.now()
-    );
-    return result.changes === 1;
+  dispatchRecord(row) {
+    return {
+      id: String(row.dispatch_id),
+      sourceSessionId: String(row.source_session_id),
+      sourceMessageId: String(row.source_message_id),
+      projectRoot: String(row.project_root),
+      targetKind: String(row.target_kind),
+      targetValue: String(row.target_value),
+      targetKey: String(row.target_key),
+      requestHash: row.request_hash === null ? null : String(row.request_hash),
+      branch: row.branch === null ? null : String(row.branch),
+      checkoutPath: row.checkout_path === null ? null : String(row.checkout_path),
+      implementationSessionId: row.implementation_session_id === null ? null : String(row.implementation_session_id),
+      status: String(row.status),
+      error: row.error === null ? null : String(row.error),
+      runnerStartedAt: row.runner_started_at === null ? null : Number(row.runner_started_at),
+      runnerPid: row.runner_pid === null ? null : Number(row.runner_pid),
+      createdAt: Number(row.created_at),
+      updatedAt: Number(row.updated_at)
+    };
   }
-  updateDispatch(sourceSessionId, sourceMessageId, fields) {
+  beginDispatch(input) {
+    return this.transaction(() => {
+      const projectRoot = canonical(input.projectRoot);
+      const source = this.database.prepare(
+        "SELECT * FROM dispatches WHERE source_session_id = ? AND source_message_id = ?"
+      ).get(input.sourceSessionId, input.sourceMessageId);
+      if (source) return { dispatch: this.dispatchRecord(source), created: false };
+      const claimed = this.database.prepare(`
+        SELECT dispatches.* FROM dispatch_target_claims
+        JOIN dispatches USING(dispatch_id)
+        WHERE dispatch_target_claims.project_root = ? AND dispatch_target_claims.target_key = ?
+      `).get(projectRoot, input.targetKey);
+      if (claimed) return { dispatch: this.dispatchRecord(claimed), created: false };
+      const now = Date.now();
+      this.database.prepare(`
+        INSERT INTO dispatches(
+          dispatch_id, source_session_id, source_message_id, project_root, request, target_kind, target_value,
+          target_key, request_hash, status, created_at, updated_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'preparing', ?, ?)
+      `).run(
+        input.id,
+        input.sourceSessionId,
+        input.sourceMessageId,
+        projectRoot,
+        input.request,
+        input.targetKind,
+        input.targetValue,
+        input.targetKey,
+        input.requestHash,
+        now,
+        now
+      );
+      this.database.prepare(`
+        INSERT INTO dispatch_target_claims(project_root, target_key, dispatch_id, created_at)
+        VALUES (?, ?, ?, ?)
+      `).run(projectRoot, input.targetKey, input.id, now);
+      return { dispatch: this.dispatch(input.id), created: true };
+    });
+  }
+  dispatch(id) {
+    const row = this.database.prepare("SELECT * FROM dispatches WHERE dispatch_id = ?").get(id);
+    return row ? this.dispatchRecord(row) : null;
+  }
+  dispatches(projectRoot) {
+    const rows = projectRoot ? this.database.prepare("SELECT * FROM dispatches WHERE project_root = ? ORDER BY created_at DESC").all(canonical(projectRoot)) : this.database.prepare("SELECT * FROM dispatches ORDER BY created_at DESC").all();
+    return rows.map((row) => this.dispatchRecord(row));
+  }
+  resumeDispatch(id, requestHash2) {
+    return this.database.prepare(`
+      UPDATE dispatches SET status = 'preparing', error = NULL, request_hash = COALESCE(request_hash, ?),
+        runner_started_at = NULL, runner_pid = NULL, updated_at = ?
+      WHERE dispatch_id = ? AND status = 'pre_prompt_failed' AND (request_hash IS NULL OR request_hash = ?)
+    `).run(requestHash2, Date.now(), id, requestHash2).changes === 1;
+  }
+  adoptDispatchRequest(id, requestHash2) {
+    return this.database.prepare(`
+      UPDATE dispatches SET request_hash = ?, updated_at = ?
+      WHERE dispatch_id = ? AND status = 'preparing' AND request_hash IS NULL
+    `).run(requestHash2, Date.now(), id).changes === 1;
+  }
+  failDispatchStart(id, error) {
+    this.database.prepare(`
+      UPDATE dispatches SET status = 'pre_prompt_failed', error = ?, updated_at = ?
+      WHERE dispatch_id = ? AND status = 'preparing' AND runner_pid IS NULL
+    `).run(error, Date.now(), id);
+  }
+  claimDispatchRun(id, pid) {
+    return this.transaction(() => {
+      const row = this.database.prepare(`
+        SELECT status, runner_pid FROM dispatches WHERE dispatch_id = ?
+      `).get(id);
+      if (!row || String(row.status) !== "preparing") return false;
+      if (row.runner_pid !== null) {
+        if (Number(row.runner_pid) === pid) return false;
+        const command = spawnSync2("ps", ["-p", String(row.runner_pid), "-o", "command="], { encoding: "utf8" });
+        if (command.status === 0 && command.stdout.includes(`dispatch-run ${id}`)) return false;
+      }
+      return this.database.prepare(`
+        UPDATE dispatches SET runner_started_at = ?, runner_pid = ?, updated_at = ? WHERE dispatch_id = ?
+      `).run(Date.now(), pid, Date.now(), id).changes === 1;
+    });
+  }
+  updateDispatch(id, fields) {
     this.database.prepare(`
       UPDATE dispatches SET status = ?, branch = COALESCE(?, branch), checkout_path = COALESCE(?, checkout_path),
-        implementation_session_id = COALESCE(?, implementation_session_id), error = ?, updated_at = ?
-      WHERE source_session_id = ? AND source_message_id = ?
+        implementation_session_id = COALESCE(?, implementation_session_id), error = ?,
+        runner_pid = CASE WHEN ? = 'preparing' THEN runner_pid ELSE NULL END, updated_at = ?
+      WHERE dispatch_id = ?
     `).run(
       fields.status,
       fields.branch ?? null,
       fields.checkoutPath ?? null,
       fields.implementationSessionId ?? null,
       fields.error ?? null,
+      fields.status,
       Date.now(),
-      sourceSessionId,
-      sourceMessageId
+      id
     );
   }
-  deleteDispatch(sourceSessionId, sourceMessageId) {
-    this.database.prepare("DELETE FROM dispatches WHERE source_session_id = ? AND source_message_id = ?").run(sourceSessionId, sourceMessageId);
+  claimDispatchTarget(id, projectRoot, targetKey) {
+    const result = this.database.prepare(`
+      INSERT OR IGNORE INTO dispatch_target_claims(project_root, target_key, dispatch_id, created_at)
+      VALUES (?, ?, ?, ?)
+    `).run(canonical(projectRoot), targetKey, id, Date.now());
+    if (result.changes === 1) return true;
+    const existing = this.database.prepare(`
+      SELECT dispatch_id FROM dispatch_target_claims WHERE project_root = ? AND target_key = ?
+    `).get(canonical(projectRoot), targetKey);
+    return String(existing?.dispatch_id ?? "") === id;
+  }
+  releaseDispatchTargets(projectRoot, branch) {
+    const ids = this.database.prepare(`
+      SELECT dispatch_id FROM dispatches WHERE project_root = ? AND branch = ?
+    `).all(canonical(projectRoot), branch);
+    for (const row of ids) {
+      this.database.prepare("DELETE FROM dispatch_target_claims WHERE dispatch_id = ?").run(String(row.dispatch_id));
+    }
   }
   registerManagedTarget(input) {
     this.database.prepare(`
@@ -1029,6 +1191,7 @@ async function watchMerged(store = new StateStore()) {
 
 // src/cli.ts
 import { readSync as readSync2 } from "node:fs";
+import { spawn as spawn3 } from "node:child_process";
 
 // src/chat.ts
 import { existsSync as existsSync4, lstatSync, mkdirSync as mkdirSync2, readFileSync as readFileSync2, readdirSync, statSync, unlinkSync, writeFileSync } from "node:fs";
@@ -1349,6 +1512,7 @@ function attemptCleanup(store, initial) {
         store.transaction(() => {
           store.deleteCleanupJob(job.id);
           store.deleteManagedTarget(job.repoRoot, job.branch);
+          store.releaseDispatchTargets(job.repoRoot, job.branch);
           if (job.eventKey) store.markEventComplete(job.eventKey);
         });
         store.log("info", "cleanup.completed", JSON.stringify({
@@ -1487,6 +1651,9 @@ function openCodeLabel() {
   }
 }
 
+// src/dispatch.ts
+import { createHash as createHash4, randomUUID as randomUUID3 } from "node:crypto";
+
 // src/worktrees.ts
 import { existsSync as existsSync5, lstatSync as lstatSync2, mkdirSync as mkdirSync3, readdirSync as readdirSync2, symlinkSync } from "node:fs";
 import { basename as basename4, dirname as dirname3, join as join2, relative, resolve as resolve7 } from "node:path";
@@ -1546,7 +1713,31 @@ function prepareTarget(input) {
   let branch = "";
   let checkout = "";
   let opened;
-  if (input.target.kind === "new") {
+  if (input.resume) {
+    branch = input.resume.branch;
+    checkout = canonical(input.resume.checkoutPath);
+    let tree = worktreeForPath(repo, checkout);
+    if (!tree && input.target.kind === "new" && !localBranchExists(repo, branch) && !remoteBranchExists(repo, branch)) {
+      const sync = synchronizeDefaultBranch(repo);
+      if (["dirty", "diverged"].includes(sync)) throw new WorkflowError(`Default branch synchronization blocked: ${sync}`);
+      createWorktree(repo, checkout, branch, defaultBaseRef(repo));
+      tree = worktreeForPath(repo, checkout);
+    }
+    if (!tree || tree.branch !== branch) {
+      throw new WorkflowError(`Cannot resume dispatch: ${checkout} is not the ${branch} worktree`);
+    }
+    if (input.target.kind === "new" && !input.store.managedTarget(repo, branch)) {
+      input.store.registerManagedTarget({
+        repoRoot: repo,
+        branch,
+        checkoutPath: checkout,
+        createdOid: branchHead(repo, branch),
+        ownsLocal: true,
+        ...hasOrigin(repo) ? { remote: "origin", remoteUrl: remoteUrl(repo), remoteBranch: branch, ownsRemote: true } : {}
+      });
+    }
+    input.onProvisioned?.({ branch, checkoutPath: checkout });
+  } else if (input.target.kind === "new") {
     const slug = slugify(input.target.value);
     branch = `wheels/${slug}`;
     checkout = managedWorktreePath(repo, slug);
@@ -1555,6 +1746,7 @@ function prepareTarget(input) {
     if (localBranchExists(repo, branch) || remoteBranchExists(repo, branch)) {
       throw new WorkflowError(`Branch already exists; dispatch it as an existing branch instead: ${branch}`);
     }
+    input.onResolved?.({ branch, checkoutPath: checkout });
     createWorktree(repo, checkout, branch, defaultBaseRef(repo));
     input.store.registerManagedTarget({
       repoRoot: repo,
@@ -1564,6 +1756,7 @@ function prepareTarget(input) {
       ownsLocal: true,
       ...hasOrigin(repo) ? { remote: "origin", remoteUrl: remoteUrl(repo), remoteBranch: branch, ownsRemote: true } : {}
     });
+    input.onProvisioned?.({ branch, checkoutPath: checkout });
   } else {
     branch = input.target.kind === "pr" ? resolvePullRequest(repo, input.target.value) : input.target.value.trim().replace(/^origin\//, "");
     if (!branch) throw new WorkflowError("Existing branch target must not be empty");
@@ -1590,6 +1783,7 @@ function prepareTarget(input) {
       ownsLocal,
       ...hasOrigin(repo) ? { remote: "origin", remoteUrl: remoteUrl(repo), remoteBranch: branch } : {}
     });
+    input.onProvisioned?.({ branch, checkoutPath: checkout });
   }
   const label = basename4(checkout);
   linkEnvironmentFiles(repo, checkout);
@@ -1618,6 +1812,9 @@ function prepareTarget(input) {
 }
 
 // src/dispatch.ts
+function requestHash(request2) {
+  return createHash4("sha256").update(request2.trim()).digest("hex");
+}
 function handoff(checkout, request2) {
   return `Implement the requested change directly in ${checkout}.
 
@@ -1656,78 +1853,122 @@ function resolveHub(projectRoot, store, env = process.env) {
   if (registered) store.deleteHub(projectRoot, registered.paneId);
   throw new WorkflowError("This repository does not have a live Herdr Project Chat hub");
 }
-async function dispatchImplementation(request2, store = new StateStore()) {
+function formatDispatch(dispatch) {
+  const lines = [
+    `Dispatch ${dispatch.id} [${dispatch.status}]`,
+    `  target: ${dispatch.branch ?? dispatch.targetValue}`,
+    `  checkout: ${dispatch.checkoutPath ?? "pending"}`,
+    `  implementation session: ${dispatch.implementationSessionId ?? "pending"}`
+  ];
+  if (dispatch.error) lines.push(`  error: ${dispatch.error}`);
+  if (dispatch.status === "preparing") lines.push("  recovery: preparation is running; inspect status instead of dispatching again");
+  if (dispatch.status === "delivery_unknown") lines.push("  recovery: prompt delivery may have succeeded; resume the implementation session and do not redispatch");
+  if (dispatch.status === "pre_prompt_failed") lines.push("  recovery: retrying this target resumes this durable dispatch and preserves its artifacts");
+  return lines.join("\n");
+}
+function dispatchReport(store, projectRoot) {
+  const dispatches = store.dispatches(projectRoot);
+  if (!dispatches.length) return "No implementation dispatches recorded.";
+  return dispatches.map(formatDispatch).join("\n\n");
+}
+async function startDispatch(request2, store = new StateStore()) {
   const source = await getSession(request2.sourceSessionId);
   const projectRoot = primaryRepository(source.location.directory);
   if (!projectRoot) throw new WorkflowError("This OpenCode session is not inside a Git repository");
-  const hub = resolveHub(projectRoot, store);
   const text = request2.request.trim();
   const target = request2.target.trim();
   if (!text || !target) throw new WorkflowError("Dispatch request and target must not be empty");
-  if (!store.beginDispatch({
+  const result = store.beginDispatch({
+    id: `dispatch-${randomUUID3()}`,
     sourceSessionId: request2.sourceSessionId,
     sourceMessageId: request2.sourceMessageId,
     projectRoot,
     request: "",
     targetKind: request2.targetKind,
-    targetValue: target
-  })) {
-    throw new WorkflowError("This dispatch turn has already been accepted; do not retry it");
+    targetValue: target,
+    targetKey: dispatchTargetKey(request2.targetKind, target),
+    requestHash: requestHash(text)
+  });
+  if (result.created) return { dispatch: result.dispatch, run: true };
+  const hash = requestHash(text);
+  if (result.dispatch.status === "preparing" && result.dispatch.requestHash === null) {
+    store.adoptDispatchRequest(result.dispatch.id, hash);
+    result.dispatch = store.dispatch(result.dispatch.id);
   }
-  const herdr = new HerdrClient(hub.herdrBin, hub.socketPath ?? void 0);
-  let implementationSessionId;
-  let prepared;
+  const sameRequest = result.dispatch.requestHash === hash;
+  if (sameRequest && result.dispatch.status === "pre_prompt_failed" && store.resumeDispatch(result.dispatch.id, hash)) {
+    return { dispatch: store.dispatch(result.dispatch.id), run: true };
+  }
+  return { dispatch: result.dispatch, run: sameRequest && result.dispatch.status === "preparing" };
+}
+async function runDispatch(dispatchId, request2, store = new StateStore()) {
+  let dispatch = store.dispatch(dispatchId);
+  if (!dispatch) throw new WorkflowError(`Unknown dispatch: ${dispatchId}`);
+  if (dispatch.status !== "preparing") return;
+  if (dispatch.requestHash !== requestHash(request2)) return;
+  if (!store.claimDispatchRun(dispatchId, process.pid)) return;
+  dispatch = store.dispatch(dispatchId);
+  let herdr;
   let promptStarted = false;
   try {
-    prepared = prepareTarget({
-      repoRoot: projectRoot,
-      target: { kind: request2.targetKind, value: target },
+    const hub = resolveHub(dispatch.projectRoot, store);
+    herdr = new HerdrClient(hub.herdrBin, hub.socketPath ?? void 0);
+    const prepared = prepareTarget({
+      repoRoot: dispatch.projectRoot,
+      target: { kind: dispatch.targetKind, value: dispatch.targetValue },
       store,
-      herdr
+      herdr,
+      ...dispatch.branch && dispatch.checkoutPath ? {
+        resume: { branch: dispatch.branch, checkoutPath: dispatch.checkoutPath }
+      } : {},
+      onResolved: ({ branch, checkoutPath }) => {
+        store.updateDispatch(dispatchId, { status: "preparing", branch, checkoutPath });
+        dispatch = store.dispatch(dispatchId);
+      },
+      onProvisioned: ({ branch, checkoutPath }) => {
+        store.updateDispatch(dispatchId, { status: "preparing", branch, checkoutPath });
+        dispatch = store.dispatch(dispatchId);
+      }
     });
-    store.updateDispatch(request2.sourceSessionId, request2.sourceMessageId, {
-      status: "preparing",
-      branch: prepared.branch,
-      checkoutPath: prepared.checkoutPath
-    });
-    const fork = await forkSession(request2.sourceSessionId, request2.sourceMessageId);
-    implementationSessionId = fork.id;
-    store.updateDispatch(request2.sourceSessionId, request2.sourceMessageId, {
-      status: "preparing",
-      implementationSessionId: fork.id
-    });
-    await prepareImplementationSession(fork.id, prepared.checkoutPath);
-    await renameSession(fork.id, source.title?.trim() || prepared.branch);
-    herdr.launchOpenCode(prepared.rootPaneId, prepared.checkoutPath, fork.id);
-    await promptSession(fork.id, handoff(prepared.checkoutPath, text), () => {
+    if (!store.claimDispatchTarget(dispatchId, dispatch.projectRoot, `branch:${prepared.branch}`)) {
+      throw new WorkflowError(`Another dispatch already owns target branch ${prepared.branch}`);
+    }
+    const source = await getSession(dispatch.sourceSessionId);
+    let implementationSessionId = dispatch.implementationSessionId;
+    if (!implementationSessionId) {
+      implementationSessionId = (await findForkedSession(dispatch.sourceSessionId, dispatch.sourceMessageId, dispatch.createdAt) ?? await forkSession(dispatch.sourceSessionId, dispatch.sourceMessageId)).id;
+      store.updateDispatch(dispatchId, { status: "preparing", implementationSessionId });
+    }
+    await prepareImplementationSession(implementationSessionId, prepared.checkoutPath);
+    await renameSession(implementationSessionId, source.title?.trim() || prepared.branch);
+    await promptSession(implementationSessionId, handoff(prepared.checkoutPath, request2.trim()), () => {
+      store.updateDispatch(dispatchId, { status: "delivery_unknown", implementationSessionId });
       promptStarted = true;
     });
+    store.updateDispatch(dispatchId, { status: "delivered", implementationSessionId });
     try {
-      store.updateDispatch(request2.sourceSessionId, request2.sourceMessageId, {
-        status: "delivered",
-        implementationSessionId: fork.id
-      });
+      herdr.launchOpenCode(prepared.rootPaneId, prepared.checkoutPath, implementationSessionId);
     } catch (error) {
-      herdr.notify("Dispatch bookkeeping incomplete", `Implementation started, but its receipt could not be updated: ${error}. Do not redispatch.`);
+      herdr.notify("Implementation delivered without opening its pane", `${formatDispatch(store.dispatch(dispatchId))}
+${String(error)}`);
     }
   } catch (error) {
     const detail = error instanceof Error ? error.message : String(error);
-    if (promptStarted) {
-      try {
-        store.updateDispatch(request2.sourceSessionId, request2.sourceMessageId, {
-          status: "delivery_unknown",
-          ...implementationSessionId ? { implementationSessionId } : {},
-          error: detail
-        });
-      } catch {
-      }
-      throw new WorkflowError(`OpenCode prompt delivery could not be confirmed. The implementation workspace was preserved; inspect it and do not redispatch. ${detail}`);
-    }
-    store.deleteDispatch(request2.sourceSessionId, request2.sourceMessageId);
-    const location = prepared ? ` Artifacts were preserved at ${prepared.checkoutPath} on ${prepared.branch}.` : " Any artifacts created before the failure were preserved.";
-    throw new WorkflowError(`Dispatch stopped before implementation prompting.${location} ${detail}`);
+    store.updateDispatch(dispatchId, {
+      status: promptStarted ? "delivery_unknown" : "pre_prompt_failed",
+      error: detail
+    });
+    herdr?.notify(
+      promptStarted ? "Implementation delivery is unknown" : "Implementation dispatch paused before prompting",
+      formatDispatch(store.dispatch(dispatchId))
+    );
   }
-  return `Implementation started in ${prepared.branch} at ${prepared.checkoutPath}. Do not dispatch this request again.`;
+}
+async function dispatchStatus(sourceSessionId, store = new StateStore()) {
+  const source = await getSession(sourceSessionId);
+  const projectRoot = primaryRepository(source.location.directory);
+  if (!projectRoot) throw new WorkflowError("This OpenCode session is not inside a Git repository");
+  return dispatchReport(store, projectRoot);
 }
 
 // src/projects.ts
@@ -1812,6 +2053,10 @@ async function main(args = process.argv.slice(2)) {
 Cleanup
 
 ${cleanupReport(store)}`);
+    console.log(`
+Implementation dispatches
+
+${dispatchReport(store)}`);
     const activity = store.recentLogs(100).filter((entry) => entry.kind.startsWith("auto-prune.") || entry.kind.startsWith("cleanup.")).slice(0, 20).reverse();
     console.log("\nRecent pruning and cleanup activity\n");
     if (!activity.length) console.log("No pruning or cleanup activity recorded yet.");
@@ -1841,7 +2086,48 @@ ${cleanupReport(store)}`);
     const chunks = [];
     for await (const chunk of process.stdin) chunks.push(Buffer.from(chunk));
     const input = JSON.parse(Buffer.concat(chunks).toString("utf8"));
-    console.log(await dispatchImplementation(input, store));
+    const started = await startDispatch(input, store);
+    if (started.run) {
+      try {
+        const child = spawn3(process.execPath, [process.argv[1], "dispatch-run", started.dispatch.id], {
+          detached: true,
+          env: process.env,
+          stdio: ["pipe", "ignore", "ignore"]
+        });
+        await new Promise((resolve9, reject) => {
+          child.once("spawn", resolve9);
+          child.once("error", reject);
+        });
+        await new Promise((resolve9, reject) => {
+          child.stdin.once("error", reject);
+          child.stdin.end(JSON.stringify({ dispatchId: started.dispatch.id, request: input.request }), resolve9);
+        });
+        child.unref();
+      } catch (error) {
+        store.failDispatchStart(
+          started.dispatch.id,
+          `Could not start the detached dispatch runner: ${error instanceof Error ? error.message : String(error)}`
+        );
+        throw error;
+      }
+    }
+    console.log(formatDispatch(started.dispatch));
+    return 0;
+  }
+  if (command === "dispatch-run") {
+    const chunks = [];
+    for await (const chunk of process.stdin) chunks.push(Buffer.from(chunk));
+    const input = JSON.parse(Buffer.concat(chunks).toString("utf8"));
+    const dispatchId = args[1];
+    if (!dispatchId || dispatchId !== input.dispatchId) throw new WorkflowError("Dispatch runner receipt does not match its input");
+    await runDispatch(dispatchId, input.request, store);
+    return 0;
+  }
+  if (command === "dispatch-status-tool") {
+    const chunks = [];
+    for await (const chunk of process.stdin) chunks.push(Buffer.from(chunk));
+    const input = JSON.parse(Buffer.concat(chunks).toString("utf8"));
+    console.log(await dispatchStatus(input.sourceSessionId, store));
     return 0;
   }
   if (command === "blank-project") return interactiveBlankProject();

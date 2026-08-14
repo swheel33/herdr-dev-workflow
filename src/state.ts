@@ -1,11 +1,40 @@
 import { mkdirSync } from "node:fs"
+import { spawnSync } from "node:child_process"
 import { dirname, resolve } from "node:path"
 import { DatabaseSync } from "node:sqlite"
+import { slugify, worktreeForPath } from "./git.js"
 import { canonical, stateDirectory } from "./paths.js"
 
 export type CleanupPhase = "validate" | "remote" | "checkout" | "branch" | "prune"
-export type DispatchStatus = "preparing" | "delivered" | "delivery_unknown"
+export type DispatchStatus = "preparing" | "delivered" | "delivery_unknown" | "pre_prompt_failed"
 export type TargetKind = "new" | "branch" | "pr"
+
+export interface DispatchRecord {
+  id: string
+  sourceSessionId: string
+  sourceMessageId: string
+  projectRoot: string
+  targetKind: TargetKind
+  targetValue: string
+  targetKey: string
+  requestHash: string | null
+  branch: string | null
+  checkoutPath: string | null
+  implementationSessionId: string | null
+  status: DispatchStatus
+  error: string | null
+  runnerStartedAt: number | null
+  runnerPid: number | null
+  createdAt: number
+  updatedAt: number
+}
+
+export function dispatchTargetKey(kind: TargetKind, value: string, branch?: string | null): string {
+  if (branch) return `branch:${branch}`
+  if (kind === "new") return `branch:wheels/${slugify(value)}`
+  if (kind === "branch") return `branch:${value.trim().replace(/^origin\//, "")}`
+  return `pr:${value.trim().toLowerCase()}`
+}
 
 export interface ProjectHub {
   projectRoot: string
@@ -79,20 +108,32 @@ CREATE TABLE IF NOT EXISTS event_completions (
   completed_at INTEGER NOT NULL
 );
 CREATE TABLE IF NOT EXISTS dispatches (
+  dispatch_id TEXT,
   source_session_id TEXT NOT NULL,
   source_message_id TEXT NOT NULL,
   project_root TEXT NOT NULL,
   request TEXT NOT NULL,
   target_kind TEXT NOT NULL,
   target_value TEXT NOT NULL,
+  target_key TEXT,
+  request_hash TEXT,
   branch TEXT,
   checkout_path TEXT,
   implementation_session_id TEXT,
   status TEXT NOT NULL,
   error TEXT,
+  runner_started_at INTEGER,
+  runner_pid INTEGER,
   created_at INTEGER NOT NULL,
   updated_at INTEGER NOT NULL,
   PRIMARY KEY(source_session_id, source_message_id)
+);
+CREATE TABLE IF NOT EXISTS dispatch_target_claims (
+  project_root TEXT NOT NULL,
+  target_key TEXT NOT NULL,
+  dispatch_id TEXT NOT NULL,
+  created_at INTEGER NOT NULL,
+  PRIMARY KEY(project_root, target_key)
 );
 DROP TABLE IF EXISTS project_chats;
 CREATE TABLE IF NOT EXISTS project_hubs (
@@ -140,10 +181,47 @@ export class StateStore {
       ["managed_targets", "owns_local", "INTEGER NOT NULL DEFAULT 1"],
       ["cleanup_jobs", "remote_url", "TEXT"],
       ["cleanup_jobs", "delete_local", "INTEGER NOT NULL DEFAULT 0"],
+      ["dispatches", "dispatch_id", "TEXT"],
+      ["dispatches", "target_key", "TEXT"],
+      ["dispatches", "request_hash", "TEXT"],
+      ["dispatches", "runner_started_at", "INTEGER"],
+      ["dispatches", "runner_pid", "INTEGER"],
     ]) {
       const exists = this.database.prepare(`PRAGMA table_info(${table})`).all().some((row) => row.name === column)
       if (!exists) this.database.exec(`ALTER TABLE ${table} ADD COLUMN ${column} ${definition}`)
     }
+    this.database.exec(`
+      UPDATE dispatches SET dispatch_id = 'legacy-' || rowid WHERE dispatch_id IS NULL;
+      CREATE UNIQUE INDEX IF NOT EXISTS dispatches_dispatch_id ON dispatches(dispatch_id);
+    `)
+    this.transaction(() => {
+      for (const row of this.database.prepare("SELECT * FROM dispatches WHERE target_key IS NULL").all()) {
+        const key = dispatchTargetKey(
+          String(row.target_kind) as TargetKind,
+          String(row.target_value),
+          row.branch === null ? null : String(row.branch),
+        )
+        this.database.prepare("UPDATE dispatches SET target_key = ? WHERE dispatch_id = ?")
+          .run(key, String(row.dispatch_id))
+        if (String(row.status) === "preparing" && row.implementation_session_id !== null) {
+          this.database.prepare(`
+            UPDATE dispatches SET status = 'delivery_unknown', error = ? WHERE dispatch_id = ?
+          `).run("Migrated from legacy preparing state after an implementation session was created; prompt delivery is unknown.", String(row.dispatch_id))
+        }
+        let shouldClaim = String(row.status) !== "delivered"
+        if (!shouldClaim && row.checkout_path !== null && row.branch !== null) {
+          try {
+            shouldClaim = worktreeForPath(String(row.project_root), String(row.checkout_path))?.branch === String(row.branch)
+          } catch { /* a missing historical repository has no active target to claim */ }
+        }
+        if (shouldClaim) {
+          this.database.prepare(`
+            INSERT OR IGNORE INTO dispatch_target_claims(project_root, target_key, dispatch_id, created_at)
+            VALUES (?, ?, ?, ?)
+          `).run(String(row.project_root), key, String(row.dispatch_id), Number(row.created_at))
+        }
+      }
+    })
   }
 
   close(): void {
@@ -219,33 +297,123 @@ export class StateStore {
     this.database.prepare(query).run(...(paneId ? [canonical(projectRoot), paneId] : [canonical(projectRoot)]))
   }
 
+  private dispatchRecord(row: Record<string, unknown>): DispatchRecord {
+    return {
+      id: String(row.dispatch_id),
+      sourceSessionId: String(row.source_session_id),
+      sourceMessageId: String(row.source_message_id),
+      projectRoot: String(row.project_root),
+      targetKind: String(row.target_kind) as TargetKind,
+      targetValue: String(row.target_value),
+      targetKey: String(row.target_key),
+      requestHash: row.request_hash === null ? null : String(row.request_hash),
+      branch: row.branch === null ? null : String(row.branch),
+      checkoutPath: row.checkout_path === null ? null : String(row.checkout_path),
+      implementationSessionId: row.implementation_session_id === null ? null : String(row.implementation_session_id),
+      status: String(row.status) as DispatchStatus,
+      error: row.error === null ? null : String(row.error),
+      runnerStartedAt: row.runner_started_at === null ? null : Number(row.runner_started_at),
+      runnerPid: row.runner_pid === null ? null : Number(row.runner_pid),
+      createdAt: Number(row.created_at),
+      updatedAt: Number(row.updated_at),
+    }
+  }
+
   beginDispatch(input: {
+    id: string
     sourceSessionId: string
     sourceMessageId: string
     projectRoot: string
     request: string
     targetKind: TargetKind
     targetValue: string
-  }): boolean {
-    const result = this.database.prepare(`
-      INSERT OR IGNORE INTO dispatches(
-        source_session_id, source_message_id, project_root, request, target_kind, target_value,
-        status, created_at, updated_at
-      ) VALUES (?, ?, ?, ?, ?, ?, 'preparing', ?, ?)
-    `).run(
-      input.sourceSessionId,
-      input.sourceMessageId,
-      canonical(input.projectRoot),
-      input.request,
-      input.targetKind,
-      input.targetValue,
-      Date.now(),
-      Date.now(),
-    )
-    return result.changes === 1
+    targetKey: string
+    requestHash: string
+  }): { dispatch: DispatchRecord; created: boolean } {
+    return this.transaction(() => {
+      const projectRoot = canonical(input.projectRoot)
+      const source = this.database.prepare(
+        "SELECT * FROM dispatches WHERE source_session_id = ? AND source_message_id = ?",
+      ).get(input.sourceSessionId, input.sourceMessageId)
+      if (source) return { dispatch: this.dispatchRecord(source), created: false }
+
+      const claimed = this.database.prepare(`
+        SELECT dispatches.* FROM dispatch_target_claims
+        JOIN dispatches USING(dispatch_id)
+        WHERE dispatch_target_claims.project_root = ? AND dispatch_target_claims.target_key = ?
+      `).get(projectRoot, input.targetKey)
+      if (claimed) return { dispatch: this.dispatchRecord(claimed), created: false }
+
+      const now = Date.now()
+      this.database.prepare(`
+        INSERT INTO dispatches(
+          dispatch_id, source_session_id, source_message_id, project_root, request, target_kind, target_value,
+          target_key, request_hash, status, created_at, updated_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'preparing', ?, ?)
+      `).run(
+        input.id, input.sourceSessionId, input.sourceMessageId, projectRoot, input.request,
+        input.targetKind, input.targetValue, input.targetKey, input.requestHash, now, now,
+      )
+      this.database.prepare(`
+        INSERT INTO dispatch_target_claims(project_root, target_key, dispatch_id, created_at)
+        VALUES (?, ?, ?, ?)
+      `).run(projectRoot, input.targetKey, input.id, now)
+      return { dispatch: this.dispatch(input.id)!, created: true }
+    })
   }
 
-  updateDispatch(sourceSessionId: string, sourceMessageId: string, fields: {
+  dispatch(id: string): DispatchRecord | null {
+    const row = this.database.prepare("SELECT * FROM dispatches WHERE dispatch_id = ?").get(id)
+    return row ? this.dispatchRecord(row) : null
+  }
+
+  dispatches(projectRoot?: string): DispatchRecord[] {
+    const rows = projectRoot
+      ? this.database.prepare("SELECT * FROM dispatches WHERE project_root = ? ORDER BY created_at DESC").all(canonical(projectRoot))
+      : this.database.prepare("SELECT * FROM dispatches ORDER BY created_at DESC").all()
+    return rows.map((row) => this.dispatchRecord(row))
+  }
+
+  resumeDispatch(id: string, requestHash: string): boolean {
+    return this.database.prepare(`
+      UPDATE dispatches SET status = 'preparing', error = NULL, request_hash = COALESCE(request_hash, ?),
+        runner_started_at = NULL, runner_pid = NULL, updated_at = ?
+      WHERE dispatch_id = ? AND status = 'pre_prompt_failed' AND (request_hash IS NULL OR request_hash = ?)
+    `).run(requestHash, Date.now(), id, requestHash).changes === 1
+  }
+
+  adoptDispatchRequest(id: string, requestHash: string): boolean {
+    return this.database.prepare(`
+      UPDATE dispatches SET request_hash = ?, updated_at = ?
+      WHERE dispatch_id = ? AND status = 'preparing' AND request_hash IS NULL
+    `).run(requestHash, Date.now(), id).changes === 1
+  }
+
+  failDispatchStart(id: string, error: string): void {
+    this.database.prepare(`
+      UPDATE dispatches SET status = 'pre_prompt_failed', error = ?, updated_at = ?
+      WHERE dispatch_id = ? AND status = 'preparing' AND runner_pid IS NULL
+    `).run(error, Date.now(), id)
+  }
+
+  claimDispatchRun(id: string, pid: number): boolean {
+    return this.transaction(() => {
+      const row = this.database.prepare(`
+        SELECT status, runner_pid FROM dispatches WHERE dispatch_id = ?
+      `).get(id)
+      if (!row || String(row.status) !== "preparing") return false
+      if (row.runner_pid !== null) {
+        if (Number(row.runner_pid) === pid) return false
+        const command = spawnSync("ps", ["-p", String(row.runner_pid), "-o", "command="], { encoding: "utf8" })
+        if (command.status === 0 && command.stdout.includes(`dispatch-run ${id}`)) return false
+      }
+      return this.database.prepare(`
+        UPDATE dispatches SET runner_started_at = ?, runner_pid = ?, updated_at = ? WHERE dispatch_id = ?
+      `).run(Date.now(), pid, Date.now(), id).changes === 1
+    })
+  }
+
+  updateDispatch(id: string, fields: {
     status: DispatchStatus
     branch?: string
     checkoutPath?: string
@@ -254,23 +422,40 @@ export class StateStore {
   }): void {
     this.database.prepare(`
       UPDATE dispatches SET status = ?, branch = COALESCE(?, branch), checkout_path = COALESCE(?, checkout_path),
-        implementation_session_id = COALESCE(?, implementation_session_id), error = ?, updated_at = ?
-      WHERE source_session_id = ? AND source_message_id = ?
+        implementation_session_id = COALESCE(?, implementation_session_id), error = ?,
+        runner_pid = CASE WHEN ? = 'preparing' THEN runner_pid ELSE NULL END, updated_at = ?
+      WHERE dispatch_id = ?
     `).run(
       fields.status,
       fields.branch ?? null,
       fields.checkoutPath ?? null,
       fields.implementationSessionId ?? null,
       fields.error ?? null,
+      fields.status,
       Date.now(),
-      sourceSessionId,
-      sourceMessageId,
+      id,
     )
   }
 
-  deleteDispatch(sourceSessionId: string, sourceMessageId: string): void {
-    this.database.prepare("DELETE FROM dispatches WHERE source_session_id = ? AND source_message_id = ?")
-      .run(sourceSessionId, sourceMessageId)
+  claimDispatchTarget(id: string, projectRoot: string, targetKey: string): boolean {
+    const result = this.database.prepare(`
+      INSERT OR IGNORE INTO dispatch_target_claims(project_root, target_key, dispatch_id, created_at)
+      VALUES (?, ?, ?, ?)
+    `).run(canonical(projectRoot), targetKey, id, Date.now())
+    if (result.changes === 1) return true
+    const existing = this.database.prepare(`
+      SELECT dispatch_id FROM dispatch_target_claims WHERE project_root = ? AND target_key = ?
+    `).get(canonical(projectRoot), targetKey)
+    return String(existing?.dispatch_id ?? "") === id
+  }
+
+  releaseDispatchTargets(projectRoot: string, branch: string): void {
+    const ids = this.database.prepare(`
+      SELECT dispatch_id FROM dispatches WHERE project_root = ? AND branch = ?
+    `).all(canonical(projectRoot), branch)
+    for (const row of ids) {
+      this.database.prepare("DELETE FROM dispatch_target_claims WHERE dispatch_id = ?").run(String(row.dispatch_id))
+    }
   }
 
   registerManagedTarget(input: {

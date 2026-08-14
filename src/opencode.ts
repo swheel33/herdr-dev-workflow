@@ -141,6 +141,16 @@ export async function forkSession(sourceSessionId: string, sourceMessageId: stri
   return response.data
 }
 
+export async function findForkedSession(sourceSessionId: string, sourceMessageId: string, createdAfter: number): Promise<SessionInfo | null> {
+  const response = await request<{ data: SessionInfo[] }>("GET", "/api/session")
+  return response.data
+    .filter((session) => session.fork?.sessionID === sourceSessionId
+      && session.fork.boundary.type === "before"
+      && session.fork.boundary.messageID === sourceMessageId
+      && session.time.created >= createdAfter)
+    .sort((left, right) => right.time.created - left.time.created)[0] ?? null
+}
+
 export async function getSession(sessionId: string, env: NodeJS.ProcessEnv = process.env): Promise<SessionInfo> {
   const response = await request<{ data: SessionInfo }>("GET", `/api/session/${encodeURIComponent(sessionId)}`, undefined, env)
   return response.data
