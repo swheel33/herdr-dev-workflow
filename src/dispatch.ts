@@ -2,7 +2,7 @@ import { createHash, randomUUID } from "node:crypto"
 import { WorkflowError } from "./errors.js"
 import { primaryRepository } from "./git.js"
 import { currentHerdrIdentity, HerdrClient } from "./herdr.js"
-import { findForkedSession, forkSession, getSession, prepareImplementationSession, promptSession, renameSession } from "./opencode.js"
+import { findForkedSession, forkSession, getSession, prepareImplementationSession, promptSession, renameSession, waitForSessionLocationReady } from "./opencode.js"
 import { canonical } from "./paths.js"
 import { dispatchTargetKey, StateStore, type DispatchRecord, type ProjectHub, type TargetKind } from "./state.js"
 import { prepareTarget } from "./worktrees.js"
@@ -18,6 +18,46 @@ export interface DispatchRequest {
 export interface DispatchStart {
   dispatch: DispatchRecord
   run: boolean
+}
+
+export interface ImplementationDelivery {
+  sessionId: string
+  directory: string
+  title: string
+  prompt: string
+  onPromptAttempt: () => void
+  onDelivered: () => void
+  launch: () => void
+}
+
+export interface ImplementationDeliveryOperations {
+  prepare: typeof prepareImplementationSession
+  waitUntilReady: typeof waitForSessionLocationReady
+  rename: typeof renameSession
+  prompt: typeof promptSession
+}
+
+const deliveryOperations: ImplementationDeliveryOperations = {
+  prepare: prepareImplementationSession,
+  waitUntilReady: waitForSessionLocationReady,
+  rename: renameSession,
+  prompt: promptSession,
+}
+
+export async function deliverImplementation(
+  input: ImplementationDelivery,
+  operations: ImplementationDeliveryOperations = deliveryOperations,
+): Promise<void> {
+  await operations.prepare(input.sessionId, input.directory)
+  await operations.waitUntilReady(input.sessionId, input.directory)
+  await operations.rename(input.sessionId, input.title)
+  await operations.prompt(input.sessionId, input.prompt, input.onPromptAttempt)
+  input.onDelivered()
+  input.launch()
+}
+
+export function dispatchFailureStatus(promptStarted: boolean): "delivery_unknown" | "pre_prompt_failed" {
+  return promptStarted ? "delivery_unknown" : "pre_prompt_failed"
 }
 
 function requestHash(request: string): string {
@@ -131,12 +171,13 @@ export async function runDispatch(dispatchId: string, request: string, store = n
   let promptStarted = false
   try {
     const hub = resolveHub(dispatch.projectRoot, store)
-    herdr = new HerdrClient(hub.herdrBin, hub.socketPath ?? undefined)
+    const activeHerdr = new HerdrClient(hub.herdrBin, hub.socketPath ?? undefined)
+    herdr = activeHerdr
     const prepared = prepareTarget({
       repoRoot: dispatch.projectRoot,
       target: { kind: dispatch.targetKind, value: dispatch.targetValue },
       store,
-      herdr,
+      herdr: activeHerdr,
       ...(dispatch.branch && dispatch.checkoutPath ? {
         resume: { branch: dispatch.branch, checkoutPath: dispatch.checkoutPath },
       } : {}),
@@ -160,22 +201,28 @@ export async function runDispatch(dispatchId: string, request: string, store = n
         ?? await forkSession(dispatch.sourceSessionId, dispatch.sourceMessageId)).id
       store.updateDispatch(dispatchId, { status: "preparing", implementationSessionId })
     }
-    await prepareImplementationSession(implementationSessionId, prepared.checkoutPath)
-    await renameSession(implementationSessionId, source.title?.trim() || prepared.branch)
-    await promptSession(implementationSessionId, handoff(prepared.checkoutPath, request.trim()), () => {
-      store.updateDispatch(dispatchId, { status: "delivery_unknown", implementationSessionId })
-      promptStarted = true
+    await deliverImplementation({
+      sessionId: implementationSessionId,
+      directory: prepared.checkoutPath,
+      title: source.title?.trim() || prepared.branch,
+      prompt: handoff(prepared.checkoutPath, request.trim()),
+      onPromptAttempt: () => {
+        store.updateDispatch(dispatchId, { status: "delivery_unknown", implementationSessionId })
+        promptStarted = true
+      },
+      onDelivered: () => store.updateDispatch(dispatchId, { status: "delivered", implementationSessionId }),
+      launch: () => {
+        try {
+          activeHerdr.launchOpenCode(prepared.rootPaneId, prepared.checkoutPath, implementationSessionId)
+        } catch (error) {
+          activeHerdr.notify("Implementation delivered without opening its pane", `${formatDispatch(store.dispatch(dispatchId)!)}\n${String(error)}`)
+        }
+      },
     })
-    store.updateDispatch(dispatchId, { status: "delivered", implementationSessionId })
-    try {
-      herdr.launchOpenCode(prepared.rootPaneId, prepared.checkoutPath, implementationSessionId)
-    } catch (error) {
-      herdr.notify("Implementation delivered without opening its pane", `${formatDispatch(store.dispatch(dispatchId)!)}\n${String(error)}`)
-    }
   } catch (error) {
     const detail = error instanceof Error ? error.message : String(error)
     store.updateDispatch(dispatchId, {
-      status: promptStarted ? "delivery_unknown" : "pre_prompt_failed",
+      status: dispatchFailureStatus(promptStarted),
       error: detail,
     })
     herdr?.notify(

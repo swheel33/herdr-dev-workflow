@@ -319,6 +319,16 @@ function synchronizeDefaultBranch(repo) {
 import { readFileSync } from "node:fs";
 import { homedir as homedir3 } from "node:os";
 import { resolve as resolve4 } from "node:path";
+var OpenCodeApiError = class extends WorkflowError {
+  constructor(status, message) {
+    super(message);
+    this.status = status;
+    this.name = "OpenCodeApiError";
+  }
+  status;
+};
+var LocationNotReadyError = class extends Error {
+};
 var PROJECT_CHAT_ENVIRONMENT = [
   "HERDR_PROJECT_CHAT",
   "HERDR_PROJECT_ROOT"
@@ -410,7 +420,7 @@ async function requestWithService(info, method, path, body, timeout = 3e4) {
     ...body === void 0 ? {} : { body: JSON.stringify(body) },
     signal: AbortSignal.timeout(timeout)
   });
-  if (!response.ok) throw new WorkflowError(`OpenCode API ${method} ${path} failed (${response.status}): ${await response.text()}`);
+  if (!response.ok) throw new OpenCodeApiError(response.status, `OpenCode API ${method} ${path} failed (${response.status}): ${await response.text()}`);
   if (response.status === 204) return void 0;
   return await response.json();
 }
@@ -437,6 +447,64 @@ async function renameSession(sessionId, title) {
 async function prepareImplementationSession(sessionId, directory) {
   await request("POST", `/api/session/${encodeURIComponent(sessionId)}/move`, { directory });
   await request("POST", `/api/session/${encodeURIComponent(sessionId)}/agent`, { agent: "build" });
+}
+function locationPath(path, location) {
+  const query = new URLSearchParams();
+  query.set("location[directory]", location.directory);
+  if (location.workspaceID) query.set("location[workspace]", location.workspaceID);
+  return `${path}?${query}`;
+}
+function assertLocation(response, expected, source) {
+  const actual = canonical(response.directory);
+  if (actual !== expected) throw new LocationNotReadyError(`${source} resolved to ${actual}, expected ${expected}`);
+}
+function retryableReadinessError(error) {
+  if (!(error instanceof OpenCodeApiError)) return true;
+  return error.status === 404 || error.status === 409 || error.status === 425 || error.status === 429 || error.status >= 500;
+}
+async function waitForSessionLocationReady(sessionId, directory, options = {}) {
+  const expected = canonical(directory);
+  const timeoutMs = options.timeoutMs ?? 45e3;
+  const intervalMs = options.intervalMs ?? 250;
+  const now = options.now ?? Date.now;
+  const sleep = options.sleep ?? ((milliseconds) => new Promise((resolvePromise) => setTimeout(resolvePromise, milliseconds)));
+  const deadline = now() + timeoutMs;
+  let readinessRequest = options.request;
+  if (!readinessRequest) {
+    const info = await service();
+    readinessRequest = async (path, timeout) => await requestWithService(info, "GET", path, void 0, timeout);
+  }
+  let lastError;
+  const probe = async (path) => {
+    const remaining = deadline - now();
+    if (remaining <= 0) throw new LocationNotReadyError("Readiness deadline expired");
+    return await readinessRequest(path, Math.min(2e3, remaining));
+  };
+  while (now() < deadline) {
+    try {
+      const sessionResponse = await probe(`/api/session/${encodeURIComponent(sessionId)}`);
+      assertLocation(sessionResponse.data.location, expected, "Session");
+      const location = sessionResponse.data.location;
+      const resolved = await probe(locationPath("/api/location", location));
+      assertLocation(resolved, expected, "Location");
+      const models = await probe(locationPath("/api/model", location));
+      assertLocation(models.location, expected, "Model catalog");
+      if (!Array.isArray(models.data)) throw new LocationNotReadyError("Model catalog is not available");
+      const agents = await probe(locationPath("/api/agent", location));
+      assertLocation(agents.location, expected, "Agent catalog");
+      if (!agents.data.some((agent) => typeof agent === "object" && agent !== null && "id" in agent && agent.id === "build")) {
+        throw new LocationNotReadyError("Build agent is not available in the destination catalog");
+      }
+      return;
+    } catch (error) {
+      if (!retryableReadinessError(error)) throw error;
+      lastError = error;
+      const delay = Math.min(intervalMs, deadline - now());
+      if (delay > 0) await sleep(delay);
+    }
+  }
+  const detail = lastError instanceof Error ? lastError.message : String(lastError ?? "destination services remained unavailable");
+  throw new WorkflowError(`OpenCode destination did not become ready within ${timeoutMs}ms for ${expected}: ${detail}`, lastError);
 }
 async function promptSession(sessionId, text, onAttempt) {
   const info = await service();
@@ -1812,6 +1880,23 @@ function prepareTarget(input) {
 }
 
 // src/dispatch.ts
+var deliveryOperations = {
+  prepare: prepareImplementationSession,
+  waitUntilReady: waitForSessionLocationReady,
+  rename: renameSession,
+  prompt: promptSession
+};
+async function deliverImplementation(input, operations = deliveryOperations) {
+  await operations.prepare(input.sessionId, input.directory);
+  await operations.waitUntilReady(input.sessionId, input.directory);
+  await operations.rename(input.sessionId, input.title);
+  await operations.prompt(input.sessionId, input.prompt, input.onPromptAttempt);
+  input.onDelivered();
+  input.launch();
+}
+function dispatchFailureStatus(promptStarted) {
+  return promptStarted ? "delivery_unknown" : "pre_prompt_failed";
+}
 function requestHash(request2) {
   return createHash4("sha256").update(request2.trim()).digest("hex");
 }
@@ -1912,12 +1997,13 @@ async function runDispatch(dispatchId, request2, store = new StateStore()) {
   let promptStarted = false;
   try {
     const hub = resolveHub(dispatch.projectRoot, store);
-    herdr = new HerdrClient(hub.herdrBin, hub.socketPath ?? void 0);
+    const activeHerdr = new HerdrClient(hub.herdrBin, hub.socketPath ?? void 0);
+    herdr = activeHerdr;
     const prepared = prepareTarget({
       repoRoot: dispatch.projectRoot,
       target: { kind: dispatch.targetKind, value: dispatch.targetValue },
       store,
-      herdr,
+      herdr: activeHerdr,
       ...dispatch.branch && dispatch.checkoutPath ? {
         resume: { branch: dispatch.branch, checkoutPath: dispatch.checkoutPath }
       } : {},
@@ -1939,23 +2025,29 @@ async function runDispatch(dispatchId, request2, store = new StateStore()) {
       implementationSessionId = (await findForkedSession(dispatch.sourceSessionId, dispatch.sourceMessageId, dispatch.createdAt) ?? await forkSession(dispatch.sourceSessionId, dispatch.sourceMessageId)).id;
       store.updateDispatch(dispatchId, { status: "preparing", implementationSessionId });
     }
-    await prepareImplementationSession(implementationSessionId, prepared.checkoutPath);
-    await renameSession(implementationSessionId, source.title?.trim() || prepared.branch);
-    await promptSession(implementationSessionId, handoff(prepared.checkoutPath, request2.trim()), () => {
-      store.updateDispatch(dispatchId, { status: "delivery_unknown", implementationSessionId });
-      promptStarted = true;
-    });
-    store.updateDispatch(dispatchId, { status: "delivered", implementationSessionId });
-    try {
-      herdr.launchOpenCode(prepared.rootPaneId, prepared.checkoutPath, implementationSessionId);
-    } catch (error) {
-      herdr.notify("Implementation delivered without opening its pane", `${formatDispatch(store.dispatch(dispatchId))}
+    await deliverImplementation({
+      sessionId: implementationSessionId,
+      directory: prepared.checkoutPath,
+      title: source.title?.trim() || prepared.branch,
+      prompt: handoff(prepared.checkoutPath, request2.trim()),
+      onPromptAttempt: () => {
+        store.updateDispatch(dispatchId, { status: "delivery_unknown", implementationSessionId });
+        promptStarted = true;
+      },
+      onDelivered: () => store.updateDispatch(dispatchId, { status: "delivered", implementationSessionId }),
+      launch: () => {
+        try {
+          activeHerdr.launchOpenCode(prepared.rootPaneId, prepared.checkoutPath, implementationSessionId);
+        } catch (error) {
+          activeHerdr.notify("Implementation delivered without opening its pane", `${formatDispatch(store.dispatch(dispatchId))}
 ${String(error)}`);
-    }
+        }
+      }
+    });
   } catch (error) {
     const detail = error instanceof Error ? error.message : String(error);
     store.updateDispatch(dispatchId, {
-      status: promptStarted ? "delivery_unknown" : "pre_prompt_failed",
+      status: dispatchFailureStatus(promptStarted),
       error: detail
     });
     herdr?.notify(

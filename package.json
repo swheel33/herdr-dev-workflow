@@ -8,7 +8,8 @@
   },
   "scripts": {
     "build": "node build.mjs",
-    "check": "tsc -p tsconfig.json --noEmit"
+    "check": "tsc -p tsconfig.json --noEmit",
+    "test": "node test.mjs"
   },
   "devDependencies": {
     "@opencode-ai/plugin": "next",

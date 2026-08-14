@@ -2,6 +2,7 @@ import { readFileSync } from "node:fs"
 import { homedir } from "node:os"
 import { resolve } from "node:path"
 import { WorkflowError } from "./errors.js"
+import { canonical } from "./paths.js"
 import { executable, run } from "./process.js"
 
 export interface SessionInfo {
@@ -20,6 +21,39 @@ interface ServiceInfo {
   password?: string
   version?: string
 }
+
+interface LocationInfo {
+  directory: string
+  workspaceID?: string
+}
+
+interface LocationResponse extends LocationInfo {
+  project: { id: string; directory: string; canonical: string }
+}
+
+interface CatalogResponse {
+  location: LocationResponse
+  data: unknown[]
+}
+
+type ReadinessRequest = (path: string, timeout: number) => Promise<unknown>
+
+export interface SessionLocationReadinessOptions {
+  timeoutMs?: number
+  intervalMs?: number
+  now?: () => number
+  sleep?: (milliseconds: number) => Promise<void>
+  request?: ReadinessRequest
+}
+
+class OpenCodeApiError extends WorkflowError {
+  constructor(readonly status: number, message: string) {
+    super(message)
+    this.name = "OpenCodeApiError"
+  }
+}
+
+class LocationNotReadyError extends Error {}
 
 export const PROJECT_CHAT_ENVIRONMENT = [
   "HERDR_PROJECT_CHAT",
@@ -125,7 +159,7 @@ async function requestWithService<T>(info: ServiceInfo, method: string, path: st
     ...(body === undefined ? {} : { body: JSON.stringify(body) }),
     signal: AbortSignal.timeout(timeout),
   })
-  if (!response.ok) throw new WorkflowError(`OpenCode API ${method} ${path} failed (${response.status}): ${await response.text()}`)
+  if (!response.ok) throw new OpenCodeApiError(response.status, `OpenCode API ${method} ${path} failed (${response.status}): ${await response.text()}`)
   if (response.status === 204) return undefined as T
   return await response.json() as T
 }
@@ -163,6 +197,77 @@ export async function renameSession(sessionId: string, title: string): Promise<v
 export async function prepareImplementationSession(sessionId: string, directory: string): Promise<void> {
   await request("POST", `/api/session/${encodeURIComponent(sessionId)}/move`, { directory })
   await request("POST", `/api/session/${encodeURIComponent(sessionId)}/agent`, { agent: "build" })
+}
+
+function locationPath(path: string, location: LocationInfo): string {
+  const query = new URLSearchParams()
+  query.set("location[directory]", location.directory)
+  if (location.workspaceID) query.set("location[workspace]", location.workspaceID)
+  return `${path}?${query}`
+}
+
+function assertLocation(response: LocationInfo, expected: string, source: string): void {
+  const actual = canonical(response.directory)
+  if (actual !== expected) throw new LocationNotReadyError(`${source} resolved to ${actual}, expected ${expected}`)
+}
+
+function retryableReadinessError(error: unknown): boolean {
+  if (!(error instanceof OpenCodeApiError)) return true
+  return error.status === 404 || error.status === 409 || error.status === 425 || error.status === 429 || error.status >= 500
+}
+
+export async function waitForSessionLocationReady(
+  sessionId: string,
+  directory: string,
+  options: SessionLocationReadinessOptions = {},
+): Promise<void> {
+  const expected = canonical(directory)
+  const timeoutMs = options.timeoutMs ?? 45_000
+  const intervalMs = options.intervalMs ?? 250
+  const now = options.now ?? Date.now
+  const sleep = options.sleep ?? ((milliseconds) => new Promise<void>((resolvePromise) => setTimeout(resolvePromise, milliseconds)))
+  const deadline = now() + timeoutMs
+  let readinessRequest = options.request
+  if (!readinessRequest) {
+    const info = await service()
+    readinessRequest = async (path, timeout) => await requestWithService(info, "GET", path, undefined, timeout)
+  }
+  let lastError: unknown
+  const probe = async (path: string): Promise<unknown> => {
+    const remaining = deadline - now()
+    if (remaining <= 0) throw new LocationNotReadyError("Readiness deadline expired")
+    return await readinessRequest(path, Math.min(2_000, remaining))
+  }
+
+  while (now() < deadline) {
+    try {
+      const sessionResponse = await probe(`/api/session/${encodeURIComponent(sessionId)}`) as { data: SessionInfo }
+      assertLocation(sessionResponse.data.location, expected, "Session")
+      const location = sessionResponse.data.location
+
+      const resolved = await probe(locationPath("/api/location", location)) as LocationResponse
+      assertLocation(resolved, expected, "Location")
+
+      const models = await probe(locationPath("/api/model", location)) as CatalogResponse
+      assertLocation(models.location, expected, "Model catalog")
+      if (!Array.isArray(models.data)) throw new LocationNotReadyError("Model catalog is not available")
+
+      const agents = await probe(locationPath("/api/agent", location)) as CatalogResponse
+      assertLocation(agents.location, expected, "Agent catalog")
+      if (!agents.data.some((agent) => typeof agent === "object" && agent !== null && "id" in agent && agent.id === "build")) {
+        throw new LocationNotReadyError("Build agent is not available in the destination catalog")
+      }
+      return
+    } catch (error) {
+      if (!retryableReadinessError(error)) throw error
+      lastError = error
+      const delay = Math.min(intervalMs, deadline - now())
+      if (delay > 0) await sleep(delay)
+    }
+  }
+
+  const detail = lastError instanceof Error ? lastError.message : String(lastError ?? "destination services remained unavailable")
+  throw new WorkflowError(`OpenCode destination did not become ready within ${timeoutMs}ms for ${expected}: ${detail}`, lastError)
 }
 
 export async function promptSession(sessionId: string, text: string, onAttempt?: () => void): Promise<void> {
